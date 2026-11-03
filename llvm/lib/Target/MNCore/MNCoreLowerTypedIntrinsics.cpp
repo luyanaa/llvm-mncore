@@ -35,6 +35,7 @@
 #include "MNCore.h"
 #include "llvm/Target/MNCore/MNCoreIntrinsicOps.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -139,6 +140,8 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
   FunctionType *L1bFT = FunctionType::get(
       Type::getVoidTy(C), {I64, I64, I64, I64, I64, I64, I64}, false);
   FunctionCallee L1b = M.getOrInsertFunction("llvm.mncore.l1b", L1bFT);
+  FunctionType *FenceFT = FunctionType::get(Type::getVoidTy(C), false);
+  FunctionCallee Fence = M.getOrInsertFunction("llvm.mncore.fence", FenceFT);
 
   struct Slot {
     unsigned Space;
@@ -208,10 +211,34 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
   // Last-use analysis over the typed call sequence (linear, same block or
   // across blocks in program order).
   DenseMap<Value *, int> LastUse;
-  for (int I = 0; I < (int)Calls.size(); ++I)
+  DenseMap<Value *, int> DefIndex;
+  for (int I = 0; I < (int)Calls.size(); ++I) {
     for (Value *Op : Calls[I].CI->args())
       if (Op->getType()->isVectorTy())
         LastUse[Op] = I;
+    if (Calls[I].CI->getType()->isVectorTy())
+      DefIndex[Calls[I].CI] = I;
+  }
+
+  // A value is live at call I if it is a kernel argument (preloaded for the
+  // whole kernel) or its last use has not happened yet. The destination of a
+  // new result must not reuse a space that a live value still occupies:
+  // otherwise a later expression may read two operands in the same space at
+  // different addresses (one address field per space).
+  auto LiveSpacesAt = [&](int Cur) {
+    SmallBitVector Live(5);
+    for (const auto &KV : Slots) {
+      Value *V = KV.first;
+      auto U = LastUse.find(V);
+      // A kernel argument that is never read still occupies its preloaded
+      // slot, so keep it live conservatively; otherwise liveness is exactly
+      // "last use is at or after the current call".
+      bool IsLive = (U != LastUse.end()) ? (U->second >= Cur) : isa<Argument>(V);
+      if (IsLive && KV.second.Space >= 1 && KV.second.Space <= 4)
+        Live.set(KV.second.Space);
+    }
+    return Live;
+  };
 
   // Assign result slots in order (destination space is chosen at rewrite
   // time from the spaces not read by the call).
@@ -261,14 +288,29 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
             return true;
         return false;
       };
+      SmallBitVector Live = LiveSpacesAt(I);
       unsigned DstSpace = 0;
       for (unsigned I2 = 0; I2 < 4; ++I2) {
         unsigned C = 1 + ((Preferred - 1 + I2) % 4);
         bool IsLM = (C == 3 || C == 4);
+        if (Live.test(C))
+          continue;
         if (IsLM && ReadIn(C))
           continue;
         DstSpace = C;
         break;
+      }
+      if (!DstSpace) {
+        // All four spaces hold live values. Fall back to the old rotation and
+        // let the same-space input check below report a real conflict.
+        for (unsigned I2 = 0; I2 < 4; ++I2) {
+          unsigned C = 1 + ((Preferred - 1 + I2) % 4);
+          bool IsLM = (C == 3 || C == 4);
+          if (IsLM && ReadIn(C))
+            continue;
+          DstSpace = C;
+          break;
+        }
       }
       if (!DstSpace)
         report_fatal_error(
@@ -389,6 +431,11 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
                         B.getInt64(-1), MaskVal(MaskBase),
                         MaskVal(MaskBase + 1)};
       B.CreateCall(L1b, Args);
+      // The PE memories allow a read and a write in the same step (3.6.3.9),
+      // but the read observes the old value. The loaded value is consumed by
+      // later expressions, so force at least one empty step here; the hazard
+      // pass then adds the remaining LM port spacing (3.6.3.9).
+      B.CreateCall(Fence);
     } else {
       // fma / mul / add (MAU vector forms)
       Value *SX = Tok(Src[0]);

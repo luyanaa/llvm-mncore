@@ -308,6 +308,23 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
   13=hvfma 14=hvmul 15=hvadd 16=d-matvec 17=h-matvec 18=d-mwrite
   19=h-mwrite 20=d-mread 21=h-mread；`alu` 10=dmax 11=dmin 12=hmax
   13=hmin。f 精度沿用 0..6。
+
+### 14.1 分配器 v2.1 (2026-11-04)
+
+* **目的空间避开存活值**：分配新结果时，先统计当前调用点仍存活的 SSA 值所占
+  的 PE 空间（kernel 参数在最后一次使用前视为存活），目的空间优先选择不在
+  该集合中的空间；四个空间全满时才退回旧的轮转策略，并由同空间输入检查
+  报错。这修复了 `vec.load` 结果与参数落在同一空间、随后被同一表达式读取
+  的冲突。
+* **typed load 的强制隔步**：`l1load` 发出的 `l1b` 之后自动补一条
+  `llvm.mncore.fence`（一个 NOP 步）。PE 存储允许同一步读写（3.6.3.9），
+  但读观察到的是旧值，因此 load→consumer 必须隔步；hazard pass 再补足
+  LM 端口所需的其余 nop。
+* **新增 typed 内存 op**：`llvm.mncore.l1load.<ty>(lbop, zmask, wmask)`
+  （L1BM→PE slot），对应 MLIR `mncore.vec.load` 与 Triton
+  `ttg.local_load`。
+* **`mncore.dma`**（MLIR 层）：`DRAM/PDM → L2BM → L1BM`，lower 为
+  `mvop + mvparams + mv + lbop + l2b`；`mvp` 的方向由操作数 kind 决定。
 * 仍限制：掩码必须为 0；跨基本块/循环未做生存期分析；matvec 语义定义为
   `dst = A*x + y`（两个向量输入）。
 

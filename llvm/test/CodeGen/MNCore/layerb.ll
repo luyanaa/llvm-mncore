@@ -15,9 +15,12 @@ define void @k(<4 x float> %a, <4 x float> %b, <4 x float> %c) {
 ; CHECK-LABEL: k:
 ; Slots rotate over GRF0/GRF1/LM0/LM1 (one address field per space), so
 ; the arguments take $llr0v/$lls0v/$llm0v and the result $lln0v.
-; CHECK: fvfma $llr0v $lls0v $llm0v $llr16v
+; The first result takes the remaining space (LM1), the second reuses GRF0
+; after %a dies (its freed slot 0 is reused); destinations never collide
+; with a live value's space.
+; CHECK: fvfma $llr0v $lls0v $llm0v $lln0v
 ; CHECK: nop
-; CHECK: fvfma $llr16v $lls0v $llm0v $lls16v
+; CHECK: fvfma $lln0v $lls0v $llm0v $llr0v
   %r = call <4 x float> @llvm.mncore.fma.v4f32(<4 x float> %a, <4 x float> %b, <4 x float> %c, i64 0, i64 0)
   %s = call <4 x float> @llvm.mncore.fma.v4f32(<4 x float> %r, <4 x float> %b, <4 x float> %c, i64 0, i64 0)
   ret void
@@ -27,7 +30,7 @@ define void @k(<4 x float> %a, <4 x float> %b, <4 x float> %c) {
 ; forwards it to Layer A, which prints /0111.
 define void @masked_fma(<4 x float> %a, <4 x float> %b, <4 x float> %c) {
 ; CHECK-LABEL: masked_fma:
-; CHECK: fvfma $llr0v $lls0v $llm0v $llr16v/0111p
+; CHECK: fvfma $llr0v $lls0v $llm0v $lln0v/0111p
   %wm = call i64 @llvm.mncore.maskop(i64 0, i64 7, i64 0)
   %r = call <4 x float> @llvm.mncore.fma.v4f32(<4 x float> %a, <4 x float> %b, <4 x float> %c, i64 -1, i64 %wm)
   ret void

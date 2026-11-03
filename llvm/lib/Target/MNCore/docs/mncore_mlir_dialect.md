@@ -50,7 +50,8 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 ### 3.3 typed（与 Layer B 同名语义）
 `mncore.vec.fma/mul/add/max/min`（3/2/2/2/2 输入 + zmask/wmask）、
 `mncore.mat.vec(face,x,y)`、`mncore.mat.write(face,row,src)`、
-`mncore.mat.read(face,row)`。
+`mncore.mat.read(face,row)`、`mncore.vec.load(lbop)`（L1BM → PE slot，
+对应 `llvm.mncore.l1load.*` → `l1bmp`；Triton `ttg.local_load` 的目标）。
 
 ## 4. 验证器规则（与 LLVM 后端一致）
 
@@ -106,7 +107,9 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
    与可选操作数的解析复杂度。
 4. **typed op 直接 lower 回 Layer B intrinsic**，槽位分配仍只在
    `MNCoreLowerTypedIntrinsics.cpp` 实现一份。
-5. **`mncore.dget` 暂未提供**：后端尚无对应的 `llvm.mncore.dget` intrinsic
+5. **已提供 `mncore.dma`**（DRAM/PDM → L2BM → L1BM，lower 为已验证的
+   `mvp + l2bmb`）与 `mncore.vec.load`（`l1load.*` → `l1bmp`）。
+   **`mncore.dget` 暂未提供**：后端尚无对应的 `llvm.mncore.dget` intrinsic
    （`DGET` 目前只是 MIR 伪指令）。数值 golden 的 MLIR 入口在补 intrinsic
    后追加。
 6. **typed 值不得逃逸**：`mncore.vec.*`/`mncore.mat.*` 的结果只能被其他 typed op

@@ -78,3 +78,16 @@ func.func @vecload() {
   "mncore.mat.write"(%v) <{face = 0 : i64, row = 0 : i64}> : (vector<4xf32>) -> ()
   return
 }
+
+// CHECK-LABEL: llvm.func @dma
+func.func @dma() {
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mvop"
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mvparams"
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mv"
+  // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
+  // CHECK: llvm.call_intrinsic "llvm.mncore.l2b"
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 0 : i64, l2_addr = 0 : i64,
+                    l1_addr = 0 : i64, size = 64 : i64, tag = 1 : i32,
+                    mv_flags = 0 : i32}> : () -> ()
+  return
+}

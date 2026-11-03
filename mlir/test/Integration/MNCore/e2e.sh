@@ -18,6 +18,8 @@ for tool in "$mlir_opt" "$mlir_translate" "$llc"; do
   fi
 done
 
-"$mlir_opt" "$here/fma.mlir" --convert-mncore-to-llvm \
+input="${1:-$here/fma.mlir}"
+
+"$mlir_opt" "$input" --convert-mncore-to-llvm \
   | "$mlir_translate" --mlir-to-llvmir \
   | "$llc" -mtriple=mncore2 -filetype=asm -o -

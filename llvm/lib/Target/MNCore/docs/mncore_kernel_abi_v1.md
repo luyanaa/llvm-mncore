@@ -525,3 +525,73 @@ PE 操作数的 `operand` 位置按 `moncore_intrinsics_design.md` §3 的 intri
   的数据，数值对拍通过；
 * 负例：未绑定 site、`byte_offset % unit != 0`、地址超出 `width_bits`，
   三者都必须被拒绝。
+
+
+**Loader 解析器确认（Ghidra）**
+* 报错字符串位于 `_createRelocatedKernelVsm`（VMA 0xaad950；Ghidra 基址
+  VMA+0x100000）内的函数 FUN_00badd20；反编译 776 行，存于
+  `suzhou:~/libmnrt/ghidra/out/00badd20_FUN_00badd20.c`。
+* 解析事实：镜像开头为**头尺寸**（offset 0 的 ushort = 0x30），后续字段是
+  相对偏移（与 `@112=size−120` 等模型一致）；payload 按**长度前缀的
+  128 字节记录向量**消费（拷贝循环以 0x80 字节为块），与实测 128 B 块一致。
+* 函数名 `_createRelocatedKernelVsm` 证实 relocation/buffer 绑定在此发生，
+  与“PE 参数在 payload 中 region-relative、重定位在 descriptor 层”一致。
+* 未解：128 字节记录的内部位布局（超出已实测的 opcode/imm 字节位置），
+  以及记录是在此函数解释还是下游 GPFN runtime 解释——下一反编译目标。
+
+
+**MNCL 逆向阶段状态（收束）**
+已达成：256 B 头 parse→rebuild→load；payload=长度前缀的 128 B 记录向量
+（loader 反编译确认 0x80 拷贝块）；整数 12-bit 立即数；浮点对数域常量律
+（18 值验证）；opcode 字节；L1BM 传输 lane 字段；PE 参数 region-relative、
+relocation 在 `_createRelocatedKernelVsm`。
+未解：128 B 记录完整位布局（操作数/寄存器/地址）、记录到 VLIW step 的映射、
+记录的下游解释位置（loader 仅拷贝；GPFN runtime 消费端未反编译）、A5 多
+entry 生成路径。assemble3 作为 payload 的“头封装”路线已被 loader 明确拒绝。
+下一阶段思路：反编译 128 B 记录向量的下游消费者；用 loader 作 oracle 做字段
+变异；寻找官方多 entry 生产者；或接受 MNCL 为不透明 provider，继续 mnrt
+emulator 路径（L2-image 已通过）。
+
+
+**突破：`mnclc --dump` 是指令级 oracle**
+`mnclc --allow_pe_args --mnir --dump` 打印头部 + 完整指令清单（immu/nop/
+mvnop/ipassa/l1bmm@…），并给出 `size of instblock`（=payload 字节数）。
+计数：kb8 24 指令/8 mvnop/1024 B；add1 60/20/2560；add2 75/25/3200；
+a2add 60/20/2560。**每个 128 B 块恰含 3 条指令，最后一条恒为 mvnop**：
+`[PE 或 nop][PE 或 nop][mvnop]`。这把实测块结构与官方指令流绑定。
+首轮字段定位（kb8 block2 vs block3：`ipassa $r0 -> $n0v` vs `-> $n4v`）：
+块内相对字节 6/13/21/39/40/41/46/47/54/59 变化，是 ipassa 目的地址/操作数
+字段候选。下一步用一变量指令对（n0/n4/n8/n12、不同立即数、不同 MV）解出
+位布局，再映射全部指令类型。
+
+
+**首轮字段映射（dump 对照法，暂定）**
+以 add1 的 block9–16 为例（ipassa 仅目的地址变化；ulpassa 源/目的同步变化）：
+* ipassa `$r4 -> $sX`（X=4,5,8,9）：byte10/byte25 = `2*addr`；
+  bytes17..18 LE16 = `addr<<5`；byte51 高半字节 = `addr&0xF`。
+* ulpassa `$lr0->$lm0 / $ls0->$lm2 / $ls4->$lm4 / $ls8->$lm6`：
+  byte7/byte22 = 源空间（0x00 GRF0 / 0x20 GRF1）；byte39 = 0x07/0x0f 镜像；
+  byte9/byte24 = 源地址；byte16 = 源地址<<4；byte50 = 源地址>>1；
+  byte15/byte48 = 目的 LM 地址；byte51 = 0x04 (LM0@0) / 0x05 (LM1)。
+* 两个 nop 块逐字节相同（block2 vs block7 零差异），证明“块=3 指令”映射精确。
+完整布局（全部指令、mvnop 槽、/1000 掩码字段）可用同一 oracle 方法继续解出。
+
+
+**iadd 字段映射与方法收束**
+add2 block0 `iadd $n0 $m0 -> $s0/1000` vs block4 `iadd $m4 $n4 -> $r0/1000`：
+地址 4 出现在 byte6/15/21/48，`addr<<4` 在 byte7/22/55，其余
+13/39/45/51/52/54/56/58 为操作数类别/空间位。结合 ipassa/ulpassa 的映射，
+可看出每个 PE 操作数由**多个分量**（多种地址单位 + 空间/宽度/掩码标签）
+分散编码在 128 字节块内。
+**方法收束**：剩余工作已从“探索”变为“系统采集”——用 `--dump` 取指令文本，
+配对仅一个操作数不同的块做字节差分，按操作数类别累积位图，最后实现
+(指令,操作数)→128B 块 的编码器，并用 MNCL 加载 + `--dump` 对照验证。
+廉价探索思路已用尽。
+
+
+**块内分割确认**：`(nop,nop,mvnop)` 块在不同程序之间**逐字节相同**
+（kb8 block1 vs add1 block2：0 差异）；所有含指令样本的变化字节都落在块内
+前 60 字节，**60..127 恒定**。因此：
+`128B 块 = [0..59：可变 PE 指令编码] + [60..127：nop;mvnop 固定尾部模板]`。
+编译器样本中第二 PE 槽从未出现非 nop。含义：native emitter 只需编码前
+60 字节，68 字节尾部可从任意合法镜像原样复制。

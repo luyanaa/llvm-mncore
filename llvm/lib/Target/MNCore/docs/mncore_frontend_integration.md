@@ -114,6 +114,25 @@ third_party/mncore/
 | mask/select | `mncore.maskop` + `zmask`/`wmask` |
 | barrier | `mncore.fence` + `mncore.wait`（tag 分配） |
 
+**执行模型与 layout 契约**（决定 pass 的形状）：
+
+* MN-Core 的一条 VLIW 表达式由**所有 PE 同时执行**；每个 PE 每步处理一个
+  2 长语（f32×4 / f64×2 / f16×8）。因此一个 `mncore.vec.*` op 代表
+  “所有 PE 的同一表达式”，其 `vector<4xf32>` 是**单个 PE 的切片**，不是
+  一个 tensor。
+* 首版要求 TTGIR 的 1-D blocked layout 为
+  `sizePerThread = [4]`（f32）/`[2]`（f64）/`[8]`（f16）、`order = [0]`，
+  即 lane *i* 独占连续的 4 个 f32。其他 layout 直接拒绝并给出错误，不做
+  静默重排。
+* `ttg.local_load`（L1BM/共享内存 → 寄存器）→ `mncore.vec.load`
+  （已实现：`llvm.mncore.l1load.*` → `l1bmp`，2 长语）。**待确认**：分布式
+  tensor 的每 PE 寻址究竟应选 `l1bmp`（broadcast）还是 `l1bmm`（individual），
+  需要对照 ISA 手册/实测；当前选择依据是 `l1bml2bm-emit.mir` 的 2 长语形态。
+* `tt.load`（DRAM）需要 MV → L2BM → L1BM 的 DMA 序列（M2，`mncore.dma`）；
+  首版切片可先用 `ttg.local_load` 验证计算路径。
+* `tt.store` 需要 PE → L1BM 的 `l1b` 方向；该方向目前**未接线**
+  （isel 的 `set` 限定符仍拒绝），因此首版以 `mncore.mat.write` 观测结果。
+
 **首版限制**：程序必须能完全展开为直线代码（后端拒绝
 `BR/BRCOND/BR_CC/BR_JT/BRIND`，`MNCoreISelDAGToDAG.cpp:70-74`）。Triton 的
 `scf.for`/`scf.if` 必须在 `mnir` stage 之前完全 unroll 或 if-convert 成掩码；
@@ -235,3 +254,92 @@ codegen。
 | F3 | TileLang target kind + `CodeGenMNCore` | 单个 copy kernel 产出 `.vsm` |
 | F4 | buffer 参数 + fixup + `mnrt` 重定位 | 多 kernel buffer reuse 数值对拍 |
 | F5 | dot / GEMM 路径 | 与 CPU golden 对拍 |
+
+---
+
+## 7. `mncore.dma` 设计 (2026-11-03)
+
+目标：把 Triton `tt.load` / TileLang `T.copy` 的 DRAM→共享内存路径收敛到一个
+op，避免前端各自拼 Layer A token。
+
+### 7.1 语义
+
+```
+mncore.dma src_space, src_addr, l2_addr, l1_addr, size, tag, mv_flags
+```
+
+* 地址单位一律 **longword（8 B）**；
+* 语义：`DRAM/PDM[src_addr .. +size) → L2BM[l2_addr ..) → L1BM[l1_addr ..)`；
+* `tag` 供后续 `mncore.wait` 使用；`size` 为 longword 数；
+* 只做搬运，不做同步；等待由显式的 `mncore.wait` 表达。
+
+### 7.2 Lowering（全部是已验证的 Layer A 指令）
+
+```llvm
+%s = call i64 @llvm.mncore.mvop(i64 <src_space>, i64 <src_addr>, i64 <mv_flags>)
+%d = call i64 @llvm.mncore.mvop(i64 2, i64 <l2_addr>, i64 <mv_flags>)
+%p = call i64 @llvm.mncore.mvparams(i64 <size>, i64 <tag>, i64 -1, i64 -1)
+call void @llvm.mncore.mv(i64 0, i64 %p, i64 %s, i64 %d)
+%c = call i64 @llvm.mncore.lbop(i64 1, i64 <l2_addr>, i64 1, i64 0)
+%b = call i64 @llvm.mncore.lbop(i64 0, i64 <l1_addr>, i64 1, i64 0)
+call void @llvm.mncore.l2b(i64 0, i64 0, i64 %c, i64 %b)
+```
+
+`mvp` 的源/目的 kind 决定方向（`1=DRAM`, `2=L2BM`, `0=PDM`），因此
+DRAM→L2BM 与 PDM→L2BM 共用同一 opcode；`l2bmb` 的 `set=0` 表示全部 L1B
+（与 `intrinsics.ll` 的 `l2b1` 一致）。hazard/packetizer 会在 `mv` 与
+`l2b`、`l2b` 与后续 `l1b` 之间插入必要的 nop。
+
+### 7.3 未闭合
+
+* **buffer 基址**仍走 §13 的 fixup 契约（地址字段静态）；
+* 首版只支持**单块连续**搬运；多 tile / 跨 group / 广播（`mvb2/mvb4/mvd`）
+  尚未暴露；
+* L1B 子集 `set` 固定 0；多 L1B 分配需要额外的资源模型；
+* `wait` 的 tag 由前端或 tag 分配 pass 负责；当前不自动插入。
+
+---
+
+## 8. Triton 3.9 ↔ LLVM 24 bring-up 记录 (2026-11-04)
+
+上游 Triton 3.9 假定的是更老的 LLVM/MLIR；用本仓库的 LLVM 24 构建时，实际
+需要以下补丁（均已应用到 `../triton-mncore`）：
+
+| 文件 | 问题 | 处理 |
+|---|---|---|
+| `lib/Conversion/TritonGPUToLLVM/WarpSpecializeUtility.cpp` | `LoopAnnotationAttr::get` 少 2 个参数 | LLVM 24 新增 `align`、`parallelAccesses`；按新签名显式占位 |
+| `python/src/llvm.cc` | `OptPassGate::shouldRunPass` 多 `funcName` 参数 | 覆盖函数改为 3 参 |
+| `python/src/llvm.cc` | `PassBuilder` 构造函数新增 `LLVMContext&` 首参 | 传入 `mod->getContext()` |
+| `python/src/llvm.cc` | `LLVMInitializeNVPTX*/AMDGPU*` 未声明 | 本仓库 LLVM 必须同时构建 `NVPTX;AMDGPU` target（Triton 核心无条件初始化它们） |
+| `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp` | `arith::populateCeilFloorDivExpandOpsPatterns` 已移除 | 该展开已并入 `populateArithToLLVMConversionPatterns`，删除显式调用 |
+| `python/src/ir.cc` 及 `third_party/{nvidia/hopper,amd}` | Release 下 `dump()` 被 `LLVM_DUMP_METHOD` 裁掉 | 以 `-DLLVM_ENABLE_DUMP=ON` 构建 LLVM（上游假定 assertions 或 dump 可用） |
+
+构建配置（已验证 configure 通过）：
+
+```sh
+# LLVM/MLIR
+cmake -G Ninja -S llvm -B build-mlir \
+  -DLLVM_ENABLE_PROJECTS="mlir;lld" \
+  -DLLVM_TARGETS_TO_BUILD="NVPTX;AMDGPU" \
+  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=MNCore \
+  -DLLVM_ENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Release
+
+# Triton（nanobind 需要装在独立 venv 中）
+cmake -G Ninja -S . -B ../triton-mncore-build \
+  -DLLVM_SYSPATH=/Users/yanlu/Documents/llvm-mncore/build-mlir \
+  -DTRITON_CODEGEN_BACKENDS="nvidia;amd" \
+  -DTRITON_CACHE_PATH=... -DTRITON_WHEEL_DIR=... \
+  -DTRITON_BUILD_PYTHON_MODULE=ON -DTRITON_BUILD_UT=OFF \
+  -DTRITON_BUILD_PROTON=OFF -DTRITON_BUILD_NVIDIA_GSAN_RUNTIME=OFF \
+  -DPython3_EXECUTABLE=<venv>/bin/python -Dnanobind_ROOT=<venv>/.../nanobind/cmake
+```
+
+注意：
+
+* `LLVM_SYSPATH` 指向 `build-mlir` 即可：`MLIRConfig.cmake` 会把源码
+  `mlir/include` 与生成头目录都导出，不需要 `cmake --install`；
+* `TRITON_CODEGEN_BACKENDS` 不能为空：核心的 `TritonInstrumentToLLVM`
+  依赖 NVIDIA 方言的生成头；
+* AMD 方言被 `python/src/gluon_ir.cc` 无条件 include，因此 `amd` 也必须启用；
+* Triton 的 TTGIR layout 默认按 GPU warp 选择；mncore backend 的
+  `make_ttgir` 目前只是占位，真正的 mncore layout 在 `mnir` pass 中定义。

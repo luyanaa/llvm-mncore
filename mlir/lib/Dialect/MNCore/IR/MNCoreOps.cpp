@@ -324,6 +324,28 @@ LogicalResult MvOp::verify() {
   return success();
 }
 
+LogicalResult DmaOp::verify() {
+  if (getSrcSpace() != 0 && getSrcSpace() != 1)
+    return emitOpError() << "src_space must be 0 (PDM) or 1 (DRAM), got "
+                         << getSrcSpace();
+  if (getSize() == 0)
+    return emitOpError() << "size must be nonzero";
+  if (getSize() > 0xffffffffULL)
+    return emitOpError() << "size must fit 32 bits, got " << getSize();
+  if (getTag() == 0 || getTag() > 0xff)
+    return emitOpError()
+           << "tag must be 1..255 (tag 0 is not a valid MV completion tag)";
+  for (auto [name, addr] : {std::pair{"src_addr", getSrcAddr()},
+                            std::pair{"l2_addr", getL2Addr()},
+                            std::pair{"l1_addr", getL1Addr()}}) {
+    if (addr > 0xffffffffULL)
+      return emitOpError() << name << " must fit 32 bits, got " << addr;
+  }
+  if (getMvFlags() & ~uint32_t{0xf})
+    return emitOpError() << "unknown MV flag bits in " << getMvFlags();
+  return success();
+}
+
 LogicalResult WaitOp::verify() {
   if (getTag() == 0 || getTag() > 0xff)
     return emitOpError() << "tag must be 1..255 (tag 0 is not a valid MV "

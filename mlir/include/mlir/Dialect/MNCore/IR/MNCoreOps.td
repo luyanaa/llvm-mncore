@@ -273,6 +273,22 @@ def MNCore_MvOp : MNCore_InstOp<"mv"> {
                        MNCore_MVOp:$opcode);
 }
 
+// DRAM/PDM -> L2BM -> L1BM copy (one MV command plus one L2BM->L1B move).
+// Addresses are longword units. This is the landing op for Triton tt.load and
+// TileLang T.copy; buffer bases still need the relocation contract.
+def MNCore_DmaOp : MNCore_Op<"dma", [
+    MemoryEffects<[
+      MemRead<MNCore_DeviceMem>, MemWrite<MNCore_DeviceMem>,
+      MemRead<MNCore_MVChannel>, MemWrite<MNCore_MVChannel>
+    ]>]> {
+  let summary = "DRAM/PDM -> L2BM -> L1BM copy";
+  let arguments = (ins I32Attr:$src_space, I64Attr:$src_addr,
+                       I64Attr:$l2_addr, I64Attr:$l1_addr,
+                       I64Attr:$size, I32Attr:$tag,
+                       DefaultValuedAttr<I32Attr, "0">:$mv_flags);
+  let hasVerifier = 1;
+}
+
 def MNCore_WaitOp : MNCore_Op<"wait", [
     MemoryEffects<[MemRead<MNCore_MVChannel>, MemWrite<MNCore_MVChannel>]>]> {
   let summary = "wait on an MV tag";
