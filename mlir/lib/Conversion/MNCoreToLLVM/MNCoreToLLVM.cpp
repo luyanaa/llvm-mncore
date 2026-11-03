@@ -516,6 +516,28 @@ struct VecLoadLowering : OpConversionPattern<mncore::VecLoadOp> {
   }
 };
 
+struct VecStoreLowering : OpConversionPattern<mncore::VecStoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mncore::VecStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    SmallVector<Value> args = {
+        adaptor.getValue(),
+        i64Const(rewriter, loc, static_cast<int64_t>(op.getMode())),
+        adaptor.getDest(),
+        i64Const(rewriter, loc, op.getSet()),
+    };
+    std::string name =
+        "llvm.mncore.l1store." + vectorSuffix(op.getValue().getType());
+    rewriter.create<LLVM::CallIntrinsicOp>(loc, rewriter.getStringAttr(name),
+                                           args);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct MatWriteLowering : OpConversionPattern<mncore::MatWriteOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -585,7 +607,8 @@ struct MNCoreToLLVMPass
              WaitLowering, FenceLowering, MaskDirLowering, DmaLowering,
              VecFmaLowering, VecMulLowering, VecAddLowering, VecMaxLowering,
              VecMinLowering, MatVecLowering, MatWriteLowering,
-             MatReadLowering, VecLoadLowering>(converter, ctx);
+             MatReadLowering, VecLoadLowering, VecStoreLowering>(converter,
+                                                                 ctx);
     populateFuncToLLVMConversionPatterns(converter, patterns);
     arith::populateArithToLLVMConversionPatterns(converter, patterns);
 

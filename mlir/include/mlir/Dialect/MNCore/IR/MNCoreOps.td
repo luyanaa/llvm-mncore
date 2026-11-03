@@ -416,4 +416,18 @@ def MNCore_VecLoadOp : MNCore_Op<"vec.load", [
   let hasVerifier = 1;
 }
 
+// PE -> L1BM writeback. The collect forms are l1bmm@ (MAB) and l1bmm4@
+// (MAB4); a broadcast store is undefined, and l1bmd collect still needs the
+// mabdiff operand.
+def MNCore_VecStoreOp : MNCore_Op<"vec.store", [
+    MemoryEffects<[MemRead<MNCore_PEState>, MemWrite<MNCore_DeviceMem>]>]> {
+  let summary = "store a PE vector into L1BM with an explicit distribution "
+                "mode";
+  let arguments = (ins AnyFixedVectorOfNonZeroRank:$value,
+                       MNCore_L1Mode:$mode,
+                       MNCore_TokenType:$dest,
+                       I64Attr:$set);
+  let hasVerifier = 1;
+}
+
 #endif // MLIR_DIALECT_MNCORE_IR_MNCOREOPS_TD

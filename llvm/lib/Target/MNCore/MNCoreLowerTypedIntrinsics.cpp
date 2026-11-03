@@ -48,7 +48,7 @@ using namespace llvm;
 namespace {
 
 enum class Op { FMA, MUL, ADD, MAX, MIN, MATVEC, MATWRITE, MATREAD,
-                L1LOAD };
+                L1LOAD, L1STORE };
 enum class Prec { D, F, H };
 
 class MNCoreLowerTypedIntrinsics : public FunctionPass {
@@ -92,6 +92,7 @@ bool MNCoreLowerTypedIntrinsics::parseName(StringRef Name, Op &O, Prec &P) {
   else if (OpName == "matwrite") O = Op::MATWRITE;
   else if (OpName == "matread") O = Op::MATREAD;
   else if (OpName == "l1load") O = Op::L1LOAD;
+  else if (OpName == "l1store") O = Op::L1STORE;
   else return false;
   if (Ty == "v2f64") { P = Prec::D; return true; }
   if (Ty == "v4f32") { P = Prec::F; return true; }
@@ -268,6 +269,7 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       NSrc = 2;
     else if (O == Op::MATVEC) NSrc = 2;
     else if (O == Op::MATWRITE) NSrc = 1;
+    else if (O == Op::L1STORE) NSrc = 1;
     else NSrc = 0;
     // l1load takes (mode, lbop, zmask, wmask): the masks follow the address
     // token, not a vector operand.
@@ -396,6 +398,7 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       MauId = (uint64_t)(P == Prec::D ? mncore::MAUOp::DMRead : P == Prec::F ? mncore::MAUOp::FMRead : mncore::MAUOp::HMRead);
       break;
     case Op::L1LOAD:
+    case Op::L1STORE:
       break;
     }
 
@@ -456,6 +459,33 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       // but the read observes the old value. The loaded value is consumed by
       // later expressions, so force at least one empty step here; the hazard
       // pass then adds the remaining LM port spacing (3.6.3.9).
+      B.CreateCall(Fence);
+    } else if (O == Op::L1STORE) {
+      // (value, mode, lbop, set). Only the collect forms l1bmm@ / l1bmm4@ are
+      // wired; broadcast has no collect, and l1bmd collect still needs the
+      // mabdiff operand.
+      auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+      auto *SetC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+      if (!ModeC || !SetC)
+        report_fatal_error(
+            "MN-Core2 Layer B: l1store mode/set must be constant");
+      uint64_t Opc;
+      switch (ModeC->getZExtValue()) {
+      case 1:
+        Opc = (uint64_t)mncore::L1BOp::L1BMM;
+        break;
+      case 2:
+        Opc = (uint64_t)mncore::L1BOp::L1BMM4;
+        break;
+      default:
+        report_fatal_error(
+            "MN-Core2 Layer B: l1store only supports MAB/MAB4 collects");
+      }
+      Value *Args[7] = {B.getInt64(Opc), B.getInt64(2), Tok(Src[0]),
+                        CI->getArgOperand(2),
+                        B.getInt64(SetC->getZExtValue() & 0xf),
+                        B.getInt64(-1), B.getInt64(-1)};
+      B.CreateCall(L1b, Args);
       B.CreateCall(Fence);
     } else {
       // fma / mul / add (MAU vector forms)

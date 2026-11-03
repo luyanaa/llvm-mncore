@@ -91,3 +91,12 @@ func.func @dma() {
                     mv_flags = 0 : i32}> : () -> ()
   return
 }
+
+// CHECK-LABEL: llvm.func @vecstore
+func.func @vecstore(%v: vector<4xf32>) {
+  // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
+  %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
+  // CHECK: llvm.call_intrinsic "llvm.mncore.l1store.v4f32"
+  "mncore.vec.store"(%v, %lb) <{mode = 1 : i64, set = 1 : i64}> : (vector<4xf32>, !mncore.token) -> ()
+  return
+}

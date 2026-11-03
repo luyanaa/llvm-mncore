@@ -124,6 +124,18 @@ def int_mncore_l1load_v2f64 : MNVecLoad<llvm_v2f64_ty>;
 def int_mncore_l1load_v4f32 : MNVecLoad<llvm_v4f32_ty>;
 def int_mncore_l1load_v8f16 : MNVecLoad<llvm_v8f16_ty>;
 
+// Layer B memory access: PE slot -> L1BM (collect form). Arguments:
+//   mode: 1=MAB(l1bmm@) 2=MAB4(l1bmm4@); broadcast/distributed are not
+//         expressible as a collect in this ABI yet.
+//   lbop: the L1BM destination token
+//   set : MAB set/destination (0..15), encoded as @<set>
+class MNVecStore<LLVMType vt> : DefaultAttrsIntrinsic<[],
+    [vt, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
+    [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
+def int_mncore_l1store_v2f64 : MNVecStore<llvm_v2f64_ty>;
+def int_mncore_l1store_v4f32 : MNVecStore<llvm_v4f32_ty>;
+def int_mncore_l1store_v8f16 : MNVecStore<llvm_v8f16_ty>;
+
 //===----------------------------------------------------------------------===//
 // Instruction expressions.
 //===----------------------------------------------------------------------===//

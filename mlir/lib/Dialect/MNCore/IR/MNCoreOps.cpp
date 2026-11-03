@@ -375,6 +375,34 @@ LogicalResult VecMinOp::verify() {
 LogicalResult MatVecOp::verify() {
   return verifyVectorType(getOperation(), getResult().getType());
 }
+LogicalResult VecStoreOp::verify() {
+  if (failed(verifyVectorType(getOperation(), getValue().getType())))
+    return failure();
+  auto lb = getDest().getDefiningOp<LbOpOp>();
+  if (!lb)
+    return emitOpError() << "dest must be an mncore.lbop token";
+  if (lb.getMem() != 0)
+    return emitOpError() << "vec.store writes L1BM; lbop.mem must be 0 (L1B)";
+  if (getMode() == L1Mode::Broadcast)
+    return emitOpError()
+           << "a broadcast store is not defined; choose MAB (l1bmm@) or "
+              "MAB4 (l1bmm4@)";
+  if (getMode() == L1Mode::Distributed)
+    return emitOpError()
+           << "l1bmd collect is not wired yet (it needs a mabdiff operand)";
+  uint64_t alignment =
+      (getMode() == L1Mode::MAB) ? (lb.getWidth() == 2 ? 8 : 4)
+                                 : (lb.getWidth() == 2 ? 32 : 16);
+  if (lb.getAddr() % alignment != 0)
+    return emitOpError() << "address " << lb.getAddr()
+                         << " (longwords) is not " << alignment
+                         << "-longword aligned for distribution mode "
+                         << stringifyL1Mode(getMode());
+  if (getSet() > 0xf)
+    return emitOpError() << "set must be 0..15, got " << getSet();
+  return success();
+}
+
 LogicalResult MatWriteOp::verify() {
   return verifyVectorType(getOperation(), getSrc().getType());
 }

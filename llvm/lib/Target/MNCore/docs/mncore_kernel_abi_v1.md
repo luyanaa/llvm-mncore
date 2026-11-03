@@ -595,3 +595,129 @@ add2 block0 `iadd $n0 $m0 -> $s0/1000` vs block4 `iadd $m4 $n4 -> $r0/1000`：
 `128B 块 = [0..59：可变 PE 指令编码] + [60..127：nop;mvnop 固定尾部模板]`。
 编译器样本中第二 PE 槽从未出现非 nop。含义：native emitter 只需编码前
 60 字节，68 字节尾部可从任意合法镜像原样复制。
+
+
+**修正与 Block Encoder v0（2026-11-04）**
+* 修正表述：已验证的是“当前样本中仅 bytes 0..59 变化”，**未证明** packed
+  块永久只有 60 B 可编码。128 B 作为完整逻辑块保留（PackMode + 两个 PE 槽 +
+  MV 槽；AUTO_STRIDE 为三个 PE 槽，暂不支持）。观测到的恒定尾部
+  （bytes 60..127，已验证子集 SHA-256 前 16 位 `f570986fa6c67b11`）仅作为
+  带适用条件的模板，不是语义。
+* Pack mode：`--dump` 显示每块 2 PE + 1 MV，符合手册 §1.2 的 **FLAT**
+  （2 PE + 1 MV）；AUTO_STRIDE（3 PE + 1 MV）未观测、暂不支持。该对应关系
+  是待确认假设（需 image metadata/loader 证明），不是已证模式。
+* Encoder v0（`suzhou:~/libmnrt/encoder/block_encoder.py`）：PackedBlock
+  （mode、PE 槽、MV 槽、trailer hash）、集中 FieldMap（int_imm/float_imm）、
+  `Unsupported → fail closed`（非有限/超范围浮点、未知掩码、非 nop 第二 PE
+  槽、auto-stride 全部拒绝，不产出镜像）。
+* E0 结果：整数立即数 9（模板 7）与 291、浮点 2.0（模板 1.0）均与官方镜像
+  **逐字节一致**；inf 被 fail-closed。
+* 下一梯级：E1 官方 loader 接受自产镜像 → E2 `--dump` 语义还原 → E3 模拟器
+  数值 → E4 硬件。`/1000` 掩码仍 unsupported（未编码前禁止输出）；浮点边界
+  （subnormal/Inf/NaN/舍入）待采样；Relocation v2 保持语义级，EncodedFixup
+  内部另加、不改已冻结契约。
+
+
+**E0/E1 覆盖扩展（2026-11-04）**
+* `block_encoder.py` 新增 `ipassa_dst`（目的地址）与 `ulpassa_src_grf1` /
+  `ulpassa_dst_lm1`（源空间/源地址、目的地址）字段编码器；全部字段集中在
+  FieldMap，未知情况一律 `Unsupported`（fail closed）。
+* E0（与官方镜像逐字节一致）矩阵：
+  - `immu` 整数立即数：9（模板 7）、291 —— PASS
+  - `immu` 浮点立即数：2.0（模板 1.0）—— PASS；inf → fail-closed
+  - `ipassa $r4 -> $sX`：X=5/8/9 —— PASS
+  - `ulpassa`：（ls0→lm2）、（ls4→lm4）、（ls8→lm6）—— PASS
+  - 编码规则修正：byte7/22 的源地址项是 **算术加** `0x20 + ((addr>>1)<<4)`，
+    不是按位或（s4 会与 0x20 基位碰撞）。
+* E1：用编码器把 kb8 的 block0 改写为 `immu i"42"` 构造自产镜像，官方 loader
+  （`clCreateProgramWithBinary → build → kernel → enqueue → finish`）**接受并执行**
+  （`PROBE OK`）。
+* E2/E3 限制：`mnclc --dump` 只对 C 源码，不能反汇编既有镜像；MNCL native
+  镜像亦不能交给 gpfn3（格式不同）。官方镜像→指令文本/数值的 oracle 目前缺失，
+  E2/E3 需自写解码器或依赖未来工具。
+* 浮点对数律仍按“已验证子集”处理（有限/范围内），边界（subnormal/Inf/NaN/
+  舍入）未采样；不将其提升为最终编码模型。
+
+
+**E0–E4 梯级状态（2026-11-04）**
+* E0（逐字节一致，已验证子集）：immu 整数 9/291、immu 浮点 2.0、
+  ipassa $r4->$s5/$s8/$s9、ulpassa (ls0->lm2)/(ls4->lm4)/(ls8->lm6)。
+  子集外 fail-closed。
+* E1：编码器改写 kb8 block0 为 `immu i"42"` 的自产镜像被官方 loader
+  接受并执行（PROBE OK）。
+* E2：自写解码器（字节→规范文本）与官方 `--dump` 对应行逐条一致
+  （immu/ipassa/ulpassa，9 项 PASS）。注意 `--dump` 只能从 C 源生成，
+  官方 image→text 转储工具缺失，E2 以官方文本作同流对照。
+* E3：数值 kernel PE 填 7 → L1BM → L2BM → DRAM；镜像 `#args=1`、
+  `#fixup=1`（DRAM 指针重定位点）；host 绑定 cl_mem、enqueue、readback：
+  `out[0]=0x0000000700000007`，**E3 PASS**（官方 MNCL 模拟器路径）。
+* E4：**本环境不可完成**——suzhou 仅有 emu2 模拟设备，无 MN-Core 2 硬件/
+  驱动。需真实设备 + 官方驱动，使用同一镜像。
+
+
+## 13. E0 完全覆盖与 llvm + assemble3 接入设计 (2026-11-04)
+
+**已核实的事实**
+* `assemble3` 输出是文本位串：`i`/`j` 行为 **292-bit PE 指令**（逐字符 0/1，
+  与手册 PE=292 bit 一致），`m` 行为 **82-bit MV 指令**（实测）。
+* MNCL payload 是 128 B 块（PE0+PE1+MV）的**重新序列化**：把同一条
+  `l1bmm@0 $ln0v $lb0` 的 292-bit 位串在 MNCL 块/整个 payload 中做逐位搜索
+  （MSB/LSB/反转）**均无命中** → 不能直接嵌入，必须字段级转码。
+
+**E0 完全覆盖的操作性定义**（由 `encoder/canonical.py` 强制）
+* 对后端闭环内核实际发射的每条指令，必须满足以下之一：
+  1. 有 mnclc 可表达的等价指令 → **E0** 逐字节一致；
+  2. mnclc 无法表达 → 用 **292-bit 解码交叉验证 + E1/E2/E3**；
+  3. 属于 emulator-only 控制（`d get/set`）→ `IMAGE-EXCLUDED`，不进入镜像。
+* 任何未覆盖项 **fail closed**（不产出镜像）。
+
+**覆盖矩阵（按计划优先级）**
+| 类 | 指令 | 现状 | oracle |
+|---|---|---|---|
+| 1 | nop / immu(int,float) / ipassa / ulpassa | E0 已过 | mnclc E0 + dump E2 |
+| 1 | iadd、其余 ALU | 字段图部分 | mnclc E0 + dump E2 |
+| 2 | l1bmp / l1bmm / l1bmm@ / l1bmd | 未编码 | mnclc E0 + E1/E3 |
+| 3 | fvfma/fvmul/fvadd | 未编码 | mnclc E0 + E3 |
+| 4 | mvp / l2bm* / wait | 未编码 | mnclc E0 + E3 |
+| 5 | mwrite/mread/matvec | 未编码 | mnclc E0 + E3 |
+| 6 | 双 PE 槽 / 掩码 `/(...)` / auto-stride | 不支持（fail closed） | 需 mnclc 样本或 292-bit 解码 |
+
+**llvm + assemble3 接入选项**
+* **A（推荐，长期主线）**：`llc .vsm` → Canonical IR → 128 B Block Encoder。
+  不依赖 assemble3 的 GPFN 应用格式；assemble3 保留为**合法性 oracle**
+  （每类编码产物仍可回灌 assemble3 校验）。
+* **B（验证/替代输入）**：`assemble3` 的 `i/j/m` 位串 → 292/82-bit 字段解码
+  → 同一 Canonical IR → 同一编码器。优点：以官方汇编器的位串为准；
+  起点是对同一指令比较“文本派生的 canonical”与“位串解码的 canonical”。
+* **C（不推荐）**：GPFN 应用 → MNCL 镜像转码。已在实测中证明裸 assemble3
+  文本被 loader 拒绝，GPFN 应用格式未文档化，风险最高。
+
+**Canonical IR（共享接口）**
+```
+PackedBlock { PackMode mode; PEInstr pe[2|3]; MVInstr mv; Fixup[] fixups; }
+PEInstr     { opcode; prec; MaskSpec mask; Operand[] operands; }
+MVInstr     { opcode; params; Operand src, dst; }
+```
+字段编码集中在 FieldMap；编码器与解码器共用同一表；Relocation 保持语义级
+（EncodedFixup 内部扩展）。每个 golden 组同时固定 assemble3/SDK/pack mode/
+设备版本（SDK 0.9 已修改 BAR hazard 检查）。
+
+**验收**
+* `encoder/canonical.py <kernel.vsm>` 对后端内核语料必须 **全部 OK**；
+* 每类至少 E0 + E1 + E3 证据（mnclc 可表达时），并有 E2 dump 对照；
+* E4 仍需真实设备（本环境仅 emu2）。
+
+
+**E0 覆盖实测（后端语料，2026-11-04）**
+`encoder/canonical.py` 对 llc 产出的 .vsm 逐指令分类：
+| 测试 | 可编码/总数 | 说明 |
+|---|---|---|
+| alu-emit | 0/23 | 全部 ALU 类待编码 |
+| mau-emit | 4/21 | 仅 nop 模板；fmfma 等待编码 |
+| l1bml2bm-emit | 8/37 | 仅 nop 模板；L1BM/L2BM 全部待编码 |
+| mv-emit | 2/8 | mvnop/nop 模板；MV/wait 待编码 |
+| mask-emit | 1/10 | 掩码 `/0111` 不支持 |
+| imm-fixed-emit | 12/23 | imm/immu/ipassa 已过；其余待编码 |
+这是 E0 完成度的量化缺口。每类按同一 oracle 流程补齐：`--dump` 一变量对
+→ FieldMap → E0 → E1/E2/E3。**“E0 完全覆盖”的验收标准**：对后端语料
+（排除 emulator-only 的 d get/set）`canonical.py` 报告 100% 可编码。

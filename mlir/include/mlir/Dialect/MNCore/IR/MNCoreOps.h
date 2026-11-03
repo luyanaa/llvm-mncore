@@ -9,9 +9,11 @@
 #ifndef MLIR_DIALECT_MNCORE_IR_MNCOREOPS_H
 #define MLIR_DIALECT_MNCORE_IR_MNCOREOPS_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/MNCore/IR/MNCoreTypes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"

@@ -280,9 +280,6 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
         auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
         return C && C->getSExtValue() == -1;
       };
-      if (!IsMinus1(6))
-        report_fatal_error(
-            "MN-Core2: mncore.l1b set qualifier not wired yet");
       bool Masked = !IsMinus1(7) || !IsMinus1(8);
       unsigned Opc;
       switch (OpcC->getZExtValue()) {
@@ -295,6 +292,30 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       auto TC = [&](unsigned I) -> SDValue {
         return Fold(N->getOperand(I));
       };
+      if (!IsMinus1(6)) {
+        // PE -> L1BM collect (l1bmm@ / l1bmm4@). The set operand packs
+        // [4]=present, [3:0]=mabadr (mabsetoperand).
+        auto *SetC = dyn_cast<ConstantSDNode>(N->getOperand(6));
+        if (!SetC)
+          report_fatal_error("MN-Core2: mncore.l1b set must be constant");
+        if (Masked)
+          report_fatal_error(
+              "MN-Core2: masked PE->L1B collect is not modelled");
+        unsigned CollectOpc;
+        switch (OpcC->getZExtValue()) {
+        case (int)mncore::L1BOp::L1BMM: CollectOpc = MNCore::L1BMM_AT; break;
+        case (int)mncore::L1BOp::L1BMM4: CollectOpc = MNCore::L1BMM4_AT; break;
+        default:
+          report_fatal_error("MN-Core2: this L1B opcode has no collect form");
+        }
+        SDValue Set = CurDAG->getTargetConstant(
+            16 | (SetC->getZExtValue() & 0xf), DL, MVT::i64);
+        SmallVector<SDValue, 4> MO{Set, TC(4), TC(5), N->getOperand(0)};
+        MachineSDNode *M = CurDAG->getMachineNode(
+            CollectOpc, DL, CurDAG->getVTList(MVT::Other), MO);
+        ReplaceNode(N, M);
+        return;
+      }
       SmallVector<SDValue, 5> MO{TC(4), TC(5)};
       if (Masked) {
         auto MaskTC = [&](unsigned I) -> SDValue {

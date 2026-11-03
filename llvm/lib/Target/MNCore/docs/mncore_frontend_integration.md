@@ -341,6 +341,8 @@ DRAM→L2BM 与 PDM→L2BM 共用同一 opcode；`l2bmb` 的 `set=0` 表示全�
 | `python/src/llvm.cc` | `LLVMInitializeNVPTX*/AMDGPU*` 未声明 | 本仓库 LLVM 必须同时构建 `NVPTX;AMDGPU` target（Triton 核心无条件初始化它们） |
 | `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp` | `arith::populateCeilFloorDivExpandOpsPatterns` 已移除 | 该展开已并入 `populateArithToLLVMConversionPatterns`，删除显式调用 |
 | `python/src/ir.cc` 及 `third_party/{nvidia/hopper,amd}` | Release 下 `dump()` 被 `LLVM_DUMP_METHOD` 裁掉 | 以 `-DLLVM_ENABLE_DUMP=ON` 构建 LLVM（上游假定 assertions 或 dump 可用） |
+| `third_party/amd/lib/TritonAMDGPUToLLVM/TritonGPUToLLVM.cpp` | `amdgpu::Chipset::parse` 在 LLVM 24 已弃用（`-Werror` 直接失败），且不再可转换为 `ROCDL` 目标描述 | 改用 `ROCDL::TargetInfo::get(arch)` |
+| `third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp` | `LLVM::LoadOp::create` 在 ordering 前新增 `isNoundef` 参数 | 显式补 `/*isNoundef=*/false` |
 
 构建配置（已验证 configure 通过）：
 
