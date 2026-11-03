@@ -320,15 +320,21 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
   `llvm.mncore.fence`（一个 NOP 步）。PE 存储允许同一步读写（3.6.3.9），
   但读观察到的是旧值，因此 load→consumer 必须隔步；hazard pass 再补足
   LM 端口所需的其余 nop。
-  **长期方向**：这是保守的实现；应由 load 结果的 MachineInstr 依赖与
-  latency 模型直接驱动调度，使与 load 无关的 ALU/MV 能填入等待间隔。
-  需要一条 `load → 独立计算 → consumer` 的回归，对比最小合法间隔与实际
-  插入的指令数，防止 packetizer 退化。
-* **新增 typed 内存 op**：`llvm.mncore.l1load.<ty>(lbop, zmask, wmask)`
-  （L1BM→PE slot），对应 MLIR `mncore.vec.load` 与 Triton
-  `ttg.local_load`。
+  **已改为调度驱动 (2026-11-04)**：Layer B pass 不再自动插入 `fence`。
+  packetizer 的 `l1bPEStageRace` 规则禁止同一步内 L1B 传输与 PE 空间的
+  producer/consumer 配对，由 hazard pass 在步间补 `nop/2`。
+  `load-gap.ll` 验证独立 ALU 可与 load 同一步发射，仅 consumer 前隔步
+  （`l1bmp ...; fvadd ...` → `nop/2` → `fvfma`）。
+* **新增 typed 内存 op**：`llvm.mncore.l1load.<ty>(mode, lbop, zmask, wmask)`
+  （L1BM→PE slot；mode 0/1/2 = l1bmp/l1bmm/l1bmm4）与
+  `llvm.mncore.l1store.<ty>(value, mode, lbop, set)`（PE→L1BM collect；
+  mode 1/2 = l1bmm@/l1bmm4@）。对应 MLIR `mncore.vec.load/store`。
 * **`mncore.dma`**（MLIR 层）：`DRAM/PDM → L2BM → L1BM`，lower 为
   `mvop + mvparams + mv + lbop + l2b`；`mvp` 的方向由操作数 kind 决定。
+* **2 长语操作数的 longword 布局（2026-11-04 数值修正）**：两个 longword
+  位于槽位 `W/2` 与 `W/2+4`（不是 +2）。分布式 load/store 的平面偏移必须
+  使用 +4；`golden_roundtrip.mir` 在 gpfn3 上以
+  `load(1.0/2.0) → fvadd → store` 验证低平面 2.0、高平面 4.0。
 * 仍限制：掩码必须为 0；跨基本块/循环未做生存期分析；matvec 语义定义为
   `dst = A*x + y`（两个向量输入）。
 

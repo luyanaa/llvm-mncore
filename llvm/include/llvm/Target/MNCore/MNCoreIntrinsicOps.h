@@ -70,6 +70,7 @@ enum class L1BOp : int64_t {
   L1BMP = 0,
   L1BMM = 1,
   L1BMM4 = 2,
+  L1BMD = 3, // one longword per PE; no double-longword form
 };
 
 // llvm.mncore.l2b(opcode, set, a, b)

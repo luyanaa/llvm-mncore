@@ -114,23 +114,27 @@ def int_mncore_matread_v8f16 : MNMatRead<llvm_v8f16_ty>;
 
 // Layer B memory access: L1BM -> PE slot. Arguments:
 //   mode: 0=broadcast(l1bmp) 1=MAB(l1bmm) 2=MAB4(l1bmm4) 3=distributed(l1bmd)
-//   lbop: the L1BM address token
+//   lbop_lo: low-plane L1BM token (the only source unless distributed)
+//   lbop_hi: high-plane L1BM token for distributed 2-longword vectors,
+//            otherwise the -1 sentinel. A distributed load issues two l1bmd
+//            (one longword per PE each), addressed W/2 and W/2+2 in the slot.
 //   zmask/wmask: i64 sentinels (-1 = absent)
 // The PE slot is allocated by mncore-lower-typed-intrinsics.
 class MNVecLoad<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
-    [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
+    [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
     [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 def int_mncore_l1load_v2f64 : MNVecLoad<llvm_v2f64_ty>;
 def int_mncore_l1load_v4f32 : MNVecLoad<llvm_v4f32_ty>;
 def int_mncore_l1load_v8f16 : MNVecLoad<llvm_v8f16_ty>;
 
 // Layer B memory access: PE slot -> L1BM (collect form). Arguments:
-//   mode: 1=MAB(l1bmm@) 2=MAB4(l1bmm4@); broadcast/distributed are not
-//         expressible as a collect in this ABI yet.
-//   lbop: the L1BM destination token
-//   set : MAB set/destination (0..15), encoded as @<set>
+//   mode: 1=MAB(l1bmm@) 2=MAB4(l1bmm4@) 3=distributed(l1bmd collect)
+//   lbop_lo: low-plane L1BM destination (the only one unless distributed)
+//   lbop_hi: high-plane destination for distributed 2-longword vectors,
+//            otherwise -1. Distributed issues two l1bmd collect transfers.
+//   set : MAB set/destination (0..15, encoded @<set>); unused when distributed
 class MNVecStore<LLVMType vt> : DefaultAttrsIntrinsic<[],
-    [vt, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
+    [vt, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
     [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 def int_mncore_l1store_v2f64 : MNVecStore<llvm_v2f64_ty>;
 def int_mncore_l1store_v4f32 : MNVecStore<llvm_v4f32_ty>;

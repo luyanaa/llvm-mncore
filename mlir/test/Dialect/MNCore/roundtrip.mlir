@@ -55,7 +55,8 @@ func.func @typed(%a: vector<4xf32>, %b: vector<4xf32>, %c: vector<4xf32>) {
   "mncore.mat.write"(%v) <{face = 1 : i64, row = 3 : i64}> : (vector<4xf32>) -> ()
   // CHECK: "mncore.vec.load"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
-  %w = "mncore.vec.load"(%lb) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token) -> vector<4xf32>
+  %hn = "mncore.none"() : () -> !mncore.token
+  %w = "mncore.vec.load"(%lb, %hn) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
   "mncore.mat.write"(%w) <{face = 0 : i64, row = 4 : i64}> : (vector<4xf32>) -> ()
   return
 }

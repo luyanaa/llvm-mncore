@@ -1,0 +1,31 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# Numeric distributed-writeback test (SDM 3.6.8.21): `imm` fills a 2-longword
+# PE vector with 0x39, two l1bmd collect transfers write the low and high
+# planes, and d get reads both planes back. Verified on gpfn3: L1BM address 0
+# and address 64 are 0x39 on every PE.
+
+--- |
+  target triple = "mncore2"
+  define void @l1bmd_store() { ret void }
+...
+---
+name:            l1bmd_store
+body:             |
+  bb.0:
+    ; CHECK: imm i"57" $llr0v
+    IMM_P 912, 67108896
+    ; CHECK: nop
+    NOP
+    ; CHECK: l1bmd $lr0v $lb0
+    L1BMD_C 0, 67108880, 0
+    ; CHECK: nop
+    NOP
+    ; CHECK: l1bmd $lr4v $lb64
+    L1BMD_C 0, 67112976, 256
+    ; CHECK: d get $lb0 1
+    DGET 2097158
+    ; CHECK: d get $lb64 1
+    DGET 2098182
+    RET
+...

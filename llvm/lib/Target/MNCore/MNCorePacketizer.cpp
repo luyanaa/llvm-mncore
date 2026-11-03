@@ -130,6 +130,32 @@ private:
     return (unsigned)((MI.getDesc().TSFlags >> 10) & 0x3);
   }
   static bool isL1BM(const MachineInstr &MI) { return l1Direction(MI) != 0; }
+
+  // A same-step PE write by an L1B transfer and a read of the same PE region
+  // by any other expression form a producer/consumer pair that the hazard
+  // pass can only separate *between* steps. PE memories permit the access
+  // (3.6.3.9), but the read observes the old value, so refuse the bundle and
+  // let the hazard pass insert the required spacing. This replaces the
+  // conservative explicit `fence` that the Layer B pass used to emit.
+  static bool l1bPEStageRace(const MachineInstr &A, const MachineInstr &B) {
+    if (!isL1BM(A) && !isL1BM(B))
+      return false;
+    SmallVector<mncore::MemAccess, 8> AA, BA;
+    mncore::miAccesses(A, AA);
+    mncore::miAccesses(B, BA);
+    for (const mncore::MemAccess &X : AA)
+      for (const mncore::MemAccess &Y : BA) {
+        if (X.Space != Y.Space || X.Write == Y.Write)
+          continue;
+        if (!mncore::isPESpace(X.Space) || X.Space == mncore::MS_T ||
+            X.Space == mncore::MS_OMR || X.Space == mncore::MS_LM0BAR ||
+            X.Space == mncore::MS_LM1BAR)
+          continue;
+        if (mncore::regionsOverlap(X.Addr, X.Width, Y.Addr, Y.Width))
+          return true;
+      }
+    return false;
+  }
   // Turnaround ($lbi) form — set on the *_T twin via TSFlags bit 12.
   static bool l1IsTurn(const MachineInstr &MI) {
     return (MI.getDesc().TSFlags >> 12) & 1;
@@ -250,6 +276,12 @@ bool MNCorePacketizerList::isLegalToPacketizeTogether(SUnit *SUI,
   // A same-step L1B/L2B producer/consumer pair is illegal (3.6.3.3/.7); the
   // hazard pass can only separate *steps*, so refuse the bundle here.
   if (mncore::sameStageRace(I, J))
+    return false;
+
+  // A same-step L1B <-> PE producer/consumer pair must also be split; see
+  // l1bPEStageRace. This is what lets typed loads/stores drop their explicit
+  // fence and rely on the scheduler/hazard pass instead.
+  if (l1bPEStageRace(I, J))
     return false;
 
   // \xC2\xA73.6.4 step-wide mask rules: a zero-flush mask on at most one expression

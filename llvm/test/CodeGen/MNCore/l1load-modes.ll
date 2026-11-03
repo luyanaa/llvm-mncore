@@ -7,7 +7,7 @@
 target triple = "mncore2"
 
 declare i64 @llvm.mncore.lbop(i64, i64, i64, i64)
-declare <4 x float> @llvm.mncore.l1load.v4f32(i64, i64, i64, i64)
+declare <4 x float> @llvm.mncore.l1load.v4f32(i64, i64, i64, i64, i64)
 declare <4 x float> @llvm.mncore.fma.v4f32(<4 x float>, <4 x float>, <4 x float>, i64, i64)
 
 define void @mab(<4 x float> %b, <4 x float> %c) {
@@ -16,7 +16,7 @@ define void @mab(<4 x float> %b, <4 x float> %c) {
 ; CHECK: nop
 ; CHECK: fvfma $llm0v $llr0v $lls0v
   %lb = call i64 @llvm.mncore.lbop(i64 0, i64 0, i64 2, i64 0)
-  %v = call <4 x float> @llvm.mncore.l1load.v4f32(i64 1, i64 %lb, i64 -1, i64 -1)
+  %v = call <4 x float> @llvm.mncore.l1load.v4f32(i64 1, i64 %lb, i64 -1, i64 -1, i64 -1)
   %r = call <4 x float> @llvm.mncore.fma.v4f32(<4 x float> %v, <4 x float> %b, <4 x float> %c, i64 -1, i64 -1)
   ret void
 }
@@ -25,7 +25,7 @@ define void @mab4(<4 x float> %b, <4 x float> %c) {
 ; CHECK-LABEL: mab4:
 ; CHECK: l1bmm4 $llb0 $llm0v
   %lb = call i64 @llvm.mncore.lbop(i64 0, i64 0, i64 2, i64 0)
-  %v = call <4 x float> @llvm.mncore.l1load.v4f32(i64 2, i64 %lb, i64 -1, i64 -1)
+  %v = call <4 x float> @llvm.mncore.l1load.v4f32(i64 2, i64 %lb, i64 -1, i64 -1, i64 -1)
   %r = call <4 x float> @llvm.mncore.fma.v4f32(<4 x float> %v, <4 x float> %b, <4 x float> %c, i64 -1, i64 -1)
   ret void
 }

@@ -50,8 +50,10 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 ### 3.3 typed（与 Layer B 同名语义）
 `mncore.vec.fma/mul/add/max/min`（3/2/2/2/2 输入 + zmask/wmask）、
 `mncore.mat.vec(face,x,y)`、`mncore.mat.write(face,row,src)`、
-`mncore.mat.read(face,row)`、`mncore.vec.load(lbop)`（L1BM → PE slot，
-对应 `llvm.mncore.l1load.*` → `l1bmp`；Triton `ttg.local_load` 的目标）。
+`mncore.mat.read(face,row)`、`mncore.vec.load(mode, lbop)`（L1BM → PE slot，
+`llvm.mncore.l1load.*`；`mode` 决定 l1bmp/l1bmm/l1bmm4/l1bmd）、
+`mncore.vec.store(value, mode, dest, set)`（PE → L1BM collect，
+`llvm.mncore.l1store.*`；当前仅 MAB/MAB4，对应 `l1bmm@`/`l1bmm4@`）。
 
 ## 4. 验证器规则（与 LLVM 后端一致）
 
@@ -94,7 +96,7 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 | 验证器 | `mlir/lib/Dialect/MNCore/IR/MNCoreOps.cpp` |
 | `mncore → LLVM` | `mlir/include/mlir/Conversion/MNCoreToLLVM/`、`mlir/lib/Conversion/MNCoreToLLVM/MNCoreToLLVM.cpp` |
 | pass 注册 | `mlir/include/mlir/Conversion/Passes.td`（`convert-mncore-to-llvm`） |
-| 测试 | `mlir/test/Dialect/MNCore/roundtrip.mlir`、`invalid.mlir`（负向）、`mlir/test/Conversion/MNCoreToLLVM/lower.mlir`、`llvm/test/CodeGen/MNCore/l1load-modes.ll` |
+| 测试 | `mlir/test/Dialect/MNCore/roundtrip.mlir`、`invalid.mlir`（负向）、`mlir/test/Conversion/MNCoreToLLVM/lower.mlir`、`llvm/test/CodeGen/MNCore/l1load-modes.ll`、`l1store.ll` |
 
 **与初版设计的差异（有意为之）**：
 
@@ -108,9 +110,10 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 4. **typed op 直接 lower 回 Layer B intrinsic**，槽位分配仍只在
    `MNCoreLowerTypedIntrinsics.cpp` 实现一份。
 5. **已提供 `mncore.dma`**（DRAM/PDM → L2BM → L1BM，lower 为已验证的
-   `mvp + l2bmb`）与 `mncore.vec.load`（带 `mode`：目前仅
-   `Broadcast` → `l1bmp`；`MAB4/MAB16/Distribute` 由验证器拒绝，等待
-   shared-layout/PE 映射实现，见 `mncore_frontend_integration.md` §2.3）。
+   `mvp + l2bmb`）、`mncore.vec.load`（`mode`：Broadcast/MAB/MAB4 已接通；
+   Distributed 用两个 1 长语源做两平面拆分）与 `mncore.vec.store`
+   （MAB/MAB4 collect → `l1bmm@`/`l1bmm4@`；Broadcast/Distributed 存储由
+   验证器拒绝）。
    **`mncore.dget` 暂未提供**：后端尚无对应的 `llvm.mncore.dget` intrinsic
    （`DGET` 目前只是 MIR 伪指令）。数值 golden 的 MLIR 入口在补 intrinsic
    后追加。
@@ -176,7 +179,7 @@ layout 计算后选择；方言本身不再默认任何模式。
 | `l1bmp` | 无额外对齐 | 允许，但存在非连续读取与地址范围限制（方言无法静态检查，文档标注） |
 | `l1bmm` | 4 longwords | 8 longwords |
 | `l1bmm4` | 16 longwords | 32 longwords |
-| `l1bmd` | 64 longwords | **不存在**；必须拒绝 |
+| `l1bmd` | 64 longwords | **不存在**；必须拆成两次单 longword 传输 |
 
 因此对当前 `<4 x f32>`（2 longwords）：
 
@@ -197,7 +200,8 @@ layout 计算后选择；方言本身不再默认任何模式。
 
 * 64 个 PE 预期持有不同值（`Distributed`）却只能生成 `l1bmp` 时，pass 必须
   报错；
-* `Distributed` + 双 longword 必须由 verifier 拒绝；
+* `Distributed` 必须提供两个 1 长语平面源；单个 2 长语源（宽度 2）必须由
+  verifier 拒绝，并提示拆成两个 longword 平面；
 * 各模式地址不满足对齐时必须由 verifier 拒绝。
 
 ### 8.6 数值级 layout regression（待模拟器工作线）
@@ -211,5 +215,26 @@ layout 计算后选择；方言本身不再默认任何模式。
 | `l1bmm4` | 0,1,2,3 | 0,1,2,3 | 16,17,18,19 |
 | `l1bmd` | 0,1,2,3 | 100,101,102,103 | 400,401,402,403 |
 
-该回归需要 gpfn3 的 `d set`/`d get` 与矩阵/PE 观测支持（见
-`golden_mem.mir` 的现有最小闭环）。
+### 8.7 数值验证结果 (2026-11-04, gpfn3)
+
+已通过 `golden_store.mir` / `golden_l1bmm.mir` 与 `check_dump.py` 验证：
+
+* `l1bmp`（现有 `golden_mem.mir`）：同一值广播到全部 64 PE；
+* `l1bmm`：MAB 0 与 MAB 1 的 PE0..3 均为 `1,2,3,4`（`golden_l1bmm.mir`）；
+* `l1bmm4`：MAB 0..3 为 `1..4`，MAB 4..7 为 `5..8`，符合
+  `index(m,p)=4*floor(m/4)+p`（临时 gpfn3 探针，已人工核对）；
+* PE→L1BM `l1bmm@0`：`imm 57` 的 2 长语向量写入 L1BM，64 个 PE 的
+  `d get` 均为 `0x3900000039`（`golden_store.mir`）。
+
+* `l1bmd` 分布式两平面：低平面 `$lb<base>`、高平面 `$lb<base+64>`。
+  **关键硬件事实**：一个 2 长语 PE 操作数的两个 longword 位于槽位的
+  `W/2` 与 `W/2+4`（不是 +2）；这是 `golden_roundtrip.mir` 数值对拍后
+  修正的。目的操作数必须是 longword 宽度（`$lr0v`），word 宽度 `$lr0`
+  不会写入；longword 目的地址必须 2 对齐。
+  `golden_l1bmd.mir` 验证 64 PE 的低/高平面读；`golden_l1bmd_store.mir`
+  验证两平面 collect；`golden_roundtrip.mir` 验证
+  `load(1.0/2.0) → fvadd → store` 后低平面 2.0、高平面 4.0（全 64 PE）。
+
+**共享布局契约**：分布式 2 长语向量要求 L1BM 中低/高两个 longword 平面各自
+连续（低平面 64 longword，高平面紧随其后），否则两次 `l1bmd` 读到的 PE
+数据不构成一个正确的 2 长语向量。

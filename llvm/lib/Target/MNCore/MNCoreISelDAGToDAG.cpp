@@ -286,6 +286,9 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       case (int)mncore::L1BOp::L1BMP: Opc = Masked ? MNCore::L1BMP_M : MNCore::L1BMP; break;
       case (int)mncore::L1BOp::L1BMM: Opc = Masked ? MNCore::L1BMM_M : MNCore::L1BMM; break;
       case (int)mncore::L1BOp::L1BMM4: Opc = Masked ? MNCore::L1BMM4_M : MNCore::L1BMM4; break;
+      case (int)mncore::L1BOp::L1BMD:
+        Opc = Masked ? MNCore::L1BMD_M : MNCore::L1BMD;
+        break;
       default:
         report_fatal_error("MN-Core2: mncore.l1b opcode id not mapped yet");
       }
@@ -313,6 +316,24 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
         SmallVector<SDValue, 4> MO{Set, TC(4), TC(5), N->getOperand(0)};
         MachineSDNode *M = CurDAG->getMachineNode(
             CollectOpc, DL, CurDAG->getVTList(MVT::Other), MO);
+        ReplaceNode(N, M);
+        return;
+      }
+      if (OpcC->getZExtValue() == (int)mncore::L1BOp::L1BMD) {
+        if (Masked || !IsMinus1(6))
+          report_fatal_error(
+              "MN-Core2: l1bmd takes no set/mask qualifiers");
+        auto *DirC = dyn_cast<ConstantSDNode>(N->getOperand(3));
+        if (!DirC)
+          report_fatal_error("MN-Core2: mncore.l1b dir must be constant");
+        // dir=1 loads (L1BMD), dir=2 collects (L1BMD_C). Both take
+        // (mabdiff, src, dst); no MAB rotation is used.
+        unsigned Op = DirC->getZExtValue() == 2 ? MNCore::L1BMD_C
+                                                : MNCore::L1BMD;
+        SDValue Diff = CurDAG->getTargetConstant(0, DL, MVT::i64);
+        SmallVector<SDValue, 4> MO{Diff, TC(4), TC(5), N->getOperand(0)};
+        MachineSDNode *M = CurDAG->getMachineNode(
+            Op, DL, CurDAG->getVTList(MVT::Other), MO);
         ReplaceNode(N, M);
         return;
       }

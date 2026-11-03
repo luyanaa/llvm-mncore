@@ -721,3 +721,16 @@ MVInstr     { opcode; params; Operand src, dst; }
 这是 E0 完成度的量化缺口。每类按同一 oracle 流程补齐：`--dump` 一变量对
 → FieldMap → E0 → E1/E2/E3。**“E0 完全覆盖”的验收标准**：对后端语料
 （排除 emulator-only 的 d get/set）`canonical.py` 报告 100% 可编码。
+
+
+**assemble3 292-bit 解码启动（2026-11-04）**
+`encoder/bits292.py`：用 assemble3 的单操作数差分确定并验证了首个指令类的
+292-bit 字段切片（全部 8 个样本 PASS）：
+* opcode：bits [216:218]（b216 为 MSB），`l1bmm@`=1、`l1bmm4@`=2；
+* 目的 PE 地址：地址位 k → bit `153-k`（k=0..4）；
+* MAB 地址：地址位 k → bit `240-k`（k=0..3；bit 241 为常量 1）；
+* L1BM 地址：地址位 k → bit `233-k`（k=0..12）。
+该结果证明 **assemble3 的 `i/j` 位串可按字段解码**，接入路径 B（292-bit
+解码 → Canonical IR → 128 B Block Encoder）可行；下一步按同一差分法扩展
+opcode 字段宽度与其余操作数类别（ALU/MAU/MV/L2BM/掩码），并与 E0 的
+mnclc 侧字段图在 Canonical IR 汇合。

@@ -1,0 +1,28 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# Numeric collect test: materialize a 2-longword PE vector with `imm`, store
+# it to L1BM with the MAB collect form, and read it back with `d get`.
+# Verified on gpfn3 (assembled with the hazard checker enabled):
+#   DEBUG-L1BM(n0c0b0,0):(f:0, i:{{0x0,0x39},{0x0,0x39}}, v:0x3900000039)
+#
+# d get spec: [3:0]mem (6=L1B), [20:4]addr, [28:21]nwords
+#   L1B@0 n2 = 6 | (2 << 21) = 4194310
+
+--- |
+  target triple = "mncore2"
+  define void @store_collect() { ret void }
+...
+---
+name:            store_collect
+body:             |
+  bb.0:
+    ; CHECK: imm i"57" $llr0v
+    IMM_P 912, 67108896
+    ; CHECK: nop
+    NOP
+    ; CHECK: l1bmm@0 $llr0v $llb0
+    L1BMM_AT 16, 67108896, 2
+    ; CHECK: d get $lb0 2
+    DGET 4194310
+    RET
+...

@@ -1,0 +1,35 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# Numeric MAB distribution test (SDM 3.6.8.8): four L1BM longwords 1..4 are
+# distributed as PE0..3 = A,B,C,D and repeated by every MAB, so MAB 0 and
+# MAB 1 both read 1,2,3,4. Verified on gpfn3:
+#   GREG0(n0c0b0m0p0)=0x1 ... m0p3=0x4, m1p0=0x1 ... m1p3=0x4
+#
+# d set/get spec: [3:0]mem (1=GRF0 6=L1B), [20:4]addr, [28:21]nwords
+#   L1B@<a> n1 = 6 | (a << 4) | (1 << 21)
+#   GRF0@0  n1 = 1 | (1 << 21) = 2097153
+
+--- |
+  target triple = "mncore2"
+  define void @l1bmm_dist() { ret void }
+...
+---
+name:            l1bmm_dist
+body:             |
+  bb.0:
+    ; CHECK: d set $lb0 1 0000000000000001
+    DSET 2097158, 1
+    ; CHECK: d set $lb1 1 0000000000000002
+    DSET 2097174, 2
+    ; CHECK: d set $lb2 1 0000000000000003
+    DSET 2097190, 3
+    ; CHECK: d set $lb3 1 0000000000000004
+    DSET 2097206, 4
+    ; CHECK: l1bmm $lb0 $lr0v
+    L1BMM 0, 67108880
+    ; CHECK: nop
+    NOP
+    ; CHECK: d get $lr0 1
+    DGET 2097153
+    RET
+...

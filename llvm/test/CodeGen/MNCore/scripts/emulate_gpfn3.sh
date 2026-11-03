@@ -20,7 +20,7 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=8 suzhou true 2>/dev/null; then
   echo "SKIP  (ssh suzhou unavailable)"
   exit 2
 fi
-LLC=/Users/yanlu/Documents/llvm-mncore/build-mncore/bin/llc
+LLC=${LLC:-/Users/yanlu/Documents/llvm-mncore/build-mncore/bin/llc}
 SDE=/opt/sde-external-10.13.1-2026-07-28-lin/sde64
 ASM=/opt/pfn/pfcomp/codegen/build/tools/assemble3
 EMU=/opt/pfn/pfcomp/codegen/build/tools/gpfn3_package_main

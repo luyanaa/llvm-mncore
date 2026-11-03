@@ -73,8 +73,9 @@ func.func @matops(%x: vector<2xf64>, %y: vector<2xf64>) {
 func.func @vecload() {
   // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
+  %hn = "mncore.none"() : () -> !mncore.token
   // CHECK: llvm.call_intrinsic "llvm.mncore.l1load.v4f32"
-  %v = "mncore.vec.load"(%lb) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token) -> vector<4xf32>
+  %v = "mncore.vec.load"(%lb, %hn) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
   "mncore.mat.write"(%v) <{face = 0 : i64, row = 0 : i64}> : (vector<4xf32>) -> ()
   return
 }
@@ -96,7 +97,8 @@ func.func @dma() {
 func.func @vecstore(%v: vector<4xf32>) {
   // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
+  %hn = "mncore.none"() : () -> !mncore.token
   // CHECK: llvm.call_intrinsic "llvm.mncore.l1store.v4f32"
-  "mncore.vec.store"(%v, %lb) <{mode = 1 : i64, set = 1 : i64}> : (vector<4xf32>, !mncore.token) -> ()
+  "mncore.vec.store"(%v, %lb, %hn) <{mode = 1 : i64, set = 1 : i64}> : (vector<4xf32>, !mncore.token, !mncore.token) -> ()
   return
 }

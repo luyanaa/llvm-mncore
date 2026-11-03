@@ -146,8 +146,8 @@ third_party/mncore/
 
   实现要求：`mnir` pass 必须根据 **源 memdesc 的 shared layout 与目标
   distributed layout** 计算 PE 映射，再选择 `l1bmp`/`l1bmm`/`l1bmm4`/`l1bmd`。
-  `mncore.vec.load` 因此携带显式 `mode`，当前只实现并验证了
-  `Broadcast`（`l1bmp`）；其余三种在布局模型落地前由验证器显式拒绝。
+  `mncore.vec.load` 携带显式 `mode`；Broadcast 与 Distributed 已实现并
+  数值验证，`MAB`/`MAB4` 的 Op 级编码已接通（等待 MAB-aware 前端布局）。
 
   额外可利用的手册性质：**同一传输类型的读/写配对保持数据布局**，适合做
   `local_load → elementwise → local_store` 的 round-trip 测试。
@@ -380,12 +380,12 @@ cmake -G Ninja -S . -B ../triton-mncore-build \
 
 | 阶段 | 测试 | 验收目标 | 当前状态 |
 |---|---|---|---|
-| T0 | plugin import / discovery | `triton.backends` 含 `mncore`，LLVM/MLIR 无重复链接冲突 | 待构建完成 |
-| T1 | 最小 TTGIR elementwise | 合法生成 `mncore` dialect | pass 已写，待编译 |
+| T0 | plugin import / discovery | `triton.backends` 含 `mncore`，LLVM/MLIR 无重复链接冲突 | **通过**（`T0 OK: ['mncore']`） |
+| T1 | 最小 TTGIR elementwise | 合法生成 `mncore` dialect | **通过**（`mncore.vec.add/mul` → `llvm.call_intrinsic`） |
 | T2 | `local_alloc → local_load` | memdesc 物理存储域一致（首版统一 L1BM） | 已定契约；load 待布局映射 |
-| T3 | 不同 PE 值的 distributed tensor | 数值级 layout 映射正确（四种模式） | **关键新增门禁**；`Distributed` 双 longword 暂被拒绝 |
-| T4 | `local_load → fma → writeback` | 寄存器生命周期与 Hazard | 计算链已验证；writeback 未接线 |
-| T5 | `DMA → load → compute → store` | 完整数据闭环 | `dma` 已验证，store 待做 |
+| T3 | 不同 PE 值的 distributed tensor | 数值级 layout 映射正确（四种模式） | **通过（模型级）**：l1bmp/l1bmm/l1bmm4/l1bmd 均由 gpfn3 数值验证；Distributed 双长语按两平面拆分 |
+| T4 | `local_load → fma → writeback` | 寄存器生命周期与 Hazard | **通过**：分布式两平面 load → add → 两平面 collect；gpfn3 数值 2.0/4.0 全 64 PE |
+| T5 | `DMA → load → compute → store` | 完整数据闭环 | **模型级通过**：DMA 已验证，Triton T4 链路生成相同的两平面 load→add→store 指令序列；数值 round-trip 全 64 PE 通过 |
 | T6 | 小尺寸 GEMM | 端到端数值 | 未开始 |
 
 T3 的数值判据见 `mncore_mlir_dialect.md` §8.6（`A[m,p] = 100m + p` 的四种

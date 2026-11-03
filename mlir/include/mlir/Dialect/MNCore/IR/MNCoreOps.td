@@ -85,9 +85,11 @@ def MNCore_MAUOp : I64EnumAttr<"MAUOp", "MN-Core MAU opcode", [
 def MNCore_L1BOp_L1BMP  : I64EnumAttrCase<"L1BMP", 0>;
 def MNCore_L1BOp_L1BMM  : I64EnumAttrCase<"L1BMM", 1>;
 def MNCore_L1BOp_L1BMM4 : I64EnumAttrCase<"L1BMM4", 2>;
+def MNCore_L1BOp_L1BMD  : I64EnumAttrCase<"L1BMD", 3>;
 
 def MNCore_L1BEnum : I64EnumAttr<"L1BKind", "MN-Core L1BM opcode", [
   MNCore_L1BOp_L1BMP, MNCore_L1BOp_L1BMM, MNCore_L1BOp_L1BMM4,
+  MNCore_L1BOp_L1BMD,
 ]> {
   let cppNamespace = "::mlir::mncore";
 }
@@ -410,6 +412,7 @@ def MNCore_VecLoadOp : MNCore_Op<"vec.load", [
                 "distribution mode";
   let arguments = (ins MNCore_L1Mode:$mode,
                        MNCore_TokenType:$source,
+                       MNCore_TokenType:$source_hi,
                        DefaultValuedAttr<I64Attr, "-1">:$zmask,
                        DefaultValuedAttr<I64Attr, "-1">:$wmask);
   let results = (outs AnyFixedVectorOfNonZeroRank:$result);
@@ -426,6 +429,7 @@ def MNCore_VecStoreOp : MNCore_Op<"vec.store", [
   let arguments = (ins AnyFixedVectorOfNonZeroRank:$value,
                        MNCore_L1Mode:$mode,
                        MNCore_TokenType:$dest,
+                       MNCore_TokenType:$dest_hi,
                        I64Attr:$set);
   let hasVerifier = 1;
 }

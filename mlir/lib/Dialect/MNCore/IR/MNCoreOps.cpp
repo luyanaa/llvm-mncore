@@ -69,6 +69,7 @@ MNCORE_ENUM_SYNC(MAUOp, MAUOp, HMRead);
 MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMP);
 MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMM);
 MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMM4);
+MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMD);
 
 MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMB);
 
@@ -385,11 +386,27 @@ LogicalResult VecStoreOp::verify() {
     return emitOpError() << "vec.store writes L1BM; lbop.mem must be 0 (L1B)";
   if (getMode() == L1Mode::Broadcast)
     return emitOpError()
-           << "a broadcast store is not defined; choose MAB (l1bmm@) or "
-              "MAB4 (l1bmm4@)";
-  if (getMode() == L1Mode::Distributed)
+           << "a broadcast store is not defined; choose MAB (l1bmm@), "
+              "MAB4 (l1bmm4@), or Distributed";
+  if (getMode() == L1Mode::Distributed) {
+    auto hi = getDestHi().getDefiningOp<LbOpOp>();
+    if (!hi)
+      return emitOpError()
+             << "distributed stores require two longword-plane destinations";
+    if (lb.getWidth() != 1 || hi.getWidth() != 1)
+      return emitOpError()
+             << "distributed store destinations must be 1-longword operands "
+                "(l1bmd has no double-longword form, SDM 3.6.8.21)";
+    if (lb.getAddr() % 64 != 0)
+      return emitOpError() << "the low plane must be 64-longword aligned";
+    if (hi.getAddr() != lb.getAddr() + 64)
+      return emitOpError()
+             << "the high plane must start 64 longwords after the low plane";
+    return success();
+  }
+  if (!getDestHi().getDefiningOp<NoneOp>())
     return emitOpError()
-           << "l1bmd collect is not wired yet (it needs a mabdiff operand)";
+           << "dest_hi must be mncore.none unless the mode is Distributed";
   uint64_t alignment =
       (getMode() == L1Mode::MAB) ? (lb.getWidth() == 2 ? 8 : 4)
                                  : (lb.getWidth() == 2 ? 32 : 16);
@@ -418,8 +435,30 @@ LogicalResult VecLoadOp::verify() {
   if (lb.getMem() != 0)
     return emitOpError() << "vec.load reads L1BM; lbop.mem must be 0 (L1B)";
 
-  // SDM 3.6.8: the distribution mode determines the required L1BM alignment,
-  // and l1bmd has no double-longword form.
+  // SDM 3.6.8. Distributed loads are the two-longword plane split: l1bmd has
+  // no double-longword form, so the low and high planes are separate
+  // 64-longword-aligned L1BM regions.
+  if (getMode() == L1Mode::Distributed) {
+    auto hi = getSourceHi().getDefiningOp<LbOpOp>();
+    if (!hi)
+      return emitOpError()
+             << "distributed loads require two longword-plane sources "
+                "(source and source_hi)";
+    if (lb.getWidth() != 1 || hi.getWidth() != 1)
+      return emitOpError()
+             << "distributed load sources must be 1-longword operands "
+                "(l1bmd has no double-longword form, SDM 3.6.8.20)";
+    if (lb.getAddr() % 64 != 0)
+      return emitOpError() << "the low plane must be 64-longword aligned";
+    if (hi.getAddr() != lb.getAddr() + 64)
+      return emitOpError()
+             << "the high plane must start 64 longwords after the low plane";
+    return success();
+  }
+  if (!getSourceHi().getDefiningOp<NoneOp>())
+    return emitOpError()
+           << "source_hi must be mncore.none unless the mode is Distributed";
+
   uint32_t width = lb.getWidth();
   uint64_t addr = lb.getAddr();
   uint64_t alignment = 0;
@@ -435,12 +474,7 @@ LogicalResult VecLoadOp::verify() {
     alignment = width == 2 ? 32 : 16;
     break;
   case L1Mode::Distributed:
-    if (width == 2)
-      return emitOpError()
-             << "l1bmd has no double-longword form; a 2-longword vector must "
-                "be split into two longword planes (SDM 3.6.8.20)";
-    alignment = 64;
-    break;
+    llvm_unreachable("handled above");
   }
   if (alignment && addr % alignment != 0)
     return emitOpError() << "address " << addr << " (longwords) is not "

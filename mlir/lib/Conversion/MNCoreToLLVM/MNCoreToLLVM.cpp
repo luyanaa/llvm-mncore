@@ -505,6 +505,7 @@ struct VecLoadLowering : OpConversionPattern<mncore::VecLoadOp> {
     SmallVector<Value> args = {
         i64Const(rewriter, loc, static_cast<int64_t>(op.getMode())),
         adaptor.getSource(),
+        adaptor.getSourceHi(),
         i64Const(rewriter, loc, op.getZmask()),
         i64Const(rewriter, loc, op.getWmask()),
     };
@@ -527,6 +528,7 @@ struct VecStoreLowering : OpConversionPattern<mncore::VecStoreOp> {
         adaptor.getValue(),
         i64Const(rewriter, loc, static_cast<int64_t>(op.getMode())),
         adaptor.getDest(),
+        adaptor.getDestHi(),
         i64Const(rewriter, loc, op.getSet()),
     };
     std::string name =

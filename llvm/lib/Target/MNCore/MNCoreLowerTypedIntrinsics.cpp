@@ -141,8 +141,6 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
   FunctionType *L1bFT = FunctionType::get(
       Type::getVoidTy(C), {I64, I64, I64, I64, I64, I64, I64}, false);
   FunctionCallee L1b = M.getOrInsertFunction("llvm.mncore.l1b", L1bFT);
-  FunctionType *FenceFT = FunctionType::get(Type::getVoidTy(C), false);
-  FunctionCallee Fence = M.getOrInsertFunction("llvm.mncore.fence", FenceFT);
 
   struct Slot {
     unsigned Space;
@@ -271,9 +269,9 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
     else if (O == Op::MATWRITE) NSrc = 1;
     else if (O == Op::L1STORE) NSrc = 1;
     else NSrc = 0;
-    // l1load takes (mode, lbop, zmask, wmask): the masks follow the address
-    // token, not a vector operand.
-    unsigned MaskBase = (O == Op::L1LOAD) ? 2 : NA;
+    // l1load takes (mode, lbop_lo, lbop_hi, zmask, wmask): the masks follow
+    // the address tokens, not a vector operand.
+    unsigned MaskBase = (O == Op::L1LOAD) ? 3 : NA;
     SmallVector<Value *, 3> Src(VA.begin(), VA.begin() + NSrc);
 
     // Pick a destination space. A GRF write may share a space with a read
@@ -428,65 +426,101 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
                          B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
       B.CreateCall(Mau, Args);
     } else if (O == Op::L1LOAD) {
-      // (mode, lbop, zmask, wmask). The mode selects the physical L1BM
-      // distribution (SDM 3.6.8); the dialect verifier has already checked
-      // alignment and the l1bmd width restriction.
+      // (mode, lbop_lo, lbop_hi, zmask, wmask). The mode selects the physical
+      // L1BM distribution (SDM 3.6.8); the dialect verifier has already
+      // checked alignment and the l1bmd width restriction.
       auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(0));
       if (!ModeC)
         report_fatal_error("MN-Core2 Layer B: l1load mode must be constant");
-      uint64_t Opc;
-      switch (ModeC->getZExtValue()) {
-      case 0: // broadcast
-        Opc = (uint64_t)mncore::L1BOp::L1BMP;
-        break;
-      case 1: // MAB broadcast
-        Opc = (uint64_t)mncore::L1BOp::L1BMM;
-        break;
-      case 2: // 4-MAB broadcast
-        Opc = (uint64_t)mncore::L1BOp::L1BMM4;
-        break;
-      default:
-        // l1bmd needs a mabdiff operand and has no double-longword form; it is
-        // not wired in the intrinsic selector yet.
-        report_fatal_error(
-            "MN-Core2 Layer B: l1bmd (distributed) is not wired yet");
+      if (ModeC->getZExtValue() == 3) {
+        // Distributed: l1bmd has no double-longword form, so a 2-longword
+        // vector needs one transfer per longword plane. The planes are
+        // contiguous by contract (the high plane starts 64 longwords after
+        // the low one). The PE slot's longwords sit at word/2 and word/2+4.
+        auto *HiC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+        if (HiC && HiC->getSExtValue() == -1)
+          report_fatal_error(
+              "MN-Core2 Layer B: distributed l1load needs a high-plane token");
+        auto TokSlotLW = [&](unsigned LWOff) -> Value * {
+          Value *A[5] = {B.getInt64(Slots[CI].Space),
+                         B.getInt64(Slots[CI].Addr / 2 + LWOff), B.getInt64(1),
+                         B.getInt64(8), B.getInt64(0)};
+          return B.CreateCall(Peop, A);
+        };
+        Value *A0[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMD),
+                        B.getInt64(1), CI->getArgOperand(1), TokSlotLW(0),
+                        B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
+        B.CreateCall(L1b, A0);
+        Value *A1[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMD),
+                        B.getInt64(1), CI->getArgOperand(2), TokSlotLW(4),
+                        B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
+        B.CreateCall(L1b, A1);
+      } else {
+        uint64_t Opc;
+        switch (ModeC->getZExtValue()) {
+        case 0: // broadcast
+          Opc = (uint64_t)mncore::L1BOp::L1BMP;
+          break;
+        case 1: // MAB broadcast
+          Opc = (uint64_t)mncore::L1BOp::L1BMM;
+          break;
+        case 2: // 4-MAB broadcast
+          Opc = (uint64_t)mncore::L1BOp::L1BMM4;
+          break;
+        default:
+          report_fatal_error("MN-Core2 Layer B: unknown l1load mode");
+        }
+        Value *Args[7] = {B.getInt64(Opc), B.getInt64(1),
+                          CI->getArgOperand(1), TokSlot(DS), B.getInt64(-1),
+                          MaskVal(MaskBase), MaskVal(MaskBase + 1)};
+        B.CreateCall(L1b, Args);
       }
-      Value *Args[7] = {B.getInt64(Opc), B.getInt64(1),
-                        CI->getArgOperand(1), TokSlot(DS), B.getInt64(-1),
-                        MaskVal(MaskBase), MaskVal(MaskBase + 1)};
-      B.CreateCall(L1b, Args);
-      // The PE memories allow a read and a write in the same step (3.6.3.9),
-      // but the read observes the old value. The loaded value is consumed by
-      // later expressions, so force at least one empty step here; the hazard
-      // pass then adds the remaining LM port spacing (3.6.3.9).
-      B.CreateCall(Fence);
     } else if (O == Op::L1STORE) {
-      // (value, mode, lbop, set). Only the collect forms l1bmm@ / l1bmm4@ are
-      // wired; broadcast has no collect, and l1bmd collect still needs the
-      // mabdiff operand.
+      // (value, mode, lbop_lo, lbop_hi, set). MAB/MAB4 use the @set collect;
+      // distributed uses two l1bmd collect transfers, one per longword plane.
       auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-      auto *SetC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+      auto *SetC = dyn_cast<ConstantInt>(CI->getArgOperand(4));
       if (!ModeC || !SetC)
         report_fatal_error(
             "MN-Core2 Layer B: l1store mode/set must be constant");
-      uint64_t Opc;
-      switch (ModeC->getZExtValue()) {
-      case 1:
-        Opc = (uint64_t)mncore::L1BOp::L1BMM;
-        break;
-      case 2:
-        Opc = (uint64_t)mncore::L1BOp::L1BMM4;
-        break;
-      default:
-        report_fatal_error(
-            "MN-Core2 Layer B: l1store only supports MAB/MAB4 collects");
+      if (ModeC->getZExtValue() == 3) {
+        auto *HiC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+        if (HiC && HiC->getSExtValue() == -1)
+          report_fatal_error(
+              "MN-Core2 Layer B: distributed l1store needs a high plane");
+        auto TokSlotLW = [&](unsigned LWOff) -> Value * {
+          Value *A[5] = {B.getInt64(Slots[Src[0]].Space),
+                         B.getInt64(Slots[Src[0]].Addr / 2 + LWOff),
+                         B.getInt64(1), B.getInt64(8), B.getInt64(0)};
+          return B.CreateCall(Peop, A);
+        };
+        Value *A0[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMD),
+                        B.getInt64(2), TokSlotLW(0), CI->getArgOperand(2),
+                        B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
+        B.CreateCall(L1b, A0);
+        Value *A1[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMD),
+                        B.getInt64(2), TokSlotLW(4), CI->getArgOperand(3),
+                        B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
+        B.CreateCall(L1b, A1);
+      } else {
+        uint64_t Opc;
+        switch (ModeC->getZExtValue()) {
+        case 1:
+          Opc = (uint64_t)mncore::L1BOp::L1BMM;
+          break;
+        case 2:
+          Opc = (uint64_t)mncore::L1BOp::L1BMM4;
+          break;
+        default:
+          report_fatal_error(
+              "MN-Core2 Layer B: l1store only supports MAB/MAB4/Distributed");
+        }
+        Value *Args[7] = {B.getInt64(Opc), B.getInt64(2), Tok(Src[0]),
+                          CI->getArgOperand(2),
+                          B.getInt64(SetC->getZExtValue() & 0xf),
+                          B.getInt64(-1), B.getInt64(-1)};
+        B.CreateCall(L1b, Args);
       }
-      Value *Args[7] = {B.getInt64(Opc), B.getInt64(2), Tok(Src[0]),
-                        CI->getArgOperand(2),
-                        B.getInt64(SetC->getZExtValue() & 0xf),
-                        B.getInt64(-1), B.getInt64(-1)};
-      B.CreateCall(L1b, Args);
-      B.CreateCall(Fence);
     } else {
       // fma / mul / add (MAU vector forms)
       Value *SX = Tok(Src[0]);

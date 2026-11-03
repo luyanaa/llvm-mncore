@@ -23,7 +23,7 @@ for a in "$@"; do
 done
 
 # Tests that emit straight .vsm text (full llc run).
-EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem"
+EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip"
 # Tests checked via -run-pass=mncore-packetizer (MIR output).
 PKT="mau-rules packetize-groups peoperand-conflict vfma-mwrite-shape mask-rules"
 # Tests checked via -run-pass=mncore-hazard (MIR output).
@@ -42,7 +42,7 @@ FLAT="peoperand-modes"
 # Hazard/race checking is a separate stage: only streams authored to be
 # race-free (single-kernel, spaced) belong here. Syntax-only verification
 # (checkers disabled) is the stage above.
-HAZARD_OK="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem layerb layerb2"
+HAZARD_OK="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip l1load-dist l1store-dist layerb layerb2"
 
 fail=0
 echo "===== FileCheck ====="
@@ -114,17 +114,44 @@ if [ $LOCAL_ONLY = 0 ]; then
     fi
   done
   echo "===== golden numeric (dump + check_dump) ====="
-  for t in golden golden_mem; do
+  for t in golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip; do
     out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
     rc=$?
     printf '%s\n' "$out" | grep -v '^emulate:'
     if [ "$t" = golden ]; then
       exp=('GREG0:n0c0b0m0p0:0=0x2A0000002A' 'GREG1:n0c0b0m0p0:2=0x3900000039')
-    else
+    elif [ "$t" = golden_mem ]; then
       exp=('GREG0:n0c0b0m0p0:0=0x39')
+    elif [ "$t" = golden_store ]; then
+      exp=('L1BM:*:0=0x3900000039')
+    elif [ "$t" = golden_l1bmm ]; then
+      exp=('GREG0:n0c0b0m0p0:0=0x1' 'GREG0:n0c0b0m0p1:0=0x2'
+           'GREG0:n0c0b0m0p2:0=0x3' 'GREG0:n0c0b0m0p3:0=0x4'
+           'GREG0:n0c0b0m1p0:0=0x1' 'GREG0:n0c0b0m15p3:0=0x4')
+    elif [ "$t" = golden_l1bmd ]; then
+      exp=('GREG0:*:0=0xaa' 'GREG0:*:4=0xbb')
+    elif [ "$t" = golden_l1bmd_store ]; then
+      exp=('L1BM:*:0=0x3900000039')
+    else
+      exp=('L1BM:*:0=0x4080000040800000')
     fi
     if [ $rc -ne 0 ] || ! python3 -I $TD/scripts/check_dump.py /tmp/mncore_$t.dmp "${exp[@]}" >/dev/null 2>&1; then
       echo "FAIL  $t  (golden value)"; remfail=$((remfail+1))
+    fi
+    if [ "$t" = golden_l1bmd_store ]; then
+      for plane in '$lb0' '$lb64'; do
+        if ! python3 -I $TD/scripts/check_dump.py --contains /tmp/mncore_$t.dmp "0x3900000039) #d get $plane 1" >/dev/null 2>&1; then
+          echo "FAIL  $t  (plane $plane)"; remfail=$((remfail+1))
+        fi
+      done
+    fi
+    if [ "$t" = golden_roundtrip ]; then
+      if ! python3 -I $TD/scripts/check_dump.py --contains /tmp/mncore_$t.dmp "0x4000000040000000) #d get \$lb0 1" >/dev/null 2>&1; then
+        echo "FAIL  $t  (low plane)"; remfail=$((remfail+1))
+      fi
+      if ! python3 -I $TD/scripts/check_dump.py --contains /tmp/mncore_$t.dmp "0x4080000040800000) #d get \$lb64 1" >/dev/null 2>&1; then
+        echo "FAIL  $t  (high plane)"; remfail=$((remfail+1))
+      fi
     fi
   done
   echo "===== assemble3 hazard/race checker (separate stage) ====="
