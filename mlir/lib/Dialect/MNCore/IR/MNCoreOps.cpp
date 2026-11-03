@@ -389,6 +389,35 @@ LogicalResult VecLoadOp::verify() {
     return emitOpError() << "source must be an mncore.lbop token";
   if (lb.getMem() != 0)
     return emitOpError() << "vec.load reads L1BM; lbop.mem must be 0 (L1B)";
+
+  // SDM 3.6.8: the distribution mode determines the required L1BM alignment,
+  // and l1bmd has no double-longword form.
+  uint32_t width = lb.getWidth();
+  uint64_t addr = lb.getAddr();
+  uint64_t alignment = 0;
+  switch (getMode()) {
+  case L1Mode::Broadcast:
+    // l1bmp: no extra alignment. Its double-longword form has non-contiguous
+    // reads and range limits that cannot be checked statically here.
+    break;
+  case L1Mode::MAB:
+    alignment = width == 2 ? 8 : 4;
+    break;
+  case L1Mode::MAB4:
+    alignment = width == 2 ? 32 : 16;
+    break;
+  case L1Mode::Distributed:
+    if (width == 2)
+      return emitOpError()
+             << "l1bmd has no double-longword form; a 2-longword vector must "
+                "be split into two longword planes (SDM 3.6.8.20)";
+    alignment = 64;
+    break;
+  }
+  if (alignment && addr % alignment != 0)
+    return emitOpError() << "address " << addr << " (longwords) is not "
+                         << alignment << "-longword aligned for distribution "
+                         << "mode " << stringifyL1Mode(getMode());
   return success();
 }
 

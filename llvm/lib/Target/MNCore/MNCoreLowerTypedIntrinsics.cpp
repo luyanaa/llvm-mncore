@@ -269,9 +269,9 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
     else if (O == Op::MATVEC) NSrc = 2;
     else if (O == Op::MATWRITE) NSrc = 1;
     else NSrc = 0;
-    // l1load takes (lbop, zmask, wmask): the masks follow the address token,
-    // not a vector operand.
-    unsigned MaskBase = (O == Op::L1LOAD) ? 1 : NA;
+    // l1load takes (mode, lbop, zmask, wmask): the masks follow the address
+    // token, not a vector operand.
+    unsigned MaskBase = (O == Op::L1LOAD) ? 2 : NA;
     SmallVector<Value *, 3> Src(VA.begin(), VA.begin() + NSrc);
 
     // Pick a destination space. A GRF write may share a space with a read
@@ -425,11 +425,32 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
                          B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
       B.CreateCall(Mau, Args);
     } else if (O == Op::L1LOAD) {
-      // (opcode, dir, src, dst, set, zmask, wmask)
-      Value *Args[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMP),
-                        B.getInt64(1), CI->getArgOperand(0), TokSlot(DS),
-                        B.getInt64(-1), MaskVal(MaskBase),
-                        MaskVal(MaskBase + 1)};
+      // (mode, lbop, zmask, wmask). The mode selects the physical L1BM
+      // distribution (SDM 3.6.8); the dialect verifier has already checked
+      // alignment and the l1bmd width restriction.
+      auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(0));
+      if (!ModeC)
+        report_fatal_error("MN-Core2 Layer B: l1load mode must be constant");
+      uint64_t Opc;
+      switch (ModeC->getZExtValue()) {
+      case 0: // broadcast
+        Opc = (uint64_t)mncore::L1BOp::L1BMP;
+        break;
+      case 1: // MAB broadcast
+        Opc = (uint64_t)mncore::L1BOp::L1BMM;
+        break;
+      case 2: // 4-MAB broadcast
+        Opc = (uint64_t)mncore::L1BOp::L1BMM4;
+        break;
+      default:
+        // l1bmd needs a mabdiff operand and has no double-longword form; it is
+        // not wired in the intrinsic selector yet.
+        report_fatal_error(
+            "MN-Core2 Layer B: l1bmd (distributed) is not wired yet");
+      }
+      Value *Args[7] = {B.getInt64(Opc), B.getInt64(1),
+                        CI->getArgOperand(1), TokSlot(DS), B.getInt64(-1),
+                        MaskVal(MaskBase), MaskVal(MaskBase + 1)};
       B.CreateCall(L1b, Args);
       // The PE memories allow a read and a write in the same step (3.6.3.9),
       // but the read observes the old value. The loaded value is consumed by

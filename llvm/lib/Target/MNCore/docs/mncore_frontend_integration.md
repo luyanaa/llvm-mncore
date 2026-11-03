@@ -124,10 +124,33 @@ third_party/mncore/
   `sizePerThread = [4]`（f32）/`[2]`（f64）/`[8]`（f16）、`order = [0]`，
   即 lane *i* 独占连续的 4 个 f32。其他 layout 直接拒绝并给出错误，不做
   静默重排。
-* `ttg.local_load`（L1BM/共享内存 → 寄存器）→ `mncore.vec.load`
-  （已实现：`llvm.mncore.l1load.*` → `l1bmp`，2 长语）。**待确认**：分布式
-  tensor 的每 PE 寻址究竟应选 `l1bmp`（broadcast）还是 `l1bmm`（individual），
-  需要对照 ISA 手册/实测；当前选择依据是 `l1bml2bm-emit.mir` 的 2 长语形态。
+* `ttg.local_load`（L1BM/共享内存 → 寄存器）**不能固定 lowering 为
+  `l1bmp`**。依据 MN-Core 2 Software Developer Manual §3.6.8，L1BM→PE 有四种
+  分配方式（§3.6.8.6/.8/.14/.20）：
+
+  | 指令 | 每 L1BM 每周期读取 | 64 PE 映射 |
+  |---|---|---|
+  | `l1bmp` | 1 longword | 同值广播到全部 64 PE |
+  | `l1bmm` | 4 longwords | 4 个 PE 各取不同值，16 个 MAB 重复该组（MAB 维广播） |
+  | `l1bmm4` | 16 longwords | 4 组不同数据，每组由 4 个 MAB 共享 |
+  | `l1bmd` | 64 longwords | 64 个 PE 各取不同值（唯一真正的逐 PE 分发） |
+
+  关键结论：
+
+  1. `l1bmm`/`l1bmm4` 仍是 **MAB 维广播**，不是逐 PE 独立加载；
+  2. 逐 PE 一对一分发只有 `l1bmd`，且手册明确 **`l1bmd` 没有 double-longword
+     分发形式**；
+  3. 因此 4×f32/PE（2 longword）的分布式 tensor 不能用一条两长语 `l1bmd`
+     完成，需要按 longword 平面拆成两条 `l1bmd`，并要求 shared/L1BM 布局
+     把同一平面（低/高 longword）连续排放，使两次读取的地址各自连续。
+
+  实现要求：`mnir` pass 必须根据 **源 memdesc 的 shared layout 与目标
+  distributed layout** 计算 PE 映射，再选择 `l1bmp`/`l1bmm`/`l1bmm4`/`l1bmd`。
+  `mncore.vec.load` 因此携带显式 `mode`，当前只实现并验证了
+  `Broadcast`（`l1bmp`）；其余三种在布局模型落地前由验证器显式拒绝。
+
+  额外可利用的手册性质：**同一传输类型的读/写配对保持数据布局**，适合做
+  `local_load → elementwise → local_store` 的 round-trip 测试。
 * `tt.load`（DRAM）需要 MV → L2BM → L1BM 的 DMA 序列（M2，`mncore.dma`）；
   首版切片可先用 `ttg.local_load` 验证计算路径。
 * `tt.store` 需要 PE → L1BM 的 `l1b` 方向；该方向目前**未接线**
@@ -151,6 +174,11 @@ Triton 的运行时指针无法直接进入指令。因此：
 当前 `mnrt` 只记录 binding、**尚未实现 relocation**（见
 `mncore_kernel_abi_v1.md` §10）。这是与运行时工作线的**交叉契约**，必须先冻结
 fixup 记录格式。
+
+**合法性门禁**：Triton pass 不得把动态 `tt.load` 指针无条件折叠为静态地址。
+只有当寻址能证明是 `buffer base + static offset`（且 offset 按 §13 的 unit
+整除）时才允许生成 `mncore.dma`；否则必须在合法化阶段报错，不得留到
+assemble3 或 runtime。当前原型 pass 对 `tt.load` 一律拒绝。
 
 ### 2.5 版本风险
 
@@ -343,3 +371,20 @@ cmake -G Ninja -S . -B ../triton-mncore-build \
 * AMD 方言被 `python/src/gluon_ir.cc` 无条件 include，因此 `amd` 也必须启用；
 * Triton 的 TTGIR layout 默认按 GPU warp 选择；mncore backend 的
   `make_ttgir` 目前只是占位，真正的 mncore layout 在 `mnir` pass 中定义。
+
+---
+
+## 9. Triton 接入验收门禁 (2026-11-04)
+
+| 阶段 | 测试 | 验收目标 | 当前状态 |
+|---|---|---|---|
+| T0 | plugin import / discovery | `triton.backends` 含 `mncore`，LLVM/MLIR 无重复链接冲突 | 待构建完成 |
+| T1 | 最小 TTGIR elementwise | 合法生成 `mncore` dialect | pass 已写，待编译 |
+| T2 | `local_alloc → local_load` | memdesc 物理存储域一致（首版统一 L1BM） | 已定契约；load 待布局映射 |
+| T3 | 不同 PE 值的 distributed tensor | 数值级 layout 映射正确（四种模式） | **关键新增门禁**；`Distributed` 双 longword 暂被拒绝 |
+| T4 | `local_load → fma → writeback` | 寄存器生命周期与 Hazard | 计算链已验证；writeback 未接线 |
+| T5 | `DMA → load → compute → store` | 完整数据闭环 | `dma` 已验证，store 待做 |
+| T6 | 小尺寸 GEMM | 端到端数值 | 未开始 |
+
+T3 的数值判据见 `mncore_mlir_dialect.md` §8.6（`A[m,p] = 100m + p` 的四种
+模式期望表）。在 T3 通过前，任何 Triton kernel 都不得宣称语义正确。

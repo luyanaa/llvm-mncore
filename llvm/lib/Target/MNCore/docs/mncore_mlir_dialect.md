@@ -94,7 +94,7 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 | 验证器 | `mlir/lib/Dialect/MNCore/IR/MNCoreOps.cpp` |
 | `mncore → LLVM` | `mlir/include/mlir/Conversion/MNCoreToLLVM/`、`mlir/lib/Conversion/MNCoreToLLVM/MNCoreToLLVM.cpp` |
 | pass 注册 | `mlir/include/mlir/Conversion/Passes.td`（`convert-mncore-to-llvm`） |
-| 测试 | `mlir/test/Dialect/MNCore/roundtrip.mlir`、`mlir/test/Conversion/MNCoreToLLVM/lower.mlir` |
+| 测试 | `mlir/test/Dialect/MNCore/roundtrip.mlir`、`invalid.mlir`（负向）、`mlir/test/Conversion/MNCoreToLLVM/lower.mlir`、`llvm/test/CodeGen/MNCore/l1load-modes.ll` |
 
 **与初版设计的差异（有意为之）**：
 
@@ -108,7 +108,9 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 4. **typed op 直接 lower 回 Layer B intrinsic**，槽位分配仍只在
    `MNCoreLowerTypedIntrinsics.cpp` 实现一份。
 5. **已提供 `mncore.dma`**（DRAM/PDM → L2BM → L1BM，lower 为已验证的
-   `mvp + l2bmb`）与 `mncore.vec.load`（`l1load.*` → `l1bmp`）。
+   `mvp + l2bmb`）与 `mncore.vec.load`（带 `mode`：目前仅
+   `Broadcast` → `l1bmp`；`MAB4/MAB16/Distribute` 由验证器拒绝，等待
+   shared-layout/PE 映射实现，见 `mncore_frontend_integration.md` §2.3）。
    **`mncore.dget` 暂未提供**：后端尚无对应的 `llvm.mncore.dget` intrinsic
    （`DGET` 目前只是 MIR 伪指令）。数值 golden 的 MLIR 入口在补 intrinsic
    后追加。
@@ -139,3 +141,75 @@ build-mlir/bin/mlir-opt input.mlir --convert-mncore-to-llvm \
 
 前端（Triton/TileLang）的接入方式见
 [`mncore_frontend_integration.md`](mncore_frontend_integration.md)。
+
+---
+
+## 8. L1BM 分发模式与 verifier 契约 (2026-11-04)
+
+依据 MN-Core 2 Software Developer Manual §3.6.8（.6/.8/.14/.20），
+L1BM→PE 的分发不是“一种 load”，而是四种物理传输模式。`mncore.vec.load`
+携带显式 `mode`，由前端根据源 memdesc 的 shared layout 与目标 distributed
+layout 计算后选择；方言本身不再默认任何模式。
+
+### 8.1 模式与指令
+
+| `mode` | 指令 | 每周期读取 | 语义 |
+|---|---|---|---|
+| `Broadcast` | `l1bmp` | 1 longword | 同一值广播到全部 64 PE |
+| `MAB` | `l1bmm` | 4 longwords | 4 个 PE 各取不同值，16 个 MAB 重复 |
+| `MAB4` | `l1bmm4` | 16 longwords | 4 组数据，每组由 4 个 MAB 共享 |
+| `Distributed` | `l1bmd` | 64 longwords | 64 个 PE 各取不同值 |
+
+### 8.2 索引映射（m = MAB 0..15，p = MAB 内 PE 0..3）
+
+* `MAB4`：`index(m,p) = 4 * floor(m / 4) + p`
+* `Distributed`：`index(m,p) = 4 * m + p`
+
+这两个公式是数值级 layout 回归（`A[m,p] = 100m + p`）的直接依据：
+`l1bmm` 在 MAB 0..15 上不随 m 变化；`l1bmm4` 每 4 个 MAB 切换到下一组；
+`l1bmd` 随 m 连续推进。
+
+### 8.3 对齐与宽度约束（verifier 必须检查）
+
+| 指令 | 单 longword 基本形式 | double-longword 形式 |
+|---|---|---|
+| `l1bmp` | 无额外对齐 | 允许，但存在非连续读取与地址范围限制（方言无法静态检查，文档标注） |
+| `l1bmm` | 4 longwords | 8 longwords |
+| `l1bmm4` | 16 longwords | 32 longwords |
+| `l1bmd` | 64 longwords | **不存在**；必须拒绝 |
+
+因此对当前 `<4 x f32>`（2 longwords）：
+
+* `Distributed` 不能用一个等价的双 longword 传输表达；首版必须由 verifier
+  拒绝 `mode=Distributed` + `lbop.width=2` 的组合；
+* 若将来支持，需要按 longword 平面拆成两条 `l1bmd`，并要求 L1BM/shared
+  布局把同一平面连续排放（低 longword 平面、高 longword 平面各自连续）。
+
+### 8.4 与 `ttg.local_load` 的关系
+
+* `ttg.local_alloc` 首版统一映射为 **L1BM allocation**（不同时使用 LM0/LM1，
+  避免 memdesc 存储域与 load 指令域不一致）；
+* `ttg.local_load` 必须由 `MNCoreLayoutAnalysis` 推导 `mode`，再生成
+  `mncore.vec.load`；
+* 无法证明布局对应关系时拒绝，而不是回退到 `l1bmp`。
+
+### 8.5 负向测试（必须存在）
+
+* 64 个 PE 预期持有不同值（`Distributed`）却只能生成 `l1bmp` 时，pass 必须
+  报错；
+* `Distributed` + 双 longword 必须由 verifier 拒绝；
+* 各模式地址不满足对齐时必须由 verifier 拒绝。
+
+### 8.6 数值级 layout regression（待模拟器工作线）
+
+输入 `A[m,p] = 100m + p`，读取 PE 侧结果并对拍：
+
+| 指令 | MAB 0 / PE 0..3 | MAB 1 / PE 0..3 | MAB 4 / PE 0..3 |
+|---|---|---|---|
+| `l1bmp` | A,A,A,A | A,A,A,A | A,A,A,A |
+| `l1bmm` | 0,1,2,3 | 0,1,2,3 | 0,1,2,3 |
+| `l1bmm4` | 0,1,2,3 | 0,1,2,3 | 16,17,18,19 |
+| `l1bmd` | 0,1,2,3 | 100,101,102,103 | 400,401,402,403 |
+
+该回归需要 gpfn3 的 `d set`/`d get` 与矩阵/PE 观测支持（见
+`golden_mem.mir` 的现有最小闭环）。

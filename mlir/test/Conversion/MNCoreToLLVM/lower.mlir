@@ -74,7 +74,7 @@ func.func @vecload() {
   // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
   // CHECK: llvm.call_intrinsic "llvm.mncore.l1load.v4f32"
-  %v = "mncore.vec.load"(%lb) <{zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token) -> vector<4xf32>
+  %v = "mncore.vec.load"(%lb) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token) -> vector<4xf32>
   "mncore.mat.write"(%v) <{face = 0 : i64, row = 0 : i64}> : (vector<4xf32>) -> ()
   return
 }

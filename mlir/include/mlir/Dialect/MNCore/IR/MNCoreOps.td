@@ -108,6 +108,21 @@ def MNCore_MVOp : I64EnumAttr<"MVOp", "MN-Core MV opcode", [
   let cppNamespace = "::mlir::mncore";
 }
 
+// L1BM -> PE distribution mode (SDM 3.6.8.6/.8/.14/.20). The mode is chosen
+// by the frontend from the source memdesc layout and the target distributed
+// layout; the dialect does not default to any mode.
+def MNCore_L1Mode_Broadcast   : I64EnumAttrCase<"Broadcast", 0>;
+def MNCore_L1Mode_MAB         : I64EnumAttrCase<"MAB", 1>;
+def MNCore_L1Mode_MAB4        : I64EnumAttrCase<"MAB4", 2>;
+def MNCore_L1Mode_Distributed : I64EnumAttrCase<"Distributed", 3>;
+
+def MNCore_L1Mode : I64EnumAttr<"L1Mode", "L1BM to PE distribution mode", [
+  MNCore_L1Mode_Broadcast, MNCore_L1Mode_MAB, MNCore_L1Mode_MAB4,
+  MNCore_L1Mode_Distributed,
+]> {
+  let cppNamespace = "::mlir::mncore";
+}
+
 //===----------------------------------------------------------------------===//
 // Side-effect resources
 //===----------------------------------------------------------------------===//
@@ -391,8 +406,10 @@ def MNCore_MatReadOp : MNCore_Op<"mat.read", [
 // Triton `ttg.local_load` / TileLang shared-memory reads.
 def MNCore_VecLoadOp : MNCore_Op<"vec.load", [
     MemoryEffects<[MemRead<MNCore_DeviceMem>, MemWrite<MNCore_PEState>]>]> {
-  let summary = "load a 2-longword vector from L1BM into a PE slot";
-  let arguments = (ins MNCore_TokenType:$source,
+  let summary = "load a vector from L1BM into a PE slot with an explicit "
+                "distribution mode";
+  let arguments = (ins MNCore_L1Mode:$mode,
+                       MNCore_TokenType:$source,
                        DefaultValuedAttr<I64Attr, "-1">:$zmask,
                        DefaultValuedAttr<I64Attr, "-1">:$wmask);
   let results = (outs AnyFixedVectorOfNonZeroRank:$result);

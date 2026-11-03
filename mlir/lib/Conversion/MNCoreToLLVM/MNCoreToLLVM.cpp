@@ -503,6 +503,7 @@ struct VecLoadLowering : OpConversionPattern<mncore::VecLoadOp> {
     if (!resultType)
       return rewriter.notifyMatchFailure(op, "result type is not convertible");
     SmallVector<Value> args = {
+        i64Const(rewriter, loc, static_cast<int64_t>(op.getMode())),
         adaptor.getSource(),
         i64Const(rewriter, loc, op.getZmask()),
         i64Const(rewriter, loc, op.getWmask()),

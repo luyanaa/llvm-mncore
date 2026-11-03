@@ -112,11 +112,13 @@ def int_mncore_matread_v2f64 : MNMatRead<llvm_v2f64_ty>;
 def int_mncore_matread_v4f32 : MNMatRead<llvm_v4f32_ty>;
 def int_mncore_matread_v8f16 : MNMatRead<llvm_v8f16_ty>;
 
-// Layer B memory access: L1BM -> PE slot (and later PE slot -> L1BM). The
-// address is an lbop token; the PE slot is allocated by
-// mncore-lower-typed-intrinsics. Masks are i64 sentinels (-1 = absent).
+// Layer B memory access: L1BM -> PE slot. Arguments:
+//   mode: 0=broadcast(l1bmp) 1=MAB(l1bmm) 2=MAB4(l1bmm4) 3=distributed(l1bmd)
+//   lbop: the L1BM address token
+//   zmask/wmask: i64 sentinels (-1 = absent)
+// The PE slot is allocated by mncore-lower-typed-intrinsics.
 class MNVecLoad<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
-    [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
+    [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
     [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 def int_mncore_l1load_v2f64 : MNVecLoad<llvm_v2f64_ty>;
 def int_mncore_l1load_v4f32 : MNVecLoad<llvm_v4f32_ty>;

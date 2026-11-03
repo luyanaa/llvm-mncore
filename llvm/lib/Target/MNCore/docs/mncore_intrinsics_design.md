@@ -320,6 +320,10 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
   `llvm.mncore.fence`（一个 NOP 步）。PE 存储允许同一步读写（3.6.3.9），
   但读观察到的是旧值，因此 load→consumer 必须隔步；hazard pass 再补足
   LM 端口所需的其余 nop。
+  **长期方向**：这是保守的实现；应由 load 结果的 MachineInstr 依赖与
+  latency 模型直接驱动调度，使与 load 无关的 ALU/MV 能填入等待间隔。
+  需要一条 `load → 独立计算 → consumer` 的回归，对比最小合法间隔与实际
+  插入的指令数，防止 packetizer 退化。
 * **新增 typed 内存 op**：`llvm.mncore.l1load.<ty>(lbop, zmask, wmask)`
   （L1BM→PE slot），对应 MLIR `mncore.vec.load` 与 Triton
   `ttg.local_load`。
