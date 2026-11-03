@@ -172,3 +172,39 @@ define void @lmbar() {
                              i64 -1, i64 -1, i64 -1, i64 -1, i64 -1)
   ret void
 }
+
+; Masked matvec / mread outputs (Layer A mau ids 4 and 6).
+define void @masked_matrix() {
+; CHECK-LABEL: masked_matrix:
+; CHECK: fmfma $lx $llr0v $lls0v $llm0v/0111p
+; CHECK: fmread $lx0 $llr0v/0111p
+  %x = call i64 @llvm.mncore.peop(i64 1, i64 0, i64 2, i64 8, i64 0)
+  %y = call i64 @llvm.mncore.peop(i64 2, i64 0, i64 2, i64 8, i64 0)
+  %d = call i64 @llvm.mncore.peop(i64 3, i64 0, i64 2, i64 8, i64 0)
+  %m = call i64 @llvm.mncore.matop(i64 0, i64 0, i64 1, i64 0)
+  call void @llvm.mncore.mau(i64 4, i64 2, i64 %m, i64 %x, i64 %y, i64 -1, i64 %d,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 57)
+  %r = call i64 @llvm.mncore.peop(i64 1, i64 0, i64 2, i64 8, i64 0)
+  %m2 = call i64 @llvm.mncore.matop(i64 0, i64 0, i64 1, i64 0)
+  call void @llvm.mncore.mau(i64 6, i64 2, i64 %m2, i64 -1, i64 -1, i64 -1, i64 %r,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 57)
+  ret void
+}
+
+; Face selection: a matrix token with face bit 1 selects the Y-face defs.
+define void @face_y() {
+; CHECK-LABEL: face_y:
+; CHECK: fmfma $ly $llr0v $lls0v $llm0v
+; CHECK: fmread $ly3 $llr0v
+  %x = call i64 @llvm.mncore.peop(i64 1, i64 0, i64 2, i64 8, i64 0)
+  %y = call i64 @llvm.mncore.peop(i64 2, i64 0, i64 2, i64 8, i64 0)
+  %d = call i64 @llvm.mncore.peop(i64 3, i64 0, i64 2, i64 8, i64 0)
+  %m = call i64 @llvm.mncore.matop(i64 1, i64 0, i64 1, i64 0)
+  call void @llvm.mncore.mau(i64 4, i64 2, i64 %m, i64 %x, i64 %y, i64 -1, i64 %d,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 -1)
+  %r = call i64 @llvm.mncore.peop(i64 1, i64 0, i64 2, i64 8, i64 0)
+  %m2 = call i64 @llvm.mncore.matop(i64 1, i64 3, i64 1, i64 0)
+  call void @llvm.mncore.mau(i64 6, i64 2, i64 %m2, i64 -1, i64 -1, i64 -1, i64 %r,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 -1)
+  ret void
+}

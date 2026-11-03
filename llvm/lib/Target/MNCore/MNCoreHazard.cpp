@@ -120,7 +120,9 @@ public:
 // data-race gap: same space + same address, writer then reader.
 static int dataRaceGap(const MemAccess &W, const MemAccess &N,
                        const char **Rule = nullptr) {
-  if (!W.Write || N.Write || W.Space != N.Space || W.Addr != N.Addr)
+  if (!W.Write || N.Write || W.Space != N.Space)
+    return 0;
+  if (!mncore::regionsOverlap(W.Addr, W.Width, N.Addr, N.Width))
     return 0;
   switch (W.Space) {
   case mncore::MS_GRF0:
@@ -153,13 +155,15 @@ static int l1bPairGap(const MemAccess &E, const MemAccess &N,
         return 2;
       }
       if (nToL2B) {
-        if (E.Addr != N.Addr) return 0;
+        if (!mncore::regionsOverlap(E.Addr, E.Width, N.Addr, N.Width))
+          return 0;
         if (Rule) *Rule = "PE->L1B then L1B->L2B race (3.6.3.7)";
         return 3;
       }
     } else if (E.Dir2 == 2) {                   // L2B->L1B write
       if (nToPE) {
-        if (E.Addr != N.Addr) return 0;
+        if (!mncore::regionsOverlap(E.Addr, E.Width, N.Addr, N.Width))
+          return 0;
         if (Rule) *Rule = "L2B->L1B then L1B->PE race (3.6.3.6)";
         return 2;
       }
@@ -170,7 +174,8 @@ static int l1bPairGap(const MemAccess &E, const MemAccess &N,
       }
     } else if (E.Dir2 == 3) {                   // internal multicast write
       if (nToPE) {
-        if (E.Addr != N.Addr) return 0;
+        if (!mncore::regionsOverlap(E.Addr, E.Width, N.Addr, N.Width))
+          return 0;
         if (Rule) *Rule = "int-mcast then L1B->PE race (3.6.3.5)";
         return 3;
       }

@@ -1,0 +1,30 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-hazard -mncore-hazard-report %s -o - 2>&1 | FileCheck %s
+#
+# Race detection compares accessed regions, not base addresses:
+#   $llr0v  = 67108896 (GRF0, 2-longword at 0 -> words 0..15)
+#   $lr4v   = 67112976 (GRF0 longword at 4 -> words 4..11)  overlaps
+#   $lr16v  = 67125264 (GRF0 longword at 16 -> words 16..23) disjoint
+
+--- |
+  target triple = "mncore2"
+  define void @overlap() { ret void }
+  define void @disjoint() { ret void }
+...
+---
+name:            overlap
+body:             |
+  bb.0:
+    ; CHECK: mncore-hazard: overlap: step 1: insert 1 nop(s) for GRF data-race (3.6.3.9); writer step 0 GRF0@0 -> GRF0@4
+    PASSA_l 67108881, 67108896
+    PASSA_l 67112976, 67108882
+    RET
+...
+---
+name:            disjoint
+body:             |
+  bb.0:
+    ; CHECK-NOT: mncore-hazard: disjoint:
+    PASSA_l 67108881, 67108896
+    PASSA_l 67125264, 67108882
+    RET
+...

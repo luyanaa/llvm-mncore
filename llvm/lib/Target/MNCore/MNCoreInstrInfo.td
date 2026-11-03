@@ -67,6 +67,25 @@ def NOFORWARD : PEExpr<(outs), (ins), "noforward">;
 let PrintMethod = "printTagOperand" in
   def tagimm : Operand<i64>;
 
+// Emulator debug dump (d get). Packed:
+//   [3:0]  mem   : 1=GRF0 2=GRF1 3=LM0 4=LM1 5=T 6=L1B 7=L2B 8=PDM
+//                  9=DRAM 10=OMR 11=MAT
+//   [20:4] addr, [28:21] nwords
+let PrintMethod = "printDGetOperand" in
+  def dgetoperand : Operand<i64>;
+
+// `d get <memory> <nwords>` — emulator-only control statement; ignored by
+// hardware. Pseudo/non-PE so the packetizer leaves it on its own line.
+def DGET : PseudoMN<(outs), (ins dgetoperand:$spec), "d get $spec">;
+
+// `d set <memory> <nwords> <longword-hex>` — emulator-only input statement
+// (3.4.4). One 64-bit data word; the memory/address/size reuse the d get
+// packing.
+let PrintMethod = "printDSetData" in
+  def dsetdata : Operand<i64>;
+def DSET : PseudoMN<(outs), (ins dgetoperand:$spec, dsetdata:$data),
+                    "d set $spec $data">;
+
 let Itinerary = IIC_wait, hasSideEffects = 1 in
 def WAIT : PEExpr<(outs), (ins tagimm:$tag), "wait $tag">;
 

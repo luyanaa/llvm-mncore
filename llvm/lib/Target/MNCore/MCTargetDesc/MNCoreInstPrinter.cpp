@@ -427,6 +427,37 @@ void MNCoreInstPrinter::printMaskOperand(const MCInst *MI, unsigned OpNum,
     O << 'p';
 }
 
+// `d get <memory> <nwords>` operand (3.4.3). Packed:
+//   [3:0] mem, [20:4] addr, [28:21] nwords.
+void MNCoreInstPrinter::printDGetOperand(const MCInst *MI, unsigned OpNum,
+                                         raw_ostream &O) {
+  uint64_t V = MI->getOperand(OpNum).getImm();
+  unsigned Mem = V & 0xf;
+  uint64_t Addr = (V >> 4) & 0x1ffff;
+  unsigned N = (unsigned)((V >> 21) & 0xff);
+  switch (Mem) {
+  case 1: O << "$lr" << Addr; break;
+  case 2: O << "$ls" << Addr; break;
+  case 3: O << "$lm" << Addr; break;
+  case 4: O << "$ln" << Addr; break;
+  case 5: O << "$t"; break;
+  case 6: O << "$lb" << Addr; break;
+  case 7: O << "$lc" << Addr; break;
+  case 8: O << "$p" << Addr; break;
+  case 9: O << "$d" << Addr; break;
+  case 10: O << "$omr" << Addr; break;
+  case 11: O << "$lx" << Addr; break;
+  default: O << "$lr" << Addr; break;
+  }
+  O << ' ' << (N ? N : 1);
+}
+
+void MNCoreInstPrinter::printDSetData(const MCInst *MI, unsigned OpNum,
+                                      raw_ostream &O) {
+  O << format_hex_no_prefix((uint64_t)MI->getOperand(OpNum).getImm(), 16,
+                            /*Upper=*/true);
+}
+
 // Multi-line write-mask directive (3.6.2.1):
 //   mask[l|ll][r][s][t][m][n][k] <addr>
 // Packed: [0] ll, [6:1] enables in r,s,t,m,n,k order, [13:7] address.

@@ -23,25 +23,26 @@ for a in "$@"; do
 done
 
 # Tests that emit straight .vsm text (full llc run).
-EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar"
+EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem"
 # Tests checked via -run-pass=mncore-packetizer (MIR output).
 PKT="mau-rules packetize-groups peoperand-conflict vfma-mwrite-shape mask-rules"
 # Tests checked via -run-pass=mncore-hazard (MIR output).
 HAZ="l2bmv-gap l1bset-hazard"
 # Hazard tests that read stderr (attribution report).
-HAZR="hazard-report"
+HAZR="hazard-report region-overlap"
 # Plain-IR tests (codegen-shape checks; the M1 register spelling is not
 # yet assemble3-legal, so these are FileCheck only).
 IRL="wide-imm plain-ir intrinsics layerb layerb2"
 # Tests that must be rejected (negative fixtures): <test>|<message>.
 NEG="operand-placement|illegal PE operand placement
-pe-alignment|misaligned PE operand"
+pe-alignment|misaligned PE operand
+lone-wait|`wait` must co-issue"
 # Tests whose vsm needs --instruction-mode flat on assemble3.
 FLAT="peoperand-modes"
 # Hazard/race checking is a separate stage: only streams authored to be
 # race-free (single-kernel, spaced) belong here. Syntax-only verification
 # (checkers disabled) is the stage above.
-HAZARD_OK="layerb"
+HAZARD_OK="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem layerb layerb2"
 
 fail=0
 echo "===== FileCheck ====="
@@ -104,11 +105,33 @@ if [ $LOCAL_ONLY = 0 ]; then
     out=$($TD/scripts/emulate_gpfn3.sh $TD/$t.ll 2>&1)
     rc=$?
     printf '%s\n' "$out" | grep -v '^emulate:'
-    [ $rc -ne 0 ] && { echo "FAIL  $t  (remote)"; remfail=$((remfail+1)); }
+    if [ $rc -ne 0 ]; then
+      if printf '%s' "$out" | grep -q '^SKIP' && [ $ALLOW_OFFLINE = 1 ]; then
+        :
+      else
+        echo "FAIL  $t  (remote)"; remfail=$((remfail+1))
+      fi
+    fi
+  done
+  echo "===== golden numeric (dump + check_dump) ====="
+  for t in golden golden_mem; do
+    out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^emulate:'
+    if [ "$t" = golden ]; then
+      exp=('GREG0:n0c0b0m0p0:0=0x2A0000002A' 'GREG1:n0c0b0m0p0:2=0x3900000039')
+    else
+      exp=('GREG0:n0c0b0m0p0:0=0x39')
+    fi
+    if [ $rc -ne 0 ] || ! python3 -I $TD/scripts/check_dump.py /tmp/mncore_$t.dmp "${exp[@]}" >/dev/null 2>&1; then
+      echo "FAIL  $t  (golden value)"; remfail=$((remfail+1))
+    fi
   done
   echo "===== assemble3 hazard/race checker (separate stage) ====="
   for t in $HAZARD_OK; do
-    out=$($TD/scripts/verify_assemble3.sh $TD/$t.ll 2>&1)
+    case " $FLAT " in *" $t "*) hz="--flat" ;; *) hz="" ;; esac
+    src=$TD/$t.mir; [ -f "$src" ] || src=$TD/$t.ll
+    out=$($TD/scripts/verify_assemble3.sh $hz $src 2>&1)
     rc=$?
     printf '%s\n' "$out" | grep -v '^assemble3 verify:'
     [ $rc -ne 0 ] && { echo "FAIL  $t  (hazard/race)"; remfail=$((remfail+1)); }

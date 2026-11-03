@@ -247,6 +247,11 @@ bool MNCorePacketizerList::isLegalToPacketizeTogether(SUnit *SUI,
   if (mncore::vfmaMwriteShapeConflict(I, J))
     return false;
 
+  // A same-step L1B/L2B producer/consumer pair is illegal (3.6.3.3/.7); the
+  // hazard pass can only separate *steps*, so refuse the bundle here.
+  if (mncore::sameStageRace(I, J))
+    return false;
+
   // \xC2\xA73.6.4 step-wide mask rules: a zero-flush mask on at most one expression
   // per step, and every present mask specifier agreeing on the mask word
   // length. These are not pairwise, so check the prospective step: the
@@ -300,6 +305,30 @@ public:
       MachineBasicBlock::iterator End = MBB.end();
       if (Begin != End)
         Packetizer.PacketizeMIs(&MBB, Begin, End);
+
+      // A `wait` must co-issue with another PE expression (3.6.13). Walk
+      // the post-packetization step layout: a lone WAIT step is illegal.
+      for (auto It = MBB.instr_begin(); It != MBB.instr_end();) {
+        auto First = It;
+        auto Last = std::next(First);
+        if (First->isBundle())
+          while (Last != MBB.instr_end() && Last->isInsideBundle())
+            ++Last;
+        bool HasWait = false, HasOther = false;
+        for (auto J = First; J != Last; ++J) {
+          if (!(J->getDesc().TSFlags & 0x1))
+            continue;
+          if (J->getOpcode() == MNCore::WAIT)
+            HasWait = true;
+          else
+            HasOther = true;
+        }
+        if (HasWait && !HasOther)
+          report_fatal_error(
+              "MN-Core2: `wait` must co-issue with another PE expression "
+              "(3.6.13)");
+        It = Last;
+      }
     }
     return true;
   }

@@ -57,6 +57,10 @@ private:
   void printOMROperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   // Multi-line write-mask directive `mask[l|ll][rstmnk] <addr>` (3.6.2.1).
   void printMaskDirective(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // `d get` debug dump operand (memory name + word count).
+  void printDGetOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // `d set` data word, 16 hex digits without prefix.
+  void printDSetData(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   // MAU expression operand helpers (sections 3.6.9-3.6.11).
   void printMATOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printMATSideOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);

@@ -441,3 +441,30 @@ multiclass matface2<InstrItinClass itin, int fc> {
 }
 defm XMD : matface2<IIC_mauX, 1>;
 defm YMD : matface2<IIC_mauY, 2>;
+
+// Masked matvec / transposed-read outputs (3.6.2): the MAU result written
+// to PE memory is maskable. Masked mwrite is not expressible (its only
+// destination is the matrix register; assemble3 rejects it).
+class MATFMAM<InstrItinClass itin, string op, int fc, int pr>
+    : MAUExpr<(outs),
+              (ins matside:$mat, peoperand:$sx, peoperand:$sy,
+                   peoperand:$dst, maskoperand:$zmask, maskoperand:$wmask),
+              !strconcat(op, "$zmask $mat $sx $sy $dst$wmask"), [], /*grp*/1,
+              fc, pr> {
+  let Itinerary = itin;
+  let TSFlags{14} = 1;
+  let TSFlags{15} = 1;
+}
+class MREADM<InstrItinClass itin, string op, int fc, int pr>
+    : MAUExpr<(outs),
+              (ins matoperand:$mat, peoperand:$dst, maskoperand:$zmask,
+                   maskoperand:$wmask),
+              !strconcat(op, "$zmask $mat $dst$wmask"), [], /*grp*/3, fc, pr> {
+  let Itinerary = itin;
+  let TSFlags{14} = 1;
+  let TSFlags{15} = 1;
+}
+def XFMFMA_M : MATFMAM<IIC_mauX, "fmfma", 1, 2>;
+def YFMFMA_M : MATFMAM<IIC_mauY, "fmfma", 2, 2>;
+def W_XFMREAD_M : MREADM<IIC_mauX, "fmread", 1, 2>;
+def W_YFMREAD_M : MREADM<IIC_mauY, "fmread", 2, 2>;

@@ -8,6 +8,7 @@
 
 #include "MNCore.h"
 #include "MNCoreSelectionDAGInfo.h"
+#include "MNCoreIntrinsicOps.h"
 #include "MNCoreRegions.h"
 #include "MNCoreTargetMachine.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -232,18 +233,18 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       unsigned Opc;
       bool OneInput = false;
       switch (OpcC->getZExtValue()) {
-      case 0: Opc = Masked ? MNCore::FMIN_M : MNCore::MIN_f; break;
-      case 1: Opc = Masked ? MNCore::FMAX_M : MNCore::MAX_f; break;
-      case 2: Opc = Masked ? MNCore::ADD_i_M : MNCore::ADD_i; break;
-      case 3: Opc = Masked ? MNCore::SUB_i_M : MNCore::SUB_i; break;
-      case 4: // lpassa (one input, one destination)
+      case (int)mncore::ALUOp::FMin: Opc = Masked ? MNCore::FMIN_M : MNCore::MIN_f; break;
+      case (int)mncore::ALUOp::FMax: Opc = Masked ? MNCore::FMAX_M : MNCore::MAX_f; break;
+      case (int)mncore::ALUOp::IAdd: Opc = Masked ? MNCore::ADD_i_M : MNCore::ADD_i; break;
+      case (int)mncore::ALUOp::ISub: Opc = Masked ? MNCore::SUB_i_M : MNCore::SUB_i; break;
+      case (int)mncore::ALUOp::LPassa: // lpassa (one input, one destination)
         Opc = Masked ? MNCore::PASSA_l_M : MNCore::PASSA_l;
         OneInput = true;
         break;
-      case 10: Opc = MNCore::MAX_d; break;
-      case 11: Opc = MNCore::MIN_d; break;
-      case 12: Opc = MNCore::MAX_h; break;
-      case 13: Opc = MNCore::MIN_h; break;
+      case (int)mncore::ALUOp::DMax: Opc = Masked ? MNCore::MAX_d_M : MNCore::MAX_d; break;
+      case (int)mncore::ALUOp::DMin: Opc = Masked ? MNCore::MIN_d_M : MNCore::MIN_d; break;
+      case (int)mncore::ALUOp::HMax: Opc = Masked ? MNCore::MAX_h_M : MNCore::MAX_h; break;
+      case (int)mncore::ALUOp::HMin: Opc = Masked ? MNCore::MIN_h_M : MNCore::MIN_h; break;
       default:
         report_fatal_error("MN-Core2: mncore.alu opcode id not mapped yet");
       }
@@ -285,9 +286,9 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       bool Masked = !IsMinus1(7) || !IsMinus1(8);
       unsigned Opc;
       switch (OpcC->getZExtValue()) {
-      case 0: Opc = Masked ? MNCore::L1BMP_M : MNCore::L1BMP; break;
-      case 1: Opc = Masked ? MNCore::L1BMM_M : MNCore::L1BMM; break;
-      case 2: Opc = Masked ? MNCore::L1BMM4_M : MNCore::L1BMM4; break;
+      case (int)mncore::L1BOp::L1BMP: Opc = Masked ? MNCore::L1BMP_M : MNCore::L1BMP; break;
+      case (int)mncore::L1BOp::L1BMM: Opc = Masked ? MNCore::L1BMM_M : MNCore::L1BMM; break;
+      case (int)mncore::L1BOp::L1BMM4: Opc = Masked ? MNCore::L1BMM4_M : MNCore::L1BMM4; break;
       default:
         report_fatal_error("MN-Core2: mncore.l1b opcode id not mapped yet");
       }
@@ -317,7 +318,7 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
         report_fatal_error("MN-Core2: mncore.mv needs a constant opcode");
       unsigned Opc;
       switch (OpcC->getZExtValue()) {
-      case 0: Opc = MNCore::MVP; break;
+      case (int)mncore::MVOp::MVP: Opc = MNCore::MVP; break;
       default:
         report_fatal_error("MN-Core2: mncore.mv opcode id not mapped yet");
       }
@@ -339,94 +340,113 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
         auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
         return C && C->getSExtValue() == -1;
       };
-      for (unsigned I : {9u, 10u, 11u, 12u, 13u})
+      for (unsigned I : {9u, 10u, 11u})
         if (!IsMinus1(I))
           report_fatal_error(
-              "MN-Core2: mncore.mau multi-dst/omr/mask operands not wired yet");
+              "MN-Core2: mncore.mau multi-dst/omr operands not wired yet");
+      bool Masked = !IsMinus1(12) || !IsMinus1(13);
       auto TC = [&](unsigned I) -> SDValue {
         return Fold(N->getOperand(I));
       };
       SmallVector<SDValue, 6> MO;
+      // Face bit of the matrix token (bit 0): 0 = X, 1 = Y.
+      bool FaceY = false;
+      if (auto *MC = dyn_cast<ConstantSDNode>(TC(4)))
+        FaceY = (MC->getZExtValue() & 1) != 0;
       unsigned Opc;
       switch (OpcC->getZExtValue()) {
-      case 0: // vfma: sx, sy, sz, dst
-        Opc = MNCore::FVFMA;
+      case (int)mncore::MAUOp::FVFMA: // vfma: sx, sy, sz, dst
+        Opc = Masked ? MNCore::FVFMA_M : MNCore::FVFMA;
         MO = {TC(5), TC(6), TC(7), TC(8)};
         break;
-      case 1: // vmul
-        Opc = MNCore::FVMUL;
+      case (int)mncore::MAUOp::FVMUL: // vmul
+        Opc = Masked ? MNCore::FVMUL_M : MNCore::FVMUL;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 2: // vadd
-        Opc = MNCore::FVADD;
+      case (int)mncore::MAUOp::FVADD: // vadd
+        Opc = Masked ? MNCore::FVADD_M : MNCore::FVADD;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 3: // vpassa
-        Opc = MNCore::FVPASSA;
+      case (int)mncore::MAUOp::FVPASSA: // vpassa
+        Opc = Masked ? MNCore::FVPASSA_M : MNCore::FVPASSA;
         MO = {TC(5), TC(8)};
         break;
-      case 4: // matvec face from the mat token's low bit
-        Opc = MNCore::XFMFMA;
+      case (int)mncore::MAUOp::FMatVec: // matvec
+        Opc = Masked ? (FaceY ? MNCore::YFMFMA_M : MNCore::XFMFMA_M)
+                     : (FaceY ? MNCore::YFMFMA : MNCore::XFMFMA);
         MO = {TC(4), TC(5), TC(6), TC(8)};
         break;
-      case 5: // mwrite (single precision): src, matrix operand
-        Opc = MNCore::W_XFMWRITE;
+      case (int)mncore::MAUOp::FMWrite: // mwrite (single precision)
+        Opc = FaceY ? MNCore::W_YFMWRITE : MNCore::W_XFMWRITE;
         MO = {TC(5), TC(4)};
         break;
-      case 6: // mread: matrix operand, dst
-        Opc = MNCore::W_XFMREAD;
+      case (int)mncore::MAUOp::FMRead: // mread
+        Opc = Masked ? (FaceY ? MNCore::W_YFMREAD_M : MNCore::W_XFMREAD_M)
+                     : (FaceY ? MNCore::W_YFMREAD : MNCore::W_XFMREAD);
         MO = {TC(4), TC(8)};
         break;
-      case 10: // dvfma
-        Opc = MNCore::DVFMAU;
+      case (int)mncore::MAUOp::DVFMA: // dvfma
+        Opc = Masked ? MNCore::DVFMAU_M : MNCore::DVFMAU;
         MO = {TC(5), TC(6), TC(7), TC(8)};
         break;
-      case 11: // dvmul
-        Opc = MNCore::DVMULU;
+      case (int)mncore::MAUOp::DVMUL: // dvmul
+        Opc = Masked ? MNCore::DVMULU_M : MNCore::DVMULU;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 12: // dvadd
+      case (int)mncore::MAUOp::DVADD: // dvadd (no masked twin exists)
+        if (Masked)
+          report_fatal_error(
+              "MN-Core2: masked double vadd is not defined");
         Opc = MNCore::DVADD;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 13: // hvfma
-        Opc = MNCore::HVFMA;
+      case (int)mncore::MAUOp::HVFMA: // hvfma
+        Opc = Masked ? MNCore::HVFMA_M : MNCore::HVFMA;
         MO = {TC(5), TC(6), TC(7), TC(8)};
         break;
-      case 14: // hvmul
-        Opc = MNCore::HVMUL;
+      case (int)mncore::MAUOp::HVMUL: // hvmul
+        Opc = Masked ? MNCore::HVMUL_M : MNCore::HVMUL;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 15: // hvadd
-        Opc = MNCore::HVADD;
+      case (int)mncore::MAUOp::HVADD: // hvadd
+        Opc = Masked ? MNCore::HVADD_M : MNCore::HVADD;
         MO = {TC(5), TC(6), TC(8)};
         break;
-      case 16: // d matvec
-        Opc = MNCore::XDMFMAU;
+      case (int)mncore::MAUOp::DMatVec: // d matvec
+        Opc = FaceY ? MNCore::YDMFMAU : MNCore::XDMFMAU;
         MO = {TC(4), TC(5), TC(6), TC(8)};
         break;
-      case 17: // h matvec
-        Opc = MNCore::XHMFMA;
+      case (int)mncore::MAUOp::HMatVec: // h matvec
+        Opc = FaceY ? MNCore::YHMFMA : MNCore::XHMFMA;
         MO = {TC(4), TC(5), TC(6), TC(8)};
         break;
-      case 18: // d mwrite
-        Opc = MNCore::W_XDMWRITE;
+      case (int)mncore::MAUOp::DMWrite: // d mwrite
+        Opc = FaceY ? MNCore::W_YDMWRITE : MNCore::W_XDMWRITE;
         MO = {TC(5), TC(4)};
         break;
-      case 19: // h mwrite
-        Opc = MNCore::W_XHMWRITE;
+      case (int)mncore::MAUOp::HMWrite: // h mwrite
+        Opc = FaceY ? MNCore::W_YHMWRITE : MNCore::W_XHMWRITE;
         MO = {TC(5), TC(4)};
         break;
-      case 20: // d mread
-        Opc = MNCore::W_XDMREAD;
+      case (int)mncore::MAUOp::DMRead: // d mread
+        Opc = FaceY ? MNCore::W_YDMREAD : MNCore::W_XDMREAD;
         MO = {TC(4), TC(8)};
         break;
-      case 21: // h mread
-        Opc = MNCore::W_XHMREAD;
+      case (int)mncore::MAUOp::HMRead: // h mread
+        Opc = FaceY ? MNCore::W_YHMREAD : MNCore::W_XHMREAD;
         MO = {TC(4), TC(8)};
         break;
       default:
         report_fatal_error("MN-Core2: mncore.mau opcode id not mapped yet");
+      }
+      if (Masked) {
+        auto MaskTC = [&](unsigned I) -> SDValue {
+          if (IsMinus1(I))
+            return CurDAG->getTargetConstant(0, DL, MVT::i64);
+          return Fold(N->getOperand(I));
+        };
+        MO.push_back(MaskTC(12));
+        MO.push_back(MaskTC(13));
       }
       MO.push_back(N->getOperand(0));
       MachineSDNode *M = CurDAG->getMachineNode(

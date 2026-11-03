@@ -75,6 +75,9 @@ def int_mncore_mvparams
 class MNVec3<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
     [vt, vt, vt, llvm_i64_ty, llvm_i64_ty],
     [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
+class MNCVec2<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
+    [vt, vt, llvm_i64_ty, llvm_i64_ty],
+    [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 class MNMatVec<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
     [llvm_i64_ty, vt, vt], [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 class MNMatWrite<LLVMType vt> : DefaultAttrsIntrinsic<[],
@@ -84,20 +87,20 @@ class MNMatRead<LLVMType vt> : DefaultAttrsIntrinsic<[vt],
     [llvm_i64_ty, llvm_i64_ty], [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 
 def int_mncore_fma_v2f64 : MNVec3<llvm_v2f64_ty>;
-def int_mncore_mul_v2f64 : MNVec3<llvm_v2f64_ty>;
-def int_mncore_add_v2f64 : MNVec3<llvm_v2f64_ty>;
-def int_mncore_max_v2f64 : MNVec3<llvm_v2f64_ty>;
-def int_mncore_min_v2f64 : MNVec3<llvm_v2f64_ty>;
+def int_mncore_mul_v2f64 : MNCVec2<llvm_v2f64_ty>;
+def int_mncore_add_v2f64 : MNCVec2<llvm_v2f64_ty>;
+def int_mncore_max_v2f64 : MNCVec2<llvm_v2f64_ty>;
+def int_mncore_min_v2f64 : MNCVec2<llvm_v2f64_ty>;
 def int_mncore_fma_v4f32 : MNVec3<llvm_v4f32_ty>;
-def int_mncore_mul_v4f32 : MNVec3<llvm_v4f32_ty>;
-def int_mncore_add_v4f32 : MNVec3<llvm_v4f32_ty>;
-def int_mncore_max_v4f32 : MNVec3<llvm_v4f32_ty>;
-def int_mncore_min_v4f32 : MNVec3<llvm_v4f32_ty>;
+def int_mncore_mul_v4f32 : MNCVec2<llvm_v4f32_ty>;
+def int_mncore_add_v4f32 : MNCVec2<llvm_v4f32_ty>;
+def int_mncore_max_v4f32 : MNCVec2<llvm_v4f32_ty>;
+def int_mncore_min_v4f32 : MNCVec2<llvm_v4f32_ty>;
 def int_mncore_fma_v8f16 : MNVec3<llvm_v8f16_ty>;
-def int_mncore_mul_v8f16 : MNVec3<llvm_v8f16_ty>;
-def int_mncore_add_v8f16 : MNVec3<llvm_v8f16_ty>;
-def int_mncore_max_v8f16 : MNVec3<llvm_v8f16_ty>;
-def int_mncore_min_v8f16 : MNVec3<llvm_v8f16_ty>;
+def int_mncore_mul_v8f16 : MNCVec2<llvm_v8f16_ty>;
+def int_mncore_add_v8f16 : MNCVec2<llvm_v8f16_ty>;
+def int_mncore_max_v8f16 : MNCVec2<llvm_v8f16_ty>;
+def int_mncore_min_v8f16 : MNCVec2<llvm_v8f16_ty>;
 
 def int_mncore_matvec_v2f64 : MNMatVec<llvm_v2f64_ty>;
 def int_mncore_matvec_v4f32 : MNMatVec<llvm_v4f32_ty>;

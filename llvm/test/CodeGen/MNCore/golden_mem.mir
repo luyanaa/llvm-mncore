@@ -1,0 +1,30 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# Data-movement testbench: d set loads L2BM, l2bmb moves it to L1BM, and
+# l1bmp broadcasts it into GRF0, observed by d get. Value 0x39 is placed in
+# the low longword; the dump reads GRF0 word 0.
+#
+# d set/d get spec: [3:0]mem (1=GRF0 2=GRF1 3=LM0 4=LM1 5=T 6=L1B 7=L2BM
+# 8=PDM 9=DRAM), [20:4]addr, [28:21]nwords.
+#   L2BM@0 n1 = 7 | (1<<21) = 2097160
+#   GRF0@0 n1 = 1 | (1<<21) = 2097153
+
+--- |
+  target triple = "mncore2"
+  define void @mv_l2b_l1b() { ret void }
+...
+---
+name:            mv_l2b_l1b
+body:             |
+  bb.0:
+    ; CHECK: d set $lc0 1 0000000000000039
+    DSET 2097159, 57
+    ; CHECK: l2bmb $lc0 $lb0
+    L2BMB 0, 0, 0
+    ; CHECK: nop/2
+    ; CHECK: l1bmp $lb0 $lr0v
+    L1BMP 0, 67108880
+    ; CHECK: d get $lr0 1
+    DGET 2097153
+    RET
+...

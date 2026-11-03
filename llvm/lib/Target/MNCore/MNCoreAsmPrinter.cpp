@@ -103,6 +103,13 @@ void MNCoreAsmPrinter::validateRegOperands(const MachineInstr *MI) {
         " (longword needs an even address, 2-longword a multiple of 4; "
         "3.6.1.6/.10)");
 
+  if (MI->getOpcode() == MNCore::WAIT) {
+    const MachineOperand &T = MI->getOperand(MI->getNumOperands() - 1);
+    if (!T.isImm() || T.getImm() == 0)
+      report_fatal_error(
+          "MN-Core2: `wait` requires a non-zero constant tag (3.6.13)");
+  }
+
   const MCRegisterInfo &RI = TM.getMCRegisterInfo();
   for (const MachineOperand &MO : MI->operands()) {
     if (!MO.isReg() || !MO.getReg().isPhysical())

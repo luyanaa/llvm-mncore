@@ -1,0 +1,15 @@
+# RUN: not llc -mtriple=mncore2 %s -o - 2>&1 | FileCheck %s
+#
+# 3.6.13: a `wait` expression cannot form a PE statement by itself.
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK: `wait` must co-issue
+    WAIT 5
+    RET
+...

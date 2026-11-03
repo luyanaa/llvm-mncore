@@ -1,0 +1,37 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# Golden numeric path: write a known value, dump it with `d get`, and let
+# check_dump.py assert the emulator's dump. 42 is replicated into all four
+# word slots, so the longword reads 0x2A0000002A.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+  define void @f_alu() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK: imm i"42" $llr0v
+    IMM_P 672, 67108896
+    ; CHECK: d get $lr0 1
+    DGET 2097153
+    RET
+...
+---
+# ALU numeric check: 50 + 7 = 57 into GRF1, dumped from $ls0.
+name:            f_alu
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f_alu:
+    ; CHECK: imm i"50" $ls0v
+    IMM_P 800, 67108881
+    ; CHECK: imm i"7" $lr0v
+    IMM_P 112, 67108880
+    ; CHECK: uladd $ls0v $lr0v $ls2v
+    UADD_l 67108881, 67108880, 67110929
+    ; CHECK: d get $ls2 1
+    DGET 2097186
+    RET
+...

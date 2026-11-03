@@ -61,6 +61,25 @@ using PEAccess = MemAccess;
 
 inline bool isPESpace(int Space) { return Space <= MS_LM1BAR; }
 
+// Words covered by one operand over a 4-cycle step with the default
+// auto-stride of one access unit per cycle: word=4, longword=8,
+// 2-longword=16 words.
+inline int64_t accessRegionWords(unsigned Width) {
+  switch (Width) {
+  case 0: return 4;
+  case 1: return 8;
+  case 2: return 16;
+  default: return 4;
+  }
+}
+
+// True when the two addressed regions intersect. Race rules compare
+// regions, not base addresses: a 2-longword access at 0 and a longword
+// access at 4 overlap even though their bases differ.
+inline bool regionsOverlap(int64_t A, unsigned WA, int64_t B, unsigned WB) {
+  return A < B + accessRegionWords(WB) && B < A + accessRegionWords(WA);
+}
+
 // The parts of a peoperand that the section 3.6.4 vfma/vmul-vs-mwrite rule
 // compares: which memory is read (space + address) and the three input
 // modifiers — sign inversion '-', one-precision-up extend 'e', and
@@ -587,6 +606,32 @@ inline bool peAlignmentBad(const MachineInstr &MI) {
     if (X.Width == 2 && (X.Addr & 3))
       return true;
   }
+  return false;
+}
+
+// Same-step L1B/L2B write->read ordering. The PE memories (GRF/LM/T) allow a
+// read and a write in the same step (3.6.3.9), but the L1B staging buffer and
+// L2BM do not: a producer write and a consumer read of the same region must be
+// in different steps (3.6.3.3/.7). The packetizer cannot repair this by
+// adding nops, so it must refuse the bundle.
+inline bool sameStageRace(const MachineInstr &A, const MachineInstr &B) {
+  SmallVector<MemAccess, 8> AA, BA;
+  miAccesses(A, AA);
+  miAccesses(B, BA);
+  for (const MemAccess &X : AA)
+    for (const MemAccess &Y : BA) {
+      if (X.Space != Y.Space || X.Write == Y.Write)
+        continue;
+      if (X.Space != MS_L1B && X.Space != MS_L2B)
+        continue;
+      // The turnaround register pair (PE->$lbi collect plus the L1B->PE
+      // broadcast draining it) is the one legal same-step L1B read/write
+      // combination (3.6.8.2).
+      if (X.Turn && Y.Turn)
+        continue;
+      if (regionsOverlap(X.Addr, X.Width, Y.Addr, Y.Width))
+        return true;
+    }
   return false;
 }
 
