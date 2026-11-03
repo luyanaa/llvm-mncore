@@ -1,0 +1,5 @@
+set(LLVM_TARGET_DEFINITIONS MNCoreOps.td)
+mlir_tablegen(MNCoreOpsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(MNCoreOpsEnums.cpp.inc -gen-enum-defs)
+add_mlir_dialect(MNCoreOps mncore)
+add_mlir_doc(MNCoreOps MNCoreOps Dialects/ -gen-dialect-doc)

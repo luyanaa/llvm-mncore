@@ -406,10 +406,16 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
 * `MNCoreIntrinsicOps.h` 定义 `ALUOp/MAUOp/L1BOp/L2BOp/MVOp` 的稳定数值；
   SelectionDAG isel 与 Layer B pass 已改用枚举名（数值不变）。规则：只追加，
   不重编号；未列出的 ID 由选择器拒绝。
-* 本构建未启用 MLIR（`build-mncore/bin/mlir-opt` 不存在），因此 MLIR dialect
-  以设计契约形式交付：`llvm/lib/Target/MNCore/docs/mncore_mlir_dialect.md`
-  （类型、op 清单、验证器规则、转换路径、里程碑）。启用 MLIR 构建后即可按
-  该文档落地 `MNCoreDialect.td`。
+* **MLIR 已落地**（2026-11-03）：`MNCoreIntrinsicOps.h` 迁至公共 include
+  (`llvm/include/llvm/Target/MNCore/`)；树内 `mncore` dialect 与
+  `convert-mncore-to-llvm` 位于 `mlir/include|lib/{Dialect,Conversion}/MNCore*`。
+  验证器规则、op 清单与状态见
+  `llvm/lib/Target/MNCore/docs/mncore_mlir_dialect.md`；前端接入见
+  `mncore_frontend_integration.md`。`MNCoreOps.cpp` 对 33 个 opcode 值做
+  `static_assert`，与 `MNCoreIntrinsicOps.h` 编译期同步。
+* 构建：`build-mlir`（`-DLLVM_ENABLE_PROJECTS=mlir`），可执行
+  `mlir-opt --convert-mncore-to-llvm | mlir-translate --mlir-to-llvmir |
+  llc -mtriple=mncore2` 全链路（已用 `fvfma`/`fmwrite` 内核验证）。
 
 
 ## 20. 门禁状态 (2026-11-03)

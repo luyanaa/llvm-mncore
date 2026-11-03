@@ -1190,6 +1190,28 @@ def ConvertPDLToPDLInterpPass : Pass<"convert-pdl-to-pdl-interp", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// MNCoreToLLVM
+//===----------------------------------------------------------------------===//
+
+def ConvertMNCoreToLLVMPass : Pass<"convert-mncore-to-llvm", "ModuleOp"> {
+  let summary = "Convert the MN-Core dialect to llvm.mncore.* intrinsic calls";
+  let description = [{
+    Lowers `mncore` token builders and instruction expressions to the frozen
+    `llvm.mncore.*` Layer A intrinsics, and typed vector/matrix operations to
+    the Layer B intrinsics so that PE slot allocation stays in llc. Function
+    and arith operations are converted in the same pass; the resulting module
+    can be translated with `mlir-translate --mlir-to-llvmir` and passed to
+    `llc -mtriple=mncore2`.
+  }];
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "arith::ArithDialect",
+    "func::FuncDialect",
+    "mncore::MNCoreDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // ReconcileUnrealizedCasts
 //===----------------------------------------------------------------------===//
 

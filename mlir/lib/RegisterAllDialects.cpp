@@ -56,6 +56,7 @@
 #include "mlir/Dialect/MPI/IR/MPI.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRefDialect.h"
+#include "mlir/Dialect/MNCore/IR/MNCoreOps.h"
 #include "mlir/Dialect/MemRef/IR/MemorySlotInterfacesImpl.h"
 #include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/Transforms//MemorySlotInterfacesImpl.h"
@@ -134,6 +135,7 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
                   LLVM::LLVMDialect,
                   math::MathDialect,
                   memref::MemRefDialect,
+                  mncore::MNCoreDialect,
                   shard::ShardDialect,
                   ml_program::MLProgramDialect,
                   mpi::MPIDialect,

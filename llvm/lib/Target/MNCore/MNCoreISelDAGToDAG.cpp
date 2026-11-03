@@ -8,7 +8,7 @@
 
 #include "MNCore.h"
 #include "MNCoreSelectionDAGInfo.h"
-#include "MNCoreIntrinsicOps.h"
+#include "llvm/Target/MNCore/MNCoreIntrinsicOps.h"
 #include "MNCoreRegions.h"
 #include "MNCoreTargetMachine.h"
 #include "llvm/CodeGen/MachineFunction.h"

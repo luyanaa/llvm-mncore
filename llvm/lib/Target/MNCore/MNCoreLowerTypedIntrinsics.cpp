@@ -33,7 +33,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MNCore.h"
-#include "MNCoreIntrinsicOps.h"
+#include "llvm/Target/MNCore/MNCoreIntrinsicOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
@@ -46,7 +46,8 @@ using namespace llvm;
 
 namespace {
 
-enum class Op { FMA, MUL, ADD, MAX, MIN, MATVEC, MATWRITE, MATREAD };
+enum class Op { FMA, MUL, ADD, MAX, MIN, MATVEC, MATWRITE, MATREAD,
+                L1LOAD };
 enum class Prec { D, F, H };
 
 class MNCoreLowerTypedIntrinsics : public FunctionPass {
@@ -89,6 +90,7 @@ bool MNCoreLowerTypedIntrinsics::parseName(StringRef Name, Op &O, Prec &P) {
   else if (OpName == "matvec") O = Op::MATVEC;
   else if (OpName == "matwrite") O = Op::MATWRITE;
   else if (OpName == "matread") O = Op::MATREAD;
+  else if (OpName == "l1load") O = Op::L1LOAD;
   else return false;
   if (Ty == "v2f64") { P = Prec::D; return true; }
   if (Ty == "v4f32") { P = Prec::F; return true; }
@@ -134,6 +136,9 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       Type::getVoidTy(C),
       {I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64}, false);
   FunctionCallee Alu = M.getOrInsertFunction("llvm.mncore.alu", AluFT);
+  FunctionType *L1bFT = FunctionType::get(
+      Type::getVoidTy(C), {I64, I64, I64, I64, I64, I64, I64}, false);
+  FunctionCallee L1b = M.getOrInsertFunction("llvm.mncore.l1b", L1bFT);
 
   struct Slot {
     unsigned Space;
@@ -237,6 +242,9 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
     else if (O == Op::MATVEC) NSrc = 2;
     else if (O == Op::MATWRITE) NSrc = 1;
     else NSrc = 0;
+    // l1load takes (lbop, zmask, wmask): the masks follow the address token,
+    // not a vector operand.
+    unsigned MaskBase = (O == Op::L1LOAD) ? 1 : NA;
     SmallVector<Value *, 3> Src(VA.begin(), VA.begin() + NSrc);
 
     // Pick a destination space. A GRF write may share a space with a read
@@ -345,6 +353,8 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
     case Op::MATREAD:
       MauId = (uint64_t)(P == Prec::D ? mncore::MAUOp::DMRead : P == Prec::F ? mncore::MAUOp::FMRead : mncore::MAUOp::HMRead);
       break;
+    case Op::L1LOAD:
+      break;
     }
 
     if (UseAlu) {
@@ -353,7 +363,7 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       Value *D = TokSlot(DS);
       Value *Args[11] = {B.getInt64(AluId), B.getInt64(0), B.getInt64(0),
                          SX, SY, D, B.getInt64(-1), B.getInt64(-1),
-                         B.getInt64(-1), MaskVal(NA), MaskVal(NA + 1)};
+                         B.getInt64(-1), MaskVal(MaskBase), MaskVal(MaskBase + 1)};
       B.CreateCall(Alu, Args);
     } else if (O == Op::MATWRITE || O == Op::MATREAD) {
       Value *Mat = B.getInt64((ConstArg(0) & 1) |
@@ -372,6 +382,13 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
                          TokSlot(DS), B.getInt64(-1), B.getInt64(-1),
                          B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
       B.CreateCall(Mau, Args);
+    } else if (O == Op::L1LOAD) {
+      // (opcode, dir, src, dst, set, zmask, wmask)
+      Value *Args[7] = {B.getInt64((uint64_t)mncore::L1BOp::L1BMP),
+                        B.getInt64(1), CI->getArgOperand(0), TokSlot(DS),
+                        B.getInt64(-1), MaskVal(MaskBase),
+                        MaskVal(MaskBase + 1)};
+      B.CreateCall(L1b, Args);
     } else {
       // fma / mul / add (MAU vector forms)
       Value *SX = Tok(Src[0]);
@@ -380,7 +397,7 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       Value *D = TokSlot(DS);
       Value *Args[12] = {B.getInt64(MauId), B.getInt64(0), B.getInt64(-1),
                          SX, SY, SZ, D, B.getInt64(-1), B.getInt64(-1),
-                         B.getInt64(-1), MaskVal(NA), MaskVal(NA + 1)};
+                         B.getInt64(-1), MaskVal(MaskBase), MaskVal(MaskBase + 1)};
       B.CreateCall(Mau, Args);
     }
 

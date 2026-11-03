@@ -2,7 +2,7 @@
 
 目标：为 MLIR 前端（Triton/TileLang 原型）提供与 LLVM 后端 **同一 ABI** 的
 方言。所有 opcode 数值来自
-[`MNCoreIntrinsicOps.h`](../MNCoreIntrinsicOps.h)（append-only 稳定枚举）。
+[`MNCoreIntrinsicOps.h`](../../../../include/llvm/Target/MNCore/MNCoreIntrinsicOps.h)（append-only 稳定枚举）。
 
 ## 1. 分层
 
@@ -80,3 +80,59 @@ vector<2xf64> / vector<4xf32> / vector<8xf16>   // typed 向量
 2. 转换 pass 到 LLVM IR；与现有 `intrinsics.ll`/`layerb*.ll` 做文本对拍。
 3. `d set`/`d get` golden 覆盖扩展到矩阵/向量与数值算子。
 4. Triton 原型：`tt.dot`/elementwise/local_alloc → typed op。
+
+---
+
+## 7. 实现状态 (2026-11-03)
+
+本文 §1–§6 的契约已落地为树内 MLIR 代码（`mlir/` 子工程）：
+
+| 内容 | 位置 |
+|---|---|
+| dialect / 类型 / ops | `mlir/include/mlir/Dialect/MNCore/IR/MNCore{ Dialect,Ops }.td`、`MNCoreOps.h`、`MNCoreTypes.h` |
+| 验证器 | `mlir/lib/Dialect/MNCore/IR/MNCoreOps.cpp` |
+| `mncore → LLVM` | `mlir/include/mlir/Conversion/MNCoreToLLVM/`、`mlir/lib/Conversion/MNCoreToLLVM/MNCoreToLLVM.cpp` |
+| pass 注册 | `mlir/include/mlir/Conversion/Passes.td`（`convert-mncore-to-llvm`） |
+| 测试 | `mlir/test/Dialect/MNCore/roundtrip.mlir`、`mlir/test/Conversion/MNCoreToLLVM/lower.mlir` |
+
+**与初版设计的差异（有意为之）**：
+
+1. **缺省操作数用 `mncore.none` 而不是 `i64 -1`**。`mncore.none` 是显式 token，
+   在 MLIR 层可被验证器识别，lowering 时才变成 ABI 哨兵 `-1`。
+2. **token 构造参数全部是属性**（`space/addr/width/flags/aux`）。这直接编码
+   §11 的结论：运行期打包不可行，非法字段在 MLIR 层即报错。
+3. **指令 op 的 token 列表是定长 `Variadic`**，由验证器检查元数
+   （alu 8、mau 10、l1b 5、l2b 3、mv 3），避免 `AttrSizedOperandSegments`
+   与可选操作数的解析复杂度。
+4. **typed op 直接 lower 回 Layer B intrinsic**，槽位分配仍只在
+   `MNCoreLowerTypedIntrinsics.cpp` 实现一份。
+5. **`mncore.dget` 暂未提供**：后端尚无对应的 `llvm.mncore.dget` intrinsic
+   （`DGET` 目前只是 MIR 伪指令）。数值 golden 的 MLIR 入口在补 intrinsic
+   后追加。
+6. **typed 值不得逃逸**：`mncore.vec.*`/`mncore.mat.*` 的结果只能被其他 typed op
+   消费；返回、store、普通算术都会在 llc 的 Layer B pass 中被拒绝
+   （`MNCoreLowerTypedIntrinsics.cpp` 的契约）。前端 kernel 必须以写矩阵/
+   LM 或 `d set` 的形式结束，不能返回向量。
+7. 目前使用 **generic assembly form**（`"mncore.alu"(%a, %b, ...) {opcode = 0 : i64, ...}`）；
+   自定义 pretty syntax 是后续工作，不影响转换与验证。
+
+**构建**：
+
+```sh
+cmake -G Ninja -S llvm -B build-mlir \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_TARGETS_TO_BUILD= \
+  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=MNCore
+ninja -C build-mlir mlir-opt llc
+```
+
+**端到端**：
+
+```sh
+build-mlir/bin/mlir-opt input.mlir --convert-mncore-to-llvm \
+  | build-mlir/bin/mlir-translate --mlir-to-llvmir \
+  | build-mlir/bin/llc -mtriple=mncore2 -filetype=asm -o -
+```
+
+前端（Triton/TileLang）的接入方式见
+[`mncore_frontend_integration.md`](mncore_frontend_integration.md)。

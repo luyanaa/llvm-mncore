@@ -1,0 +1,237 @@
+# MN-Core 前端接入设计（Triton / TileLang）— 草案 (2026-11-03)
+
+本文描述 `../triton-mncore` 与 `../tilelang-mncore` 如何接入本仓库的
+MLIR 设备层与 LLVM 后端。设备运行时（模拟器/真机）的接入由另一条工作线
+负责；本文只定义**编译产物边界**。
+
+---
+
+## 1. 唯一契约
+
+前端不直接生成 `.vsm`，也不直接调用 `assemble3`。统一路径：
+
+```
+前端 IR
+  │  (前端专用 lowering)
+  ▼
+mncore dialect  (mlir/Dialect/MNCore, 本仓库)
+  │  convert-mncore-to-llvm
+  ▼
+LLVM IR: llvm.mncore.* intrinsics  (已冻结 ABI)
+  │  llc -mtriple=mncore2
+  ▼
+.vsm 文本 + metadata sidecar
+```
+
+两条硬边界：
+
+1. **`mncore` dialect 是设备语义的唯一入口**（`docs/mncore_mlir_dialect.md`、
+   `mlir/include/mlir/Dialect/MNCore/IR/`）。
+2. **`llvm.mncore.*` 是已冻结的机器层 ABI**
+   （`llvm/include/llvm/IR/IntrinsicsMNCore.td`、
+   `llvm/include/llvm/Target/MNCore/MNCoreIntrinsicOps.h`）。任何前端不得绕过
+   `convert-mncore-to-llvm` 自行拼装 Layer A token。
+
+### 1.1 安装产物
+
+前端需要一份**带 MNCore target 的 LLVM/MLIR 安装**：
+
+```sh
+cmake -G Ninja -S llvm -B build-mlir \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_TARGETS_TO_BUILD= \
+  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=MNCore \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF
+cmake --install build-mlir --prefix /opt/llvm-mncore
+```
+
+安装目录必须同时包含：
+
+* `bin/llvm-config`、`bin/llc`、`bin/mlir-opt`、`bin/mlir-translate`；
+* `lib/libMLIRMNCoreDialect.a`、`lib/libMLIRMNCoreToLLVM.a`；
+* `include/mlir/Dialect/MNCore/...`、`include/mlir/Conversion/MNCoreToLLVM/...`；
+* `include/llvm/Target/MNCore/MNCoreIntrinsicOps.h`（已迁移为公共头）。
+
+前端构建时通过 `LLVM_SYSPATH`（Triton）或 `USE_LLVM`（TVM）指向该前缀。
+
+---
+
+## 2. Triton 3.9 接入（`../triton-mncore`）
+
+现状（2026-11-03）：上游 `triton-lang/triton` main，版本 `3.9.0`；LLVM 由
+`LLVM_SYSPATH` 提供，不再内置 LLVM。后端接口为
+`BaseBackend.add_stages`（`python/triton/backends/compiler.py`）。
+
+### 2.1 目录
+
+```
+third_party/mncore/
+  CMakeLists.txt              # add_triton_library / add_triton_plugin
+  include/mncore/Conversion/  # TritonGPU -> mncore 的 pass 声明
+  lib/Conversion/             # TritonGPUToMNCore.cpp
+  backend/compiler.py         # MncoreBackend(BaseBackend)
+  backend/driver.py           # 启动/加载 .vsm（与另一条运行时工作线的接口）
+```
+
+构建：`-DTRITON_CODEGEN_BACKENDS=mncore -DLLVM_SYSPATH=/opt/llvm-mncore`。
+
+### 2.2 stage 划分
+
+`add_stages` 提供：
+
+| stage | 内容 |
+|---|---|
+| `ttir` | 复用 Triton 的 TTIR pass 链 |
+| `ttgir` | `convert_to_ttgpuir` 使用 mncore 的 layout |
+| `mnir` | **新增**：`tritongpu-to-mncore`（TTGIR → `mncore` dialect） |
+| `llir` | `convert-mncore-to-llvm` + LLVM dialect 翻译为 `.ll` 文本 |
+| `vsm` | `llc -mtriple=mncore2` → `.vsm` 文本；附 metadata |
+
+最终 stage 返回 bytes；driver 只认 `.vsm` + metadata。
+
+实现要点（已核对 Triton 3.9 源码）：
+
+* `llir` stage 返回 **LLVM IR 文本**（`str(llvm_mod)`），不是模块对象；
+* `vsm` stage 调 `llvm.translate_to_asm(src, "mncore2", ...)`，内部用
+  `TargetRegistry::lookupTarget` + `addPassesToEmitFile` 直接跑本仓库的
+  `MNCoreAsmPrinter`，无需子进程；
+* `llvm.attach_datalayout` 同样按 triple 创建 TargetMachine，要求该 LLVM
+  构建包含 MNCore target；
+* Triton 内置的 `llvm.init_targets()` 只初始化 NVPTX/AMDGPU，插件必须自行调用
+  `LLVMInitializeMNCoreTargetInfo/Target/TargetMC/AsmPrinter`。
+
+### 2.3 TTGIR → mncore 映射
+
+| TTGIR | mncore |
+|---|---|
+| `tt.load` / `tt.store`（DRAM） | `mncore.mv` + `mncore.l2b` + `mncore.l1b`（`mncore.dma`，M2） |
+| `ttg.local_alloc` | LM0/LM1（`mncore.peop` space 3/4） |
+| `ttg.local_load/store` | `mncore.l1b` / PE 直接寻址 |
+| `tt.dot` | `mncore.mat.write` + `mncore.mat.vec` + `mncore.mat.read` |
+| elementwise | `mncore.vec.fma/mul/add/max/min` |
+| `ttg.convert_layout` | `mncore.l1b`（broadcast/distribute/gather） |
+| mask/select | `mncore.maskop` + `zmask`/`wmask` |
+| barrier | `mncore.fence` + `mncore.wait`（tag 分配） |
+
+**首版限制**：程序必须能完全展开为直线代码（后端拒绝
+`BR/BRCOND/BR_CC/BR_JT/BRIND`，`MNCoreISelDAGToDAG.cpp:70-74`）。Triton 的
+`scf.for`/`scf.if` 必须在 `mnir` stage 之前完全 unroll 或 if-convert 成掩码；
+无法证明等价的副作用（DMA、同步）不得谓词化。
+
+### 2.4 指针参数与重定位（关键）
+
+`.vsm` 的地址字段是静态的（`packPEOperand`/`packMVOperand` 只接受立即数），
+Triton 的运行时指针无法直接进入指令。因此：
+
+* `mncore` 层把 buffer 参数表达为 `symbol + static offset`；
+* `convert-mncore-to-llvm` 生成占位地址，并在模块 metadata 中记录
+  `{arg_index, byte_offset, access}` fixup；
+* loader（`mnrt`）在 `mnrt_load_program_ex` 时做重定位。
+
+当前 `mnrt` 只记录 binding、**尚未实现 relocation**（见
+`mncore_kernel_abi_v1.md` §10）。这是与运行时工作线的**交叉契约**，必须先冻结
+fixup 记录格式。
+
+### 2.5 版本风险
+
+Triton 3.9 的上游 LLVM 版本与 LLVM 24 的 API 兼容性尚未验证。若不兼容，
+优先级为：
+
+1. 把 Triton 的 MLIR/LLVM 调用点适配到 24；
+2. 若成本过高，改用**进程外契约**：Triton 后端只产出 `mncore` dialect 文本
+   （stdout/文件），由外部 `mlir-opt --convert-mncore-to-llvm | mlir-translate | llc`
+   完成余下步骤。该路径牺牲 JIT 时延，但保证 ABI 与版本解耦。
+
+---
+
+## 3. TileLang 接入（`../tilelang-mncore`）
+
+现状：TVM 子模块已初始化（`3rdparty/tvm`，commit `4211874e`）；TileLang 有
+自建 backend 的模板 `src/ascend/`（`TVM_REGISTER_TARGET_KIND("ascend", ...)` +
+`CodeGenTileLangAscend : CodeGenTileLangCBase`）。Ascend 是 C 源码后端；MN-Core
+需要 LLVM IR，因此走 **TVM 的 LLVM codegen** 路径，而不是复制 Ascend 的 C
+codegen。
+
+### 3.1 推荐路径：TVM `CodeGenLLVM` 子类
+
+1. 用本仓库的 LLVM 安装构建 TVM：
+   `USE_LLVM=/opt/llvm-mncore/bin/llvm-config`（必须包含 MNCore target）。
+2. 在 `src/mncore/target.cc` 注册 target kind：
+   ```cpp
+   TVM_REGISTER_TARGET_KIND("mncore2", kDLExtDev)
+       .add_attr_option<ffi::String>("mcpu")
+       .set_default_keys({"mncore2"});
+   ```
+   并注册 `target.build.mncore2`（复用 `LLVMModuleNode`/`target.build.llvm` 的
+   实现）。
+3. `CodeGenLLVM::Create` 按 TargetMachine 名查找
+   `tvm.codegen.llvm.target_mncore2`（`codegen_llvm.cc:110`）。注册工厂，
+   返回 `CodeGenMNCore : CodeGenLLVM`：
+   * `VisitExpr_(CallNode*)` / `FLowerIntrinsic` 规则发射
+     `llvm.mncore.*` intrinsic；
+   * 约定 TIR `thread_binding` → PE lane 映射；
+   * 非法结构（动态循环、设备函数调用、越界静态资源）直接报错。
+4. 产物：`LLVMModuleNode` 持有 `LLVMTarget`，可调
+   `TargetMachine::addPassesToEmitFile(..., CGFT_AssemblyFile)`，由本仓库的
+   `MNCoreAsmPrinter` 直接产出 `.vsm` 文本（无需子进程，且 LLVM 版本天然一致）。
+   `CodeGenLLVM::Create` 按 TargetMachine 名查找
+   `tvm.codegen.llvm.target_mncore2`，因此工厂名必须是 `target_mncore2`
+   （MNCore 的 `RegisterTarget<Triple::mncore2>` 名字）。
+
+### 3.2 TIR 映射前提
+
+* TileLang 的 `T.Kernel` / 并行轴必须映射为 PE lane + 静态展开；TVM 的
+  `ForKind::kParallel` 与 `thread_binding` 不能留给 LLVM 生成真实分支。
+* `T.alloc_shared` → LM0/LM1；`T.copy` → MV/L2B/L1B 序列。
+* GEMM tile → 矩阵寄存器（`mat.write` / `mat.vec` / `mat.read`）。
+* 动态循环首版由 TileLang 在 host 侧分块或完全展开；后端不接收 CFG。
+
+### 3.3 备选路径
+
+若 TVM 与 LLVM 24 的 API 兼容性代价过大：
+
+* **文本桥**：`CodeGenMNCore` 用 TVM 自带 LLVM 发射名为 `mncore.*` 的普通
+  函数调用（非 `llvm.` 前缀，避免 TVM 侧 verifier 拒绝），在交给本仓库
+  `llc` 前做一次受控文本重写为 `llvm.mncore.*`。该桥已在设计上可行，
+  但必须由 golden 测试锁定，不能作为长期形态。
+* 不建议在 TileLang 侧重写一套 LLVM IR emitter。
+
+---
+
+## 4. 共享缺口（按优先级）
+
+1. **重定位/fixup + `mnrt` 支持**：前端 buffer 参数的前提（§2.4）。
+2. **`mncore.dma` / buffer 描述符**：把 MV→L2B→L1B 序列、tag 分配、静态内存
+   规划收敛到一个 op，避免前端各自拼 token。
+3. **控制流策略**：MLIR 侧 unroll/if-conversion 的合法性规则；后端只接收
+   直线代码。
+4. **tag 分配与 double buffering**：MV tag/wait 的编译期分配。
+5. **数值 golden**：当前只有 `d get`/`d set` 的最小闭环
+   （`golden.mir`/`golden_mem.mir`）；前端端到端对拍需要模拟器工作线的
+   `--dump` 支持。
+
+---
+
+## 5. 待办（本仓库侧）
+
+* ~~把枚举头迁到公共 include~~ **已完成**：`llvm/include/llvm/Target/MNCore/`。
+* ~~枚举同步检查~~ **已完成**：`MNCoreOps.cpp` 对 33 个值做 `static_assert`
+  （MLIR TableGen 枚举 ↔ `MNCoreIntrinsicOps.h`），任何漂移都是编译错误。
+* `mlir-translate` 端到端脚本：`.mlir → .ll → llc → .vsm`，并与现有
+  `intrinsics.ll`/`layerb*.ll` 文本对拍。
+* 在 `mncore` dialect 增加 `func` 级的 kernel metadata 输出
+  （entry、参数、资源），供 loader 消费。
+
+---
+
+## 6. 里程碑
+
+| 里程碑 | 内容 | 验收 |
+|---|---|---|
+| F0 | 本仓库 MLIR dialect + conversion 可用 | `mlir-opt --convert-mncore-to-llvm` lit 通过 |
+| F1 | 安装前缀；Triton/TVM 能链接 `MLIRMNCoreDialect` | 两个前端各自最小 C++ 链接测试 |
+| F2 | Triton `mnir` stage：单个 elementwise kernel | `.vsm` 可被 assemble3 接受 |
+| F3 | TileLang target kind + `CodeGenMNCore` | 单个 copy kernel 产出 `.vsm` |
+| F4 | buffer 参数 + fixup + `mnrt` 重定位 | 多 kernel buffer reuse 数值对拍 |
+| F5 | dot / GEMM 路径 | 与 CPU golden 对拍 |

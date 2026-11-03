@@ -13,13 +13,15 @@
 // range; an ID that is not listed here is unsupported and rejected by the
 // selector.
 //
-// This header is the single source of truth shared by SelectionDAG isel, the
-// Layer B lowering pass, and (planned) the MLIR mncore dialect.
+// This header is the public single source of truth shared by SelectionDAG
+// isel, the Layer B lowering pass, and the MLIR mncore dialect
+// (mlir/lib/Dialect/MNCore/IR/MNCoreOps.cpp). The MLIR dialect mirrors these
+// values in MNCoreOps.td; static_asserts in MNCoreOps.cpp reject any drift.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
-#define LLVM_LIB_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
+#ifndef LLVM_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
+#define LLVM_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
 
 #include <cstdint>
 
@@ -83,4 +85,4 @@ enum class MVOp : int64_t {
 } // namespace mncore
 } // namespace llvm
 
-#endif // LLVM_LIB_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
+#endif // LLVM_TARGET_MNCORE_MNCOREINTRINSIC_OPS_H
