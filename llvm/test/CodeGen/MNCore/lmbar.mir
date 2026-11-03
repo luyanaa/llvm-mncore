@@ -1,0 +1,26 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# LM base-address-register writes (3.6.1.7 / 3.6.1.9): $mb / $lmb (LM0) and
+# $nb / $lnb (LM1). The peoperand carries bit 49 to mark the BAR form;
+# width 0 = word, 1 = longword. BAR is output-only.
+#
+# $ls0v = 67108881; BAR0 word = kind2 | bar = 562949953421314,
+# BAR0 longword = +16, BAR1 longword = kind3 | width1 | bar.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+    ; CHECK: lpassa $ls0v $mb
+    PASSA_l 67108881, 562949953421314
+    ; CHECK: lpassa $ls0v $lmb
+    PASSA_l 67108881, 562949953421330
+    ; CHECK: lpassa $ls0v $lnb
+    PASSA_l 67108881, 562949953421331
+    RET
+...

@@ -52,6 +52,7 @@ public:
   }
 
   bool addInstSelector() override;
+  void addIRPasses() override;
   void addPreEmitPass() override;
 };
 
@@ -64,6 +65,12 @@ TargetPassConfig *MNCoreTargetMachine::createPassConfig(PassManagerBase &PM) {
 bool MNCorePassConfig::addInstSelector() {
   addPass(createMNCoreISelDag(getMNCoreTargetMachine(), getOptLevel()));
   return false;
+}
+
+void MNCorePassConfig::addIRPasses() {
+  TargetPassConfig::addIRPasses();
+  // Layer B typed intrinsics -> PE slot allocation -> Layer A.
+  addPass(createMNCoreLowerTypedIntrinsics());
 }
 
 void MNCorePassConfig::addPreEmitPass() {
@@ -92,4 +99,5 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMNCoreTarget() {
   initializeMNCoreDAGToDAGISelLegacyPass(PR);
   initializeMNCorePacketizerPass(PR);
   initializeMNCoreHazardPass(PR);
+  initializeMNCoreLowerTypedIntrinsicsPass(PR);
 }

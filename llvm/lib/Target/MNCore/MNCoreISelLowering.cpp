@@ -103,9 +103,18 @@ SDValue MNCoreTargetLowering::LowerFormalArguments(
   // Map each incoming i64 parameter to a live-in GRF0 slot.
   for (unsigned i = 0, e = Ins.size(); i != e; ++i) {
     EVT ArgVT = Ins[i].ArgVT;
+    // Vector arguments are Layer B values: the typed-intrinsic pass has
+    // already replaced all their uses by PE operand tokens, and the ABI
+    // assumes they are preloaded into GRF0 slots.
+    if (ArgVT.isVector()) {
+      // Unused after the Layer B pass; the framework still expects one
+      // value per argument.
+      InVals.push_back(DAG.getUNDEF(ArgVT));
+      continue;
+    }
     if (!ArgVT.isSimple() || ArgVT.getSimpleVT().SimpleTy != MVT::i64)
       report_fatal_error(
-          "MN-Core2 only accepts i64 kernel parameters");
+          "MN-Core2 only accepts i64 or vector kernel parameters");
 
     MCRegister PhysReg = MNCore::GRF0_0 + 2 * i;
     Register VReg = MRI.createVirtualRegister(&MNCore::GRFRegClass);

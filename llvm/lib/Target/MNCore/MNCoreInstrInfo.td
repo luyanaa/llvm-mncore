@@ -55,7 +55,7 @@ def MNCoreRetFlag : SDNode<"MNCoreISD::RET", SDT_MNCoreRet,
 // Control expressions (PE instruction expressions)
 //===----------------------------------------------------------------------===//
 
-let Itinerary = IIC_nop in
+let Itinerary = IIC_nop, hasSideEffects = 1 in
 def NOP : PEExpr<(outs), (ins), "nop">;
 
 let Itinerary = IIC_noforward in
@@ -67,7 +67,7 @@ def NOFORWARD : PEExpr<(outs), (ins), "noforward">;
 let PrintMethod = "printTagOperand" in
   def tagimm : Operand<i64>;
 
-let Itinerary = IIC_wait in
+let Itinerary = IIC_wait, hasSideEffects = 1 in
 def WAIT : PEExpr<(outs), (ins tagimm:$tag), "wait $tag">;
 
 

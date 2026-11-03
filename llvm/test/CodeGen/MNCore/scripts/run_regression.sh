@@ -23,7 +23,7 @@ for a in "$@"; do
 done
 
 # Tests that emit straight .vsm text (full llc run).
-EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit"
+EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar"
 # Tests checked via -run-pass=mncore-packetizer (MIR output).
 PKT="mau-rules packetize-groups peoperand-conflict vfma-mwrite-shape mask-rules"
 # Tests checked via -run-pass=mncore-hazard (MIR output).
@@ -32,12 +32,16 @@ HAZ="l2bmv-gap l1bset-hazard"
 HAZR="hazard-report"
 # Plain-IR tests (codegen-shape checks; the M1 register spelling is not
 # yet assemble3-legal, so these are FileCheck only).
-IRL="wide-imm plain-ir"
+IRL="wide-imm plain-ir intrinsics layerb layerb2"
 # Tests that must be rejected (negative fixtures): <test>|<message>.
 NEG="operand-placement|illegal PE operand placement
 pe-alignment|misaligned PE operand"
 # Tests whose vsm needs --instruction-mode flat on assemble3.
 FLAT="peoperand-modes"
+# Hazard/race checking is a separate stage: only streams authored to be
+# race-free (single-kernel, spaced) belong here. Syntax-only verification
+# (checkers disabled) is the stage above.
+HAZARD_OK="layerb"
 
 fail=0
 echo "===== FileCheck ====="
@@ -94,6 +98,20 @@ if [ $LOCAL_ONLY = 0 ]; then
         remfail=$((remfail+1))
       fi
     fi
+  done
+  # IR tests that must also assemble/emulate.
+  for t in intrinsics layerb layerb2; do
+    out=$($TD/scripts/emulate_gpfn3.sh $TD/$t.ll 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^emulate:'
+    [ $rc -ne 0 ] && { echo "FAIL  $t  (remote)"; remfail=$((remfail+1)); }
+  done
+  echo "===== assemble3 hazard/race checker (separate stage) ====="
+  for t in $HAZARD_OK; do
+    out=$($TD/scripts/verify_assemble3.sh $TD/$t.ll 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^assemble3 verify:'
+    [ $rc -ne 0 ] && { echo "FAIL  $t  (hazard/race)"; remfail=$((remfail+1)); }
   done
   echo "remote failures: $remfail"
 fi

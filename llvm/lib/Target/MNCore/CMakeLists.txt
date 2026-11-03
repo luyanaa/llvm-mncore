@@ -19,6 +19,7 @@ add_llvm_target(MNCoreCodeGen
   MNCoreInstrInfo.cpp
   MNCoreISelDAGToDAG.cpp
   MNCoreISelLowering.cpp
+  MNCoreLowerTypedIntrinsics.cpp
   MNCoreMCInstLower.cpp
   MNCorePacketizer.cpp
   MNCoreRegisterInfo.cpp

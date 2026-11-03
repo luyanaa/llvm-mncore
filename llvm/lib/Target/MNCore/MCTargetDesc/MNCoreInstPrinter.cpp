@@ -276,6 +276,12 @@ void MNCoreInstPrinter::printPEOperand(const MCInst *MI, unsigned OpNum,
   bool Rd = (V >> 8) & 1;
   bool Flat = (V >> 9) & 1;
 
+  // LM base-address-register write operands (3.6.1.7 / 3.6.1.9):
+  // $[l]mb / $[l]nb. Marked by peoperand bit 49; output-only.
+  if (((V >> 49) & 1) && !((V >> 9) & 1) && (Kind == 2 || Kind == 3)) {
+    O << '$' << (Width == 0 ? "" : "l") << (Kind == 2 ? "mb" : "nb");
+    goto done;
+  }
   if (Neg)
     O << '-';
   switch (Kind) {

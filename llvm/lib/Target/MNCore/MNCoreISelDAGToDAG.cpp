@@ -8,12 +8,15 @@
 
 #include "MNCore.h"
 #include "MNCoreSelectionDAGInfo.h"
+#include "MNCoreRegions.h"
 #include "MNCoreTargetMachine.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsMNCore.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -84,12 +87,20 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
     // Operand 0 is the input chain; it is tracked by the scheduler's
     // SUnit edges, not emitted as a machine operand, so skip it and
     // forward only the live result values.
+    // Keep the chain as the machine node's chain operand (result 0 is
+    // MVT::Other) and retarget the DAG root with ReplaceNode. Dropping the
+    // chain here left the chain feeding side-effecting intrinsics
+    // unreachable from the root, so their machine nodes were never emitted.
     SmallVector<SDValue, 8> Ops;
     for (const SDValue &Op : drop_begin(N->ops()))
       Ops.push_back(Op);
+    // The chain operand goes LAST: InstrEmitter ignores a trailing
+    // MVT::Other operand, while a leading one would be treated as an
+    // ordinary (register) operand.
+    Ops.push_back(N->getOperand(0));
     MachineSDNode *M = CurDAG->getMachineNode(
         MNCore::RET, SDLoc(N), MVT::Other, Ops);
-    ReplaceUses(SDValue(N, 0), SDValue(M, 0));
+    ReplaceNode(N, M);
     return;
   }
 
@@ -127,6 +138,432 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
           CurDAG->getMachineNode(MNCore::LOR, DL, MVT::i64, Sh, T2), 0);
       ReplaceNode(N, Or.getNode());
       return;
+    }
+  }
+
+  // llvm.mncore.* Layer A (docs/mncore_intrinsics_design.md).
+  //   * INTRINSIC_VOID: fence -> one nop step (a conservative ordering
+  //     barrier); wait -> WAIT with a constant tag.
+  //   * INTRINSIC_WO_CHAIN: token builders fold to a target constant; a
+  //     non-constant address/field is rejected (no runtime packing yet).
+  if (N->getOpcode() == ISD::INTRINSIC_VOID) {
+    auto *IIDN = dyn_cast<ConstantSDNode>(N->getOperand(1));
+    if (!IIDN) {
+      SelectCode(N);
+      return;
+    }
+    unsigned IID = (unsigned)IIDN->getZExtValue();
+    SDLoc DL(N);
+    auto Finish = [&](SDNode *M) {
+      const auto &D = CurDAG->getMachineFunction().getSubtarget().getInstrInfo()
+                          ->get(M->getMachineOpcode());
+      ReplaceNode(N, M);
+    };
+    // Token operands may still be unselected INTRINSIC_WO_CHAIN nodes when
+    // this instruction is selected (isel order is chain-driven). Fold them
+    // on demand; a bare constant is used as-is.
+    auto ConstOf = [&](const SDValue &V, unsigned I) -> int64_t {
+      auto *C = dyn_cast<ConstantSDNode>(V.getOperand(I));
+      if (!C)
+        report_fatal_error(
+            "MN-Core2: mncore token requires constant arguments");
+      return (int64_t)C->getZExtValue();
+    };
+    auto Fold = [&](SDValue V) -> SDValue {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return CurDAG->getTargetConstant(C->getZExtValue(), DL, MVT::i64);
+      if (V.getOpcode() != ISD::INTRINSIC_WO_CHAIN)
+        report_fatal_error(
+            "MN-Core2: mncore instruction operand is not a token");
+      auto *IDC = dyn_cast<ConstantSDNode>(V.getOperand(0));
+      if (!IDC)
+        report_fatal_error("MN-Core2: malformed mncore token");
+      StringRef TN = Intrinsic::getName((Intrinsic::ID)IDC->getZExtValue());
+      uint64_t P = 0;
+      if (TN == "llvm.mncore.peop")
+        P = mncore::packPEOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3),
+                                  (unsigned)ConstOf(V, 4), ConstOf(V, 5));
+      else if (TN == "llvm.mncore.lbop")
+        P = mncore::packLBOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3),
+                                  (unsigned)ConstOf(V, 4));
+      else if (TN == "llvm.mncore.matop")
+        P = mncore::packMATOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                   (unsigned)ConstOf(V, 3));
+      else if (TN == "llvm.mncore.mvop")
+        P = mncore::packMVOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3));
+      else if (TN == "llvm.mncore.mvparams")
+        P = mncore::packMVParams((uint64_t)ConstOf(V, 1),
+                                 (unsigned)ConstOf(V, 2),
+                                 (unsigned)ConstOf(V, 3),
+                                 (unsigned)ConstOf(V, 4));
+      else if (TN == "llvm.mncore.maskop")
+        P = mncore::packMaskOperand((unsigned)ConstOf(V, 1),
+                                    (unsigned)ConstOf(V, 2),
+                                    (unsigned)ConstOf(V, 3));
+      else
+        report_fatal_error("MN-Core2: unsupported mncore token builder");
+      return CurDAG->getTargetConstant(P, DL, MVT::i64);
+    };
+    StringRef ImmName = Intrinsic::getName((Intrinsic::ID)IID);
+    if (ImmName == "llvm.mncore.fence") {
+      MachineSDNode *M = CurDAG->getMachineNode(MNCore::NOP, DL, MVT::Other,
+                                                N->getOperand(0));
+      Finish(M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.alu") {
+      // (opcode, prec, opt, sx, sy, d0, d1, d2, omr, zmask, wmask)
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.alu needs a constant opcode");
+      auto IsMinus1 = [&](unsigned I) {
+        auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
+        return C && C->getSExtValue() == -1;
+      };
+      // Multi-destination and mask-register outputs are not wired.
+      for (unsigned I : {8u, 9u, 10u})
+        if (!IsMinus1(I))
+          report_fatal_error(
+              "MN-Core2: mncore.alu multi-dst/omr operands not wired yet");
+      bool Masked = !IsMinus1(11) || !IsMinus1(12);
+      unsigned Opc;
+      bool OneInput = false;
+      switch (OpcC->getZExtValue()) {
+      case 0: Opc = Masked ? MNCore::FMIN_M : MNCore::MIN_f; break;
+      case 1: Opc = Masked ? MNCore::FMAX_M : MNCore::MAX_f; break;
+      case 2: Opc = Masked ? MNCore::ADD_i_M : MNCore::ADD_i; break;
+      case 3: Opc = Masked ? MNCore::SUB_i_M : MNCore::SUB_i; break;
+      case 4: // lpassa (one input, one destination)
+        Opc = Masked ? MNCore::PASSA_l_M : MNCore::PASSA_l;
+        OneInput = true;
+        break;
+      case 10: Opc = MNCore::MAX_d; break;
+      case 11: Opc = MNCore::MIN_d; break;
+      case 12: Opc = MNCore::MAX_h; break;
+      case 13: Opc = MNCore::MIN_h; break;
+      default:
+        report_fatal_error("MN-Core2: mncore.alu opcode id not mapped yet");
+      }
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 6> MO;
+      if (OneInput)
+        MO = {TC(5), TC(7)};
+      else
+        MO = {TC(5), TC(6), TC(7)};
+      if (Masked) {
+        auto MaskTC = [&](unsigned I) -> SDValue {
+          if (IsMinus1(I))
+            return CurDAG->getTargetConstant(0, DL, MVT::i64); // absent
+          return Fold(N->getOperand(I));
+        };
+        MO.push_back(MaskTC(11)); // zero-flush
+        MO.push_back(MaskTC(12)); // write mask
+      }
+      MO.push_back(N->getOperand(0));
+      MachineSDNode *M = CurDAG->getMachineNode(
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.l1b") {
+      // (opcode, dir, src, dst, set, zmask, wmask)
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.l1b needs a constant opcode");
+      auto IsMinus1 = [&](unsigned I) {
+        auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
+        return C && C->getSExtValue() == -1;
+      };
+      if (!IsMinus1(6))
+        report_fatal_error(
+            "MN-Core2: mncore.l1b set qualifier not wired yet");
+      bool Masked = !IsMinus1(7) || !IsMinus1(8);
+      unsigned Opc;
+      switch (OpcC->getZExtValue()) {
+      case 0: Opc = Masked ? MNCore::L1BMP_M : MNCore::L1BMP; break;
+      case 1: Opc = Masked ? MNCore::L1BMM_M : MNCore::L1BMM; break;
+      case 2: Opc = Masked ? MNCore::L1BMM4_M : MNCore::L1BMM4; break;
+      default:
+        report_fatal_error("MN-Core2: mncore.l1b opcode id not mapped yet");
+      }
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 5> MO{TC(4), TC(5)};
+      if (Masked) {
+        auto MaskTC = [&](unsigned I) -> SDValue {
+          if (IsMinus1(I))
+            return CurDAG->getTargetConstant(0, DL, MVT::i64); // absent
+          return Fold(N->getOperand(I));
+        };
+        MO.push_back(MaskTC(7));
+        MO.push_back(MaskTC(8));
+      }
+      MO.push_back(N->getOperand(0));
+      MachineSDNode *M = CurDAG->getMachineNode(
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.mv") {
+      // (opcode, params, src, dst)
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.mv needs a constant opcode");
+      unsigned Opc;
+      switch (OpcC->getZExtValue()) {
+      case 0: Opc = MNCore::MVP; break;
+      default:
+        report_fatal_error("MN-Core2: mncore.mv opcode id not mapped yet");
+      }
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 4> MO{TC(3), TC(4), TC(5), N->getOperand(0)};
+      MachineSDNode *M = CurDAG->getMachineNode(
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.mau") {
+      // (opcode, prec, mat, sx, sy, sz, d0, d1, d2, omr, zmask, wmask)
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.mau needs a constant opcode");
+      auto IsMinus1 = [&](unsigned I) {
+        auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
+        return C && C->getSExtValue() == -1;
+      };
+      for (unsigned I : {9u, 10u, 11u, 12u, 13u})
+        if (!IsMinus1(I))
+          report_fatal_error(
+              "MN-Core2: mncore.mau multi-dst/omr/mask operands not wired yet");
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 6> MO;
+      unsigned Opc;
+      switch (OpcC->getZExtValue()) {
+      case 0: // vfma: sx, sy, sz, dst
+        Opc = MNCore::FVFMA;
+        MO = {TC(5), TC(6), TC(7), TC(8)};
+        break;
+      case 1: // vmul
+        Opc = MNCore::FVMUL;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 2: // vadd
+        Opc = MNCore::FVADD;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 3: // vpassa
+        Opc = MNCore::FVPASSA;
+        MO = {TC(5), TC(8)};
+        break;
+      case 4: // matvec face from the mat token's low bit
+        Opc = MNCore::XFMFMA;
+        MO = {TC(4), TC(5), TC(6), TC(8)};
+        break;
+      case 5: // mwrite (single precision): src, matrix operand
+        Opc = MNCore::W_XFMWRITE;
+        MO = {TC(5), TC(4)};
+        break;
+      case 6: // mread: matrix operand, dst
+        Opc = MNCore::W_XFMREAD;
+        MO = {TC(4), TC(8)};
+        break;
+      case 10: // dvfma
+        Opc = MNCore::DVFMAU;
+        MO = {TC(5), TC(6), TC(7), TC(8)};
+        break;
+      case 11: // dvmul
+        Opc = MNCore::DVMULU;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 12: // dvadd
+        Opc = MNCore::DVADD;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 13: // hvfma
+        Opc = MNCore::HVFMA;
+        MO = {TC(5), TC(6), TC(7), TC(8)};
+        break;
+      case 14: // hvmul
+        Opc = MNCore::HVMUL;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 15: // hvadd
+        Opc = MNCore::HVADD;
+        MO = {TC(5), TC(6), TC(8)};
+        break;
+      case 16: // d matvec
+        Opc = MNCore::XDMFMAU;
+        MO = {TC(4), TC(5), TC(6), TC(8)};
+        break;
+      case 17: // h matvec
+        Opc = MNCore::XHMFMA;
+        MO = {TC(4), TC(5), TC(6), TC(8)};
+        break;
+      case 18: // d mwrite
+        Opc = MNCore::W_XDMWRITE;
+        MO = {TC(5), TC(4)};
+        break;
+      case 19: // h mwrite
+        Opc = MNCore::W_XHMWRITE;
+        MO = {TC(5), TC(4)};
+        break;
+      case 20: // d mread
+        Opc = MNCore::W_XDMREAD;
+        MO = {TC(4), TC(8)};
+        break;
+      case 21: // h mread
+        Opc = MNCore::W_XHMREAD;
+        MO = {TC(4), TC(8)};
+        break;
+      default:
+        report_fatal_error("MN-Core2: mncore.mau opcode id not mapped yet");
+      }
+      MO.push_back(N->getOperand(0));
+      MachineSDNode *M = CurDAG->getMachineNode(
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.l2b") {
+      // (opcode, set, a, b) — opcode 0 = l2bmb (L2BM -> L1BM broadcast)
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.l2b needs a constant opcode");
+      if (OpcC->getZExtValue() != 0)
+        report_fatal_error("MN-Core2: mncore.l2b opcode id not mapped yet");
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 4> MO{TC(3), TC(4), TC(5), N->getOperand(0)};
+      MachineSDNode *M = CurDAG->getMachineNode(
+          MNCore::L2BMB, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.maskdir") {
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      MachineSDNode *M = CurDAG->getMachineNode(
+          MNCore::MASK_DIR, DL, MVT::Other, TC(2), N->getOperand(0));
+      ReplaceNode(N, M);
+      return;
+    }
+    if (ImmName == "llvm.mncore.wait") {
+      auto *Tag = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!Tag)
+        report_fatal_error(
+            "MN-Core2: llvm.mncore.wait requires a constant tag");
+      SDValue T = CurDAG->getTargetConstant(Tag->getZExtValue(), DL, MVT::i64);
+      MachineSDNode *M = CurDAG->getMachineNode(
+          MNCore::WAIT, DL, MVT::Other, T, N->getOperand(0));
+      Finish(M);
+      return;
+    }
+  }
+  if (N->getOpcode() == ISD::INTRINSIC_WO_CHAIN) {
+    auto *IIDN = dyn_cast<ConstantSDNode>(N->getOperand(0));
+    if (IIDN) {
+      unsigned IID = (unsigned)IIDN->getZExtValue();
+      auto ConstArg = [&](unsigned I) -> int64_t {
+        auto *C = dyn_cast<ConstantSDNode>(N->getOperand(I));
+        if (!C)
+          report_fatal_error(
+              "MN-Core2: mncore operand token requires constant arguments");
+        return (int64_t)C->getZExtValue();
+      };
+      SDLoc DL(N);
+      // Token operands may still be unselected INTRINSIC_WO_CHAIN nodes when
+    // this instruction is selected (isel order is chain-driven). Fold them
+    // on demand; a bare constant is used as-is.
+    auto ConstOf = [&](const SDValue &V, unsigned I) -> int64_t {
+      auto *C = dyn_cast<ConstantSDNode>(V.getOperand(I));
+      if (!C)
+        report_fatal_error(
+            "MN-Core2: mncore token requires constant arguments");
+      return (int64_t)C->getZExtValue();
+    };
+    auto Fold = [&](SDValue V) -> SDValue {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return CurDAG->getTargetConstant(C->getZExtValue(), DL, MVT::i64);
+      if (V.getOpcode() != ISD::INTRINSIC_WO_CHAIN)
+        report_fatal_error(
+            "MN-Core2: mncore instruction operand is not a token");
+      auto *IDC = dyn_cast<ConstantSDNode>(V.getOperand(0));
+      if (!IDC)
+        report_fatal_error("MN-Core2: malformed mncore token");
+      StringRef TN = Intrinsic::getName((Intrinsic::ID)IDC->getZExtValue());
+      uint64_t P = 0;
+      if (TN == "llvm.mncore.peop")
+        P = mncore::packPEOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3),
+                                  (unsigned)ConstOf(V, 4), ConstOf(V, 5));
+      else if (TN == "llvm.mncore.lbop")
+        P = mncore::packLBOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3),
+                                  (unsigned)ConstOf(V, 4));
+      else if (TN == "llvm.mncore.matop")
+        P = mncore::packMATOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                   (unsigned)ConstOf(V, 3));
+      else if (TN == "llvm.mncore.mvop")
+        P = mncore::packMVOperand((unsigned)ConstOf(V, 1), ConstOf(V, 2),
+                                  (unsigned)ConstOf(V, 3));
+      else if (TN == "llvm.mncore.mvparams")
+        P = mncore::packMVParams((uint64_t)ConstOf(V, 1),
+                                 (unsigned)ConstOf(V, 2),
+                                 (unsigned)ConstOf(V, 3),
+                                 (unsigned)ConstOf(V, 4));
+      else if (TN == "llvm.mncore.maskop")
+        P = mncore::packMaskOperand((unsigned)ConstOf(V, 1),
+                                    (unsigned)ConstOf(V, 2),
+                                    (unsigned)ConstOf(V, 3));
+      else
+        report_fatal_error("MN-Core2: unsupported mncore token builder");
+      return CurDAG->getTargetConstant(P, DL, MVT::i64);
+    };
+    StringRef ImmName = Intrinsic::getName((Intrinsic::ID)IID);
+      uint64_t V = 0;
+      bool Handled = true;
+      if (ImmName == "llvm.mncore.peop") {
+        V = mncore::packPEOperand((unsigned)ConstArg(1), ConstArg(2),
+                                  (unsigned)ConstArg(3), (unsigned)ConstArg(4),
+                                  ConstArg(5));
+      } else if (ImmName == "llvm.mncore.lbop") {
+        V = mncore::packLBOperand((unsigned)ConstArg(1), ConstArg(2),
+                                  (unsigned)ConstArg(3), (unsigned)ConstArg(4));
+      } else if (ImmName == "llvm.mncore.maskop") {
+        V = mncore::packMaskOperand((unsigned)ConstArg(1),
+                                    (unsigned)ConstArg(2),
+                                    (unsigned)ConstArg(3));
+      } else if (ImmName == "llvm.mncore.matop") {
+        V = mncore::packMATOperand((unsigned)ConstArg(1), ConstArg(2),
+                                   (unsigned)ConstArg(3));
+      } else if (ImmName == "llvm.mncore.mvparams") {
+        V = mncore::packMVParams((uint64_t)ConstArg(1),
+                                 (unsigned)ConstArg(2),
+                                 (unsigned)ConstArg(3),
+                                 (unsigned)ConstArg(4));
+      } else if (ImmName == "llvm.mncore.mvop") {
+        V = mncore::packMVOperand((unsigned)ConstArg(1), ConstArg(2),
+                                  (unsigned)ConstArg(3));
+      } else {
+        Handled = false;
+      }
+      if (Handled) {
+        SDValue C = CurDAG->getTargetConstant(V, DL, MVT::i64);
+        ReplaceNode(N, C.getNode());
+        return;
+      }
     }
   }
 

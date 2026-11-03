@@ -41,7 +41,9 @@ body:             |
     RET
 ...
 
-# Writes of different operands ($lr0v and $lr2v) -> one step.
+# Writes to different spaces ($lr0v = GRF0, $ls2v = GRF1) -> one step.
+# (Two writes to the *same* space conflict at any address: there is one
+# write-address field per space.)
 name:            distinct_write
 body:             |
   bb.0:
@@ -51,8 +53,8 @@ body:             |
     ; CHECK-NEXT: MAX_f
     ; CHECK-NEXT: }
     L1BMP 0, 67108880
-    ; fmax $ls0v $ln0v $lr2v
-    MAX_f 67108881, 67108883, 67110928
+    ; fmax $ls0v $ln0v $ls2v
+    MAX_f 67108881, 67108883, 67110929
     RET
 ...
 

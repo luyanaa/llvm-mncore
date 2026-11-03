@@ -84,3 +84,4 @@ for mir in "${ARGS[@]}"; do
 done
 echo "-----------------------------------------"
 echo "emulate: $pass passed, $fail failed"
+[ $fail -eq 0 ]

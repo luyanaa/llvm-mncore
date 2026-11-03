@@ -27,10 +27,12 @@ FunctionPass *createMNCoreISelDag(MNCoreTargetMachine &TM,
                                   CodeGenOptLevel OptLevel);
 FunctionPass *createMNCorePacketizer();
 FunctionPass *createMNCoreHazard();
+FunctionPass *createMNCoreLowerTypedIntrinsics();
 void initializeMNCoreAsmPrinterPass(PassRegistry &);
 void initializeMNCoreDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeMNCorePacketizerPass(PassRegistry &);
 void initializeMNCoreHazardPass(PassRegistry &);
+void initializeMNCoreLowerTypedIntrinsicsPass(PassRegistry &);
 
 } // end namespace llvm
 
