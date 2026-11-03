@@ -19,9 +19,11 @@
 
 #include "MNCore.h"
 #include "MNCoreMCInstLower.h"
+#include "MNCoreRegions.h"
 #include "MNCoreSubtarget.h"
 #include "MNCoreTargetMachine.h"
 #include "TargetInfo/MNCoreTargetInfo.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -48,6 +50,11 @@ class MNCoreAsmPrinter : public AsmPrinter {
   // private MCInstPrinter is not reachable from the AsmPrinter.
   std::unique_ptr<MCInstPrinter> ExprPrinter;
 
+  // NOP steps already folded into a preceding `nop/<N>` line. The generic
+  // emitter calls emitInstruction once per MachineInstr, so the run's
+  // remaining NOPs are skipped here.
+  SmallPtrSet<const MachineInstr *, 8> SuppressedNops;
+
 public:
   static char ID;
 
@@ -62,6 +69,11 @@ public:
 
   void emitInstruction(const MachineInstr *MI) override;
   void emitExpressionText(const MachineInstr *MI, raw_ostream &OS);
+  // Check that GRF register operands satisfy the .vsm access rules that the
+  // packed-immediate path enforces by construction: a longword access needs
+  // a 2-aligned address (3.6.1.6/.10). SelectionDAG/RA know nothing about
+  // the physical encoding, so this is the last place to catch it.
+  void validateRegOperands(const MachineInstr *MI);
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
@@ -78,6 +90,41 @@ void MNCoreAsmPrinter::emitFunctionBodyStart() {
 void MNCoreAsmPrinter::emitFunctionBodyEnd() {
   // Kernels end at end-of-file; `quit` is optional and can be inserted
   // by an explicit pass when truncation is desired.
+}
+
+void MNCoreAsmPrinter::validateRegOperands(const MachineInstr *MI) {
+  // Packed PE operands: width/alignment from the single shared decoder.
+  // Only PE expressions have this operand layout (MV lines pack memory
+  // kinds differently and are not PE exprs).
+  if ((MI->getDesc().TSFlags & 0x1) && mncore::peAlignmentBad(*MI))
+    report_fatal_error(
+        Twine("MN-Core2: misaligned PE operand in ") +
+        MI->getParent()->getParent()->getName() +
+        " (longword needs an even address, 2-longword a multiple of 4; "
+        "3.6.1.6/.10)");
+
+  const MCRegisterInfo &RI = TM.getMCRegisterInfo();
+  for (const MachineOperand &MO : MI->operands()) {
+    if (!MO.isReg() || !MO.getReg().isPhysical())
+      continue;
+    StringRef N = RI.getName(MO.getReg());
+    int64_t Addr = 0;
+    StringRef Digits;
+    if (N.starts_with_insensitive("grf0_"))
+      Digits = N.drop_front(5);
+    else if (N.starts_with_insensitive("grf1_"))
+      Digits = N.drop_front(5);
+    else
+      continue;
+    if (Digits.getAsInteger(10, Addr))
+      continue;
+    if (Addr % 2 != 0)
+      report_fatal_error(
+          Twine("MN-Core2: GRF address ") + Twine(Addr) + " in " +
+              MI->getParent()->getParent()->getName() +
+              " is not 2-aligned; longword PE operands require an even "
+              "address (3.6.1.6)");
+  }
 }
 
 void MNCoreAsmPrinter::emitInstruction(const MachineInstr *MI) {
@@ -99,6 +146,7 @@ void MNCoreAsmPrinter::emitInstruction(const MachineInstr *MI) {
     raw_string_ostream OS(Line);
     bool First = true;
     while (It != End && It->isInsideBundle()) {
+      validateRegOperands(&*It);
       // Each expression's generated text starts with a tab; render it to
       // a scratch buffer and strip leading whitespace so only the first
       // expression on the line keeps the conventional indent and the
@@ -117,6 +165,31 @@ void MNCoreAsmPrinter::emitInstruction(const MachineInstr *MI) {
     OS.flush();
     OutStreamer->emitRawText(StringRef(Line).rtrim());
     return;
+  }
+
+  if (!SuppressedNops.empty() && SuppressedNops.erase(MI))
+    return;
+  validateRegOperands(MI);
+
+  // Consecutive bare `nop` steps (each its own MI, never bundled: nop is
+  // exclusive with every expression but wait) fold into the manual's
+  // `nop/<n>` idiom. Only the first of a run emits text.
+  if (MI->getOpcode() == MNCore::NOP && !MI->isInsideBundle()) {
+    MachineBasicBlock::const_instr_iterator It = MI->getIterator();
+    MachineBasicBlock::const_instr_iterator End = MI->getParent()->instr_end();
+    unsigned N = 1;
+    MachineBasicBlock::const_instr_iterator Next = std::next(It);
+    while (Next != End && Next->getOpcode() == MNCore::NOP &&
+           !Next->isInsideBundle()) {
+      ++N;
+      ++Next;
+    }
+    if (N > 1) {
+      for (auto J = std::next(It); J != Next; ++J)
+        SuppressedNops.insert(&*J);
+      OutStreamer->emitRawText(Twine("\tnop/") + Twine(N));
+      return;
+    }
   }
 
   // A single (non-bundled) PE expression or an MV / pseudo line.

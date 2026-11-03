@@ -62,12 +62,17 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "mncore-hazard"
+
+static cl::opt<bool> HazardReport(
+    "mncore-hazard-report", cl::Hidden,
+    cl::desc("Report each hazard gap and the rule that forced it"));
 
 namespace {
 
@@ -365,16 +370,18 @@ void MNCoreHazard::regions(const MachineInstr &MI,
     return;
   }
 
-  // grp 0: no matrix side; scalar ALU destinations are GRF registers, so
-  // every decodable peoperand is a read — except an imm's PE destination
-  // and a multi-destination form, whose trailing operands write.
+  // grp 0: no matrix side. The isel-facing scalar ALU writes a GRF
+  // *register* (its packed operands are all reads); every assembly-level
+  // ALU expression (ALU1P/ALU2P/IMM_P, no register defs) writes its last
+  // peoperand, and a multi-destination form writes its last NDst.
+  bool RegDefs = MI.getDesc().getNumDefs() != 0;
   int srcEnd0 = (int)V.size();
   if (MDst)
     srcEnd0 -= (int)NDst;
   for (int i = 0; i < (int)V.size(); ++i) {
     Region R;
     bool Wr = MDst ? (i >= srcEnd0)
-                   : (((TS >> 16) & 1) && i == (int)V.size() - 1);
+                   : (!RegDefs && i == (int)V.size() - 1);
     if (decPE(V[i], R, /*w=*/Wr)) Out.push_back(R);
   }
 }
@@ -387,13 +394,18 @@ void MNCoreHazard::regions(const MachineInstr &MI,
 // ---------------------------------------------------------------------------
 
 // data-race gap: same space + same address, writer then reader.
-static int dataRaceGap(const Access &W, const Access &N) {
+static int dataRaceGap(const Access &W, const Access &N,
+                       const char **Rule = nullptr) {
   if (!W.R.Write || N.R.Write || W.R.Space != N.R.Space ||
       W.R.Addr != N.R.Addr)
     return 0;
   switch (W.R.Space) {
-  case MS_GRF0: case MS_GRF1: return 1;
-  case MS_T:                  return 1;
+  case MS_GRF0: case MS_GRF1:
+    if (Rule) *Rule = "GRF data-race (3.6.3.9)";
+    return 1;
+  case MS_T:
+    if (Rule) *Rule = "T data-race (3.6.3.9)";
+    return 1;
   case MS_LM0: case MS_LM1:   return 0; // LM is port, handled separately
   case MS_L1B:                return 0; // L1B via direction rules
   default:                    return 0;
@@ -403,7 +415,8 @@ static int dataRaceGap(const Access &W, const Access &N) {
 // L1B direction-pair rules (section 3.6.3). The writer/reader direction
 // is taken from the expression's l1dir/l2dir; the region must be the
 // L1B-side access of that expression.
-static int l1bPairGap(const Access &E, const Access &N) {
+static int l1bPairGap(const Access &E, const Access &N,
+                      const char **Rule = nullptr) {
   if (E.R.Space != MS_L1B || N.R.Space != MS_L1B)
     return 0;
 
@@ -414,48 +427,103 @@ static int l1bPairGap(const Access &E, const Access &N) {
     bool nToPE   = (N.D1 == 1);         // reader drains to PE
     bool nToL2B  = (N.D2 == 1 || N.D2 == 3); // reader feeds L2B / int-mc
     if (E.D1 == 2) {                    // PE->L1B write
-      if (nToPE)  return N.Turn ? 0 : 2; // turnaround drain is exempt
-      if (nToL2B) return (E.R.Addr == N.R.Addr) ? 3 : 0;
+      if (nToPE) {
+        if (N.Turn) return 0; // turnaround drain is exempt
+        if (Rule) *Rule = "PE->L1B then L1B->PE port (3.6.3.8)";
+        return 2;
+      }
+      if (nToL2B) {
+        if (E.R.Addr != N.R.Addr) return 0;
+        if (Rule) *Rule = "PE->L1B then L1B->L2B race (3.6.3.7)";
+        return 3;
+      }
     } else if (E.D2 == 2) {             // L2B->L1B write
-      if (nToPE)  return (E.R.Addr == N.R.Addr) ? 2 : 0;
-      if (nToL2B) return (E.R.Set & N.R.Set) ? 2 : 0; // port
+      if (nToPE) {
+        if (E.R.Addr != N.R.Addr) return 0;
+        if (Rule) *Rule = "L2B->L1B then L1B->PE race (3.6.3.6)";
+        return 2;
+      }
+      if (nToL2B) {
+        if (!(E.R.Set & N.R.Set)) return 0;
+        if (Rule) *Rule = "L2B->L1B then L1B->L2B port (3.6.3.3)";
+        return 2;
+      }
     } else if (E.D2 == 3) {             // internal multicast write
-      if (nToPE)  return (E.R.Addr == N.R.Addr) ? 3 : 0;
-      if (nToL2B) return (E.R.Set & N.R.Set) ? 3 : 0; // port
+      if (nToPE) {
+        if (E.R.Addr != N.R.Addr) return 0;
+        if (Rule) *Rule = "int-mcast then L1B->PE race (3.6.3.5)";
+        return 3;
+      }
+      if (nToL2B) {
+        if (!(E.R.Set & N.R.Set)) return 0;
+        if (Rule) *Rule = "int-mcast then L1B->L2B port (3.6.3.4)";
+        return 3;
+      }
     }
     return 0;
   }
 
       // Earlier read L1B for an L2B-bound transfer; a later L2B->L1B write
       // collides on the port regardless of address.
-  if (!E.R.Write && E.D2 == 1 && N.R.Write && N.D2 == 2)
-    return (E.R.Set & N.R.Set) ? 3 : 0;
+  if (!E.R.Write && E.D2 == 1 && N.R.Write && N.D2 == 2) {
+    if (!(E.R.Set & N.R.Set)) return 0;
+    if (Rule) *Rule = "L2B->L1B read then L2B->L1B write port (3.6.3.3)";
+    return 3;
+  }
 
   return 0;
 }
 
 // L2BM-side rules (3.6.3.1 and 3.6.3.2), keyed off the L2BM access of the
 // L1B<->L2B transfer expressions and of MV commands reading L2BM.
-static int l2bPairGap(const Access &E, const Access &N) {
+static int l2bPairGap(const Access &E, const Access &N,
+                      const char **Rule = nullptr) {
   if (E.R.Space != MS_L2B || !E.R.Write || E.D2 != 1)
     return 0; // only an L1B->L2B write starts these hazards
   // 3.6.3.1: an MV that reads L2BM must wait one empty step (the checker
   // assumes the MV touches its whole region on issue, so assume overlap).
-  if (N.R.Space == MS_L2B && !N.R.Write && N.D2 == 0)
+  if (N.R.Space == MS_L2B && !N.R.Write && N.D2 == 0) {
+    if (Rule) *Rule = "L1B->L2B then MV reads L2BM (3.6.3.1)";
     return 1;
+  }
   // 3.6.3.2: a following L2B->L1B transfer collides on the L2BM port.
   // (The L1B side of the same pair is handled in l1bPairGap.)
-  if (N.R.Space == MS_L2B && !N.R.Write && N.D2 == 2)
+  if (N.R.Space == MS_L2B && !N.R.Write && N.D2 == 2) {
+    if (Rule) *Rule = "L1B->L2B then L2B->L1B port (3.6.3.2)";
     return 3;
+  }
   return 0;
 }
 
 // port-collision gap: same LM space, writer then reader (any address).
-static int portGap(const Access &W, const Access &N) {
+static int portGap(const Access &W, const Access &N,
+                   const char **Rule = nullptr) {
   if ((W.R.Space == MS_LM0 || W.R.Space == MS_LM1) && W.R.Write &&
-      !N.R.Write && W.R.Space == N.R.Space)
+      !N.R.Write && W.R.Space == N.R.Space) {
+    if (Rule) *Rule = "LM port (3.6.3.9)";
     return 2;
-  return std::max(l1bPairGap(W, N), l2bPairGap(W, N));
+  }
+  const char *R1 = nullptr, *R2 = nullptr;
+  int G1 = l1bPairGap(W, N, &R1), G2 = l2bPairGap(W, N, &R2);
+  if (G1 >= G2) {
+    if (Rule) *Rule = R1;
+    return G1;
+  }
+  if (Rule) *Rule = R2;
+  return G2;
+}
+
+static const char *spaceName(int Space) {
+  switch (Space) {
+  case MS_GRF0: return "GRF0";
+  case MS_GRF1: return "GRF1";
+  case MS_LM0: return "LM0";
+  case MS_LM1: return "LM1";
+  case MS_T: return "T";
+  case MS_L1B: return "L1B";
+  case MS_L2B: return "L2B";
+  default: return "?";
+  }
 }
 
 bool MNCoreHazard::runOnMachineFunction(MachineFunction &MF) {
@@ -514,12 +582,33 @@ bool MNCoreHazard::runOnMachineFunction(MachineFunction &MF) {
       // (se + g + 1) - Step: 'g' empty steps must elapse, so the
       // earliest issue step for this access is h.Step + g + 1.
       int need = 0;
+      const char *BestRule = nullptr;
+      int BestStep = -1;
+      const Region *BestE = nullptr, *BestA = nullptr;
       for (const Hist &h : Hist_)
         for (const Access &a : Cur) {
-          int g = std::max(dataRaceGap(h.A, a), portGap(h.A, a));
-          if (g > 0)
-            need = std::max(need, (h.Step + g + 1) - Step);
+          const char *R1 = nullptr, *R2 = nullptr;
+          int G1 = dataRaceGap(h.A, a, &R1);
+          int G2 = portGap(h.A, a, &R2);
+          int g = std::max(G1, G2);
+          const char *R = G1 >= G2 ? R1 : R2;
+          if (g <= 0)
+            continue;
+          int Cand = (h.Step + g + 1) - Step;
+          if (Cand > need) {
+            need = Cand;
+            BestRule = R;
+            BestStep = h.Step;
+            BestE = &h.A.R;
+            BestA = &a.R;
+          }
         }
+      if (HazardReport && need > 0)
+        errs() << "mncore-hazard: " << MF.getName() << ": step " << Step
+               << ": insert " << need << " nop(s) for " << BestRule
+               << "; writer step " << BestStep << " "
+               << spaceName(BestE->Space) << "@" << BestE->Addr << " -> "
+               << spaceName(BestA->Space) << "@" << BestA->Addr << "\n";
 
       // Emit 'need' NOPs before the step (each = one empty step). Insert
       // at the plain-iterator position of the step's first MI (the BUNDLE

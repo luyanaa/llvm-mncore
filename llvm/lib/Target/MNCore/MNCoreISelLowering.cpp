@@ -94,9 +94,11 @@ SDValue MNCoreTargetLowering::LowerFormalArguments(
   MachineFunction &MF = DAG.getMachineFunction();
   MachineRegisterInfo &MRI = MF.getRegInfo();
 
-  if (Ins.size() > 256)
+  // Longword PE operands need an even GRF address (3.6.1.6), so the
+  // preloaded parameter slots are 2 apart.
+  if (Ins.size() > 128)
     report_fatal_error(
-        "MN-Core2 kernel takes too many scalar parameters (>256)");
+        "MN-Core2 kernel takes too many scalar parameters (>128 even slots)");
 
   // Map each incoming i64 parameter to a live-in GRF0 slot.
   for (unsigned i = 0, e = Ins.size(); i != e; ++i) {
@@ -105,7 +107,7 @@ SDValue MNCoreTargetLowering::LowerFormalArguments(
       report_fatal_error(
           "MN-Core2 only accepts i64 kernel parameters");
 
-    MCRegister PhysReg = MNCore::GRF0_0 + i;
+    MCRegister PhysReg = MNCore::GRF0_0 + 2 * i;
     Register VReg = MRI.createVirtualRegister(&MNCore::GRFRegClass);
     MRI.addLiveIn(PhysReg, VReg);
     InVals.push_back(DAG.getCopyFromReg(Chain, dl, VReg, MVT::i64));

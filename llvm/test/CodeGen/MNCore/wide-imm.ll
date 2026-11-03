@@ -14,12 +14,14 @@ target triple = "mncore2"
 ; 0x1122334455667788 — neither half zero nor equal.
 define i64 @wide(i64 %a) {
 ; CHECK-LABEL: wide:
-; CHECK: imm i"32", $grf0_1
-; CHECK: imm i"287454020", $grf0_2
-; CHECK: imm i"1432778632", $grf0_3
-; CHECK: lsl $grf0_2, $grf0_1, $grf0_1
-; CHECK: lor $grf0_1, $grf0_3, $grf0_1
-; CHECK: ladd $grf0_0, $grf0_1, $grf0_0
+; The register spelling is the legal .vsm PE operand ($lr<addr>v, no
+; commas); all longword operands must be 2-aligned.
+; CHECK: imm i"32" $lr{{[0-9]+}}v
+; CHECK: imm i"287454020" $lr{{[0-9]+}}v
+; CHECK: imm i"1432778632" $lr{{[0-9]+}}v
+; CHECK: lsl $lr{{[0-9]+}}v $lr{{[0-9]+}}v $lr{{[0-9]+}}v
+; CHECK: lor $lr{{[0-9]+}}v $lr{{[0-9]+}}v $lr{{[0-9]+}}v
+; CHECK: ladd $lr{{[0-9]+}}v $lr{{[0-9]+}}v $lr{{[0-9]+}}v
   %1 = add i64 %a, 1234605616436508552
   ret i64 %1
 }
@@ -27,8 +29,8 @@ define i64 @wide(i64 %a) {
 ; 0x1234567800000000 — low word is zero: xoxo form.
 define i64 @lowzero(i64 %a) {
 ; CHECK-LABEL: lowzero:
-; CHECK: immu i"305419896", $grf0_1
-; CHECK: ladd $grf0_0, $grf0_1, $grf0_0
+; CHECK: immu i"305419896" $lr{{[0-9]+}}v
+; CHECK: ladd $lr{{[0-9]+}}v $lr{{[0-9]+}}v $lr{{[0-9]+}}v
   %1 = add i64 %a, 1311768464867721216
   ret i64 %1
 }
@@ -36,8 +38,8 @@ define i64 @lowzero(i64 %a) {
 ; 0x1122334411223344 — both halves equal: xxxx form.
 define i64 @samehalves(i64 %a) {
 ; CHECK-LABEL: samehalves:
-; CHECK: imm i"287454020", $grf0_1
-; CHECK: ladd $grf0_0, $grf0_1, $grf0_0
+; CHECK: imm i"287454020" $lr{{[0-9]+}}v
+; CHECK: ladd $lr{{[0-9]+}}v $lr{{[0-9]+}}v $lr{{[0-9]+}}v
   %1 = add i64 %a, 1234605615291183940
   ret i64 %1
 }
@@ -45,7 +47,7 @@ define i64 @samehalves(i64 %a) {
 ; A signed 32-bit constant keeps the original single-imm path.
 define i64 @narrow(i64 %a) {
 ; CHECK-LABEL: narrow:
-; CHECK: imm i"-7", $grf0_1
+; CHECK: imm i"-7" $lr{{[0-9]+}}v
   %1 = add i64 %a, -7
   ret i64 %1
 }

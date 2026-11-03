@@ -40,9 +40,10 @@ enum MemSpace { MS_GRF0 = 0, MS_GRF1, MS_LM0, MS_LM1, MS_T, MS_OMR };
 
 // One access of an addressable PE memory.
 struct PEAccess {
-  int Space;     // MemSpace
-  int64_t Addr;  // base address (the peoperand address field)
+  int Space;      // MemSpace
+  int64_t Addr;   // base address (the peoperand address field)
   bool Write;
+  unsigned Width; // 0=word, 1=longword, 2=2-longword
 };
 
 // The parts of a peoperand that the section 3.6.4 vfma/vmul-vs-mwrite rule
@@ -117,7 +118,7 @@ inline void peAccesses(const MachineInstr &MI,
     SmallVector<uint64_t, 6> F;
     for (uint64_t X : V) {
       if ((X >> 32) & 1)
-        Acc.push_back({MS_OMR, (int64_t)(X & 0x3f), /*Wr=*/true});
+        Acc.push_back({MS_OMR, (int64_t)(X & 0x3f), /*Wr=*/true, 0});
       else
         F.push_back(X);
     }
@@ -137,7 +138,7 @@ inline void peAccesses(const MachineInstr &MI,
     }
     int64_t Addr = ((X >> 9) & 1) ? (int64_t)((X >> 10) & 0xfff)
                                   : (int64_t)((X >> 10) & 0xffff);
-    Acc.push_back({Sp, Addr, Wr});
+    Acc.push_back({Sp, Addr, Wr, (unsigned)((X >> 4) & 0x3)});
   };
 
   // Multi-destination form (section 3.6.1: <dst_0> [<dst_1>..]). The
@@ -350,6 +351,23 @@ inline bool peInstructionConflict(const MachineInstr &MI) {
       if (Kind == 8 || (Kind >= 10 && Kind <= 15))
         return true; // fixed value / mreadf outside the first input
     }
+  }
+  return false;
+}
+
+// Access-width alignment (3.6.1.6/.10 and 3.6.1.12): a longword access
+// needs an even word address, a 2-longword access a multiple of four.
+// T and OMR have no address, and word accesses are unconstrained.
+inline bool peAlignmentBad(const MachineInstr &MI) {
+  SmallVector<PEAccess, 6> A;
+  peAccesses(MI, A);
+  for (const PEAccess &X : A) {
+    if (X.Space == MS_T || X.Space == MS_OMR)
+      continue;
+    if (X.Width == 1 && (X.Addr & 1))
+      return true;
+    if (X.Width == 2 && (X.Addr & 3))
+      return true;
   }
   return false;
 }

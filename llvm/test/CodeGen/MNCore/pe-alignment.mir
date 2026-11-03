@@ -1,0 +1,20 @@
+# RUN: not llc -mtriple=mncore2 %s -o - 2>&1 | FileCheck %s
+#
+# A longword PE operand needs a 2-aligned address (3.6.1.6). The packed
+# operand below addresses GRF0 word 1 with width 1 ($lr1v), which the
+# shared PE-access decoder rejects at emission. (Physical-register operands
+# from SelectionDAG/RA go through the same validator; plain-ir.ll covers
+# the legal even-address case.)
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK: misaligned PE operand
+    PASSA_l 67108881, 67109904
+    RET
+...

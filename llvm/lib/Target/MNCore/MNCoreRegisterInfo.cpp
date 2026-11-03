@@ -56,3 +56,26 @@ bool MNCoreRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI,
                                              RegScavenger *RS) const {
   llvm_unreachable("MN-Core2 has no stack frame; frame indices are invalid");
 }
+
+bool MNCoreRegisterInfo::getRegAllocationHints(
+    Register VirtReg, ArrayRef<MCPhysReg> Order,
+    SmallSetVector<MCPhysReg, 16> &Hints, const MachineFunction &MF,
+    const VirtRegMap *VRM, const LiveRegMatrix *Matrix) const {
+  const TargetRegisterClass *RC = MF.getRegInfo().getRegClass(VirtReg);
+  if (RC != &MNCore::GRFRegClass)
+    return MNCoreGenRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
+                                                        MF, VRM, Matrix);
+  // GRF0 HWEncoding = address, GRF1 = 256 + address; both are even for an
+  // even address. Only two-register addressing is legal for longword PE
+  // operands, so offer the even candidates first and the odd ones only as
+  // a last resort.
+  Hints.clear();
+  for (MCPhysReg R : Order) {
+    unsigned Enc = getEncodingValue(R);
+    if (Enc < 512 && (Enc % 2) == 0)
+      Hints.insert(R);
+  }
+  for (MCPhysReg R : Order)
+    Hints.insert(R);
+  return true;
+}

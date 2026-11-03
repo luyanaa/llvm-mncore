@@ -71,6 +71,9 @@ body:             |
     ; CHECK: l1bmp $lb0 $lr0v $lm0v $ln0v
     L1BMP3 0, 67108880, 67108882, 67108883
 
+    ; consecutive hazard NOP steps fold into nop/<n>
+    ; CHECK: nop/2
+
     ; ---- mask-register destination (3.6.1.13) ----
     ; CHECK: lpassa $llm0v $ln0v $omr1
     LPASSA_O 67108898, 67108883, 4294967297

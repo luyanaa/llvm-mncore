@@ -87,11 +87,11 @@ def WAIT : PEExpr<(outs), (ins tagimm:$tag), "wait $tag">;
 let Itinerary = IIC_alu in {
 class ALU2<string opc>
     : PEExpr<(outs GRF:$dst), (ins GRF:$x, GRF:$y),
-             !strconcat(opc, " $x, $y, $dst")>;
+             !strconcat(opc, " $x $y $dst")>;
 
 class ALU1<string opc>
     : PEExpr<(outs GRF:$dst), (ins GRF:$x),
-             !strconcat(opc, " $x, $dst")>;
+             !strconcat(opc, " $x $dst")>;
 }
 
 def LADD : ALU2<"ladd">;
@@ -133,7 +133,7 @@ let PrintMethod = "printImmTyped" in
 // into a GRF register; its literal prints as `i"<s32>"`. TSFlags[16]
 // marks it as an imm command (see MNCoreInstrFormats.td).
 let isReMaterializable = 1, Itinerary = IIC_const in
-def IMM : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "imm $imm, $dst"> {
+def IMM : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "imm $imm $dst"> {
   let TSFlags{16} = 1;
 }
 
@@ -142,7 +142,7 @@ def IMM : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "imm $imm, $dst"> {
 // the high half of the 64-bit result holds the word and the low half is
 // zero. Used to materialize constants with a zero low word.
 let isReMaterializable = 1, Itinerary = IIC_const in
-def IMMU : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "immu $imm, $dst"> {
+def IMMU : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "immu $imm $dst"> {
   let TSFlags{16} = 1;
 }
 

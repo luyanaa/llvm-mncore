@@ -43,6 +43,14 @@ public:
     return Empty;
   }
 
+  // Prefer 2-aligned GRF addresses: longword PE operands require an even
+  // address (3.6.1.6/.10). The allocator otherwise has no notion of the
+  // packed VSM address, and an odd choice is rejected at emission.
+  bool getRegAllocationHints(Register VirtReg, ArrayRef<MCPhysReg> Order,
+                             SmallSetVector<MCPhysReg, 16> &Hints,
+                             const MachineFunction &MF, const VirtRegMap *VRM,
+                             const LiveRegMatrix *Matrix) const override;
+
   // MN-Core2 has no stack frames or calls, so the frame/call related
   // hooks are inert or hard-error if the generic pipeline asks for
   // them.

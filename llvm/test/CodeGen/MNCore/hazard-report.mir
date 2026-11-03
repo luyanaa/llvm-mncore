@@ -1,0 +1,31 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-hazard -mncore-hazard-report %s -o - 2>&1 | FileCheck %s
+#
+# -mncore-hazard-report names the rule that forced each gap, so a spacing
+# failure is attributable instead of a silent NOP count. GRF write->read
+# is a 1-step data race (3.6.3.9); an LM write->read is a 2-step port
+# collision (3.6.3.9).
+#
+# CHECK-DAG: mncore-hazard: grf_race: step 1: insert 1 nop(s) for GRF data-race (3.6.3.9); writer step 0 GRF0@0 -> GRF0@0
+# CHECK-DAG: mncore-hazard: lm_port: step 1: insert 2 nop(s) for LM port (3.6.3.9); writer step 0 LM0@0 -> LM0@0
+
+--- |
+  target triple = "mncore2"
+  define void @grf_race() { ret void }
+  define void @lm_port() { ret void }
+...
+---
+name:            grf_race
+body:             |
+  bb.0:
+    PASSA_l 67108881, 67108880
+    PASSA_l 67108880, 67108882
+    RET
+...
+---
+name:            lm_port
+body:             |
+  bb.0:
+    PASSA_l 67108881, 67108898
+    PASSA_l 67108882, 67108880
+    RET
+...

@@ -35,8 +35,39 @@ void MNCoreInstPrinter::printInst(const MCInst *MI, uint64_t Address,
   printAnnotation(O, Annot);
 }
 
+// M1 scalar registers are GRF0/GRF1/T slots. `.vsm` names them as physical
+// PE operands, not compiler registers: GRF0@A -> $lr<A>v, GRF1@A ->
+// $ls<A>v, the T register -> $llt. All M1 scalar ALU ops are longword
+// accesses, so the `l` width and the `v` address mode are fixed here; the
+// assemble3-side 2-longword alignment rule is checked when the instruction
+// is emitted (MNCoreAsmPrinter::emitInstruction). MASM-level packed
+// operands do not go through this path — they are i64 immediates printed by
+// printPEOperand.
 void MNCoreInstPrinter::printRegName(raw_ostream &OS, MCRegister Reg) {
-  OS << '$' << getRegisterName(Reg);
+  StringRef N = getRegisterName(Reg);
+  auto NumAfter = [&](StringRef Prefix, int64_t &Out) -> bool {
+    if (!N.starts_with(Prefix))
+      return false;
+    return !N.drop_front(Prefix.size()).getAsInteger(10, Out);
+  };
+  int64_t Addr = 0;
+  if (NumAfter("grf0_", Addr)) {
+    OS << "$lr" << Addr << 'v';
+    return;
+  }
+  if (NumAfter("grf1_", Addr)) {
+    OS << "$ls" << Addr << 'v';
+    return;
+  }
+  if (NumAfter("t_", Addr)) {
+    OS << "$llt"; // T has no address; always 2-longword (3.6.1.12)
+    return;
+  }
+  if (NumAfter("omr_", Addr)) {
+    OS << "$omr" << Addr;
+    return;
+  }
+  OS << '$' << N;
 }
 
 void MNCoreInstPrinter::printOperand(const MCInst *MI, unsigned OpNum,
