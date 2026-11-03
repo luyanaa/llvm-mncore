@@ -93,6 +93,43 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
     return;
   }
 
+  // Wide (beyond signed-32-bit) 64-bit constants. The single `imm` word
+  // literal is replicated into all four word slots, so a constant whose
+  // two 32-bit halves agree is one imm; one with a zero low half is one
+  // immu (xoxo). Anything else needs two materializations plus a shift
+  // and an or. TSFlags on IMM/IMMU keep the imm<->LM0 co-issue rule and
+  // the PE-operand decode correct for every spelling.
+  if (N->getOpcode() == ISD::Constant) {
+    APInt C = cast<ConstantSDNode>(N)->getAPIntValue();
+    if (C.getBitWidth() == 64 && !isInt<32>(C.getSExtValue())) {
+      SDLoc DL(N);
+      uint64_t V = C.getZExtValue();
+      uint32_t Lo = (uint32_t)V, Hi = (uint32_t)(V >> 32);
+      auto ImmNode = [&](unsigned Opc, uint32_t Word) -> SDValue {
+        SDValue K = CurDAG->getTargetConstant((int32_t)Word, DL, MVT::i64);
+        return SDValue(
+            CurDAG->getMachineNode(Opc, DL, MVT::i64, K), 0);
+      };
+      if (Lo == 0) { // xoxo: high word only
+        ReplaceNode(N, ImmNode(MNCore::IMMU, Hi).getNode());
+        return;
+      }
+      if (Lo == Hi) { // xxxx: both halves agree
+        ReplaceNode(N, ImmNode(MNCore::IMM, Hi).getNode());
+        return;
+      }
+      SDValue T1 = ImmNode(MNCore::IMM, Hi);
+      SDValue T2 = ImmNode(MNCore::IMM, Lo);
+      SDValue T3 = ImmNode(MNCore::IMM, 32);
+      SDValue Sh = SDValue(
+          CurDAG->getMachineNode(MNCore::LSLR, DL, MVT::i64, T1, T3), 0);
+      SDValue Or = SDValue(
+          CurDAG->getMachineNode(MNCore::LOR, DL, MVT::i64, Sh, T2), 0);
+      ReplaceNode(N, Or.getNode());
+      return;
+    }
+  }
+
   // The target-specific patterns in MNCoreInstrInfo.td handle the
   // supported scalar ops.
   SelectCode(N);

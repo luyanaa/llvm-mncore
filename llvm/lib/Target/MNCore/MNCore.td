@@ -34,6 +34,7 @@ include "MNCoreInstrInfo.td"
 include "MNCoreInstrMV.td"
 include "MNCoreInstrL2BM.td"
 include "MNCoreInstrL1BM.td"
+include "MNCoreInstrALU.td"
 include "MNCoreInstrMAU.td"
 
 def MNCoreInstrInfo : InstrInfo;

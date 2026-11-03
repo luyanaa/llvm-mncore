@@ -15,6 +15,7 @@ add_public_tablegen_target(MNCoreCommonTableGen)
 add_llvm_target(MNCoreCodeGen
   MNCoreAsmPrinter.cpp
   MNCoreFrameLowering.cpp
+  MNCoreHazard.cpp
   MNCoreInstrInfo.cpp
   MNCoreISelDAGToDAG.cpp
   MNCoreISelLowering.cpp

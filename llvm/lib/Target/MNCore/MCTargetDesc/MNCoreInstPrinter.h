@@ -37,6 +37,10 @@ private:
   }
   void printTagOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printImmLiteral(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // Typed immediate literal (3.2.2): i/s/ui/us/f/h forms of the imm command.
+  void printImmTyped(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // hbfn/hbfe mantissa-length suffix (3.6.12.12): prints "/<n>".
+  void printBFMantOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   // MV instruction operand helpers (section 3.5).
   void printMVOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printMVParams(const MCInst *MI, unsigned OpNum, raw_ostream &O);
@@ -49,9 +53,16 @@ private:
   void printLB2Operand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printMABSetOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printMABDiffOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // Mask-register write destination $omr<addr> (3.6.1.13).
+  void printOMROperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // Multi-line write-mask directive `mask[l|ll][rstmnk] <addr>` (3.6.2.1).
+  void printMaskDirective(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   // MAU expression operand helpers (sections 3.6.9-3.6.11).
   void printMATOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
   void printMATSideOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
+  // Mask application (section 3.6.2): "/(ll)?(<pattern>|$imr<adr>)(t|p)".
+  // Prints nothing when the operand is absent (present bit clear).
+  void printMaskOperand(const MCInst *MI, unsigned OpNum, raw_ostream &O);
 };
 
 } // end namespace llvm

@@ -108,6 +108,36 @@ let PrintMethod = "printMABSetOperand" in
 let PrintMethod = "printMABDiffOperand" in
   def mabdiffoperand : Operand<i64>;
 
+// Mask-register write destination (3.6.1.13): "$omr<addr>". Packed as
+// addr | (1<<32); bit 32 is a marker the PE-operand decoders use to skip it.
+let PrintMethod = "printOMROperand" in
+  def omroperand : Operand<i64>;
+
+// Multi-line write-mask directive (3.6.2.1): "mask[l|ll][r][s][t][m][n][k] <addr>".
+// Packed: [0] ll, [6:1] enables r,s,t,m,n,k, [13:7] entry address.
+let PrintMethod = "printMaskDirective" in
+  def maskdiroperand : Operand<i64>;
+
+// The multi-line directive itself (3.6.2.1). It is a control statement,
+// not a PE expression: it changes the mask applied to following writes
+// until the next directive. Pseudo + non-PE, so it stays on its own line.
+def MASK_DIR : PseudoMN<(outs), (ins maskdiroperand:$spec), "mask$spec">;
+
+// Mask application (section 3.6.2), the shared "/(ll)?(<pattern>|$imr<adr>)(t|p)".
+// Used two ways, distinguished by where the operand sits in the asm string:
+//   * zero-flush:  <opcode>/(...)  — printed right after the mnemonic;
+//   * write mask:  <dst>/(...)     — printed right after the destination.
+// Both are always the LAST operand in the `ins` list (stable MI index); the
+// class's asm string decides where it prints. Packed i64:
+//   [0]     present
+//   [1]     ll     : 2-longword mask word length
+//   [2]     var    : variable entry ($imr) instead of a fixed 4-bit pattern
+//   [15:3]  value  : fixed-entry 4-bit pattern, or variable-entry address
+//   [17:16] tp     : 0 none, 1 't' (truncate), 2 'p' (pad)
+//   [18]    zero   : 1 = zero-flush application (3.6.2.2), 0 = write mask
+let PrintMethod = "printMaskOperand" in
+  def maskoperand : Operand<i64>;
+
 //===----------------------------------------------------------------------===//
 // L1BM instruction expressions.
 //
@@ -116,66 +146,92 @@ let PrintMethod = "printMABDiffOperand" in
 // identical text, different reserved unit.
 //===----------------------------------------------------------------------===//
 
-class L1BMC<dag ins, string asm> : PEExpr<(outs), ins, asm> {
+// Direction tags (TSFlags [9:8]) drive the §3.6.4 co-issue check and the
+// §3.6.3 hazard latencies: 1 = L1B->PE (the expression READS L1BM,
+// writes PE), 2 = PE->L1B (writes L1BM), 3 = turnaround ($lbi). For a
+// turnaround form the tag records the direction of the $lbi access:
+// a read-side turnaround (l1bmm $lbi -> PE) is L1B->PE, a write-side
+// turnaround (PE -> $lbi) is PE->L1B. The plain/_T twin of one mnemonic
+// shares the direction; only the reserved unit differs.
+class L1BMC<dag ins, string asm, int dir>
+    : PEExpr<(outs), ins, asm> {
   let Itinerary = IIC_l1bm;
+  let TSFlags{9-8} = dir;
 }
-class L1BMCT<dag ins, string asm> : PEExpr<(outs), ins, asm> {
+class L1BMCT<dag ins, string asm, int dir>
+    : PEExpr<(outs), ins, asm> {
   let Itinerary = IIC_l1bmt;
+  let TSFlags{9-8} = dir;
+  // Bit 12 marks this as a turnaround ($lbi) form — the packetizer uses
+  // it to pair a turnaround read with the PE->L1B write that feeds it.
+  let TSFlags{12} = 1;
 }
 
 // ---- L1BM -> PE broadcast -------------------------------------------------
 
 // l1bmp $(l|ll)b(<a>|i) <pe>: 1/2-longword PE broadcast (3.6.8.6/.7).
 def L1BMP   : L1BMC<(ins lb2operand:$src, peoperand:$dst),
-                    "l1bmp $src $dst">;
+                    "l1bmp $src $dst", 1>;
 def L1BMP_T : L1BMCT<(ins lb2operand:$src, peoperand:$dst),
-                     "l1bmp $src $dst">;
+                     "l1bmp $src $dst", 1>;
+// Multi-destination broadcast (3.6.1/3.6.8.6): the same data is written
+// to every listed PE operand. TSFlags[17] + [20:18] carry the write count.
+def L1BMP2  : L1BMC<(ins lb2operand:$src, peoperand:$d0, peoperand:$d1),
+                    "l1bmp $src $d0 $d1", 1> {
+  let TSFlags{17} = 1;
+  let TSFlags{20-18} = 2;
+}
 
 // l1bmm $(l|ll)b(<a>|i) <pe>: 1/2-longword 16x1 MAB broadcast (.8/.9).
 def L1BMM   : L1BMC<(ins lb2operand:$src, peoperand:$dst),
-                    "l1bmm $src $dst">;
+                    "l1bmm $src $dst", 1>;
+def L1BMM2  : L1BMC<(ins lb2operand:$src, peoperand:$d0, peoperand:$d1),
+                    "l1bmm $src $d0 $d1", 1> {
+  let TSFlags{17} = 1;
+  let TSFlags{20-18} = 2;
+}
 def L1BMM_T : L1BMCT<(ins lb2operand:$src, peoperand:$dst),
-                     "l1bmm $src $dst">;
+                     "l1bmm $src $dst", 1>;
 
 // l1bmm4 $(l|ll)b(<a>|i) <pe>: 1/2-longword 4x4 MAB broadcast (.14/.15).
 def L1BMM4   : L1BMC<(ins lb2operand:$src, peoperand:$dst),
-                     "l1bmm4 $src $dst">;
+                     "l1bmm4 $src $dst", 1>;
 def L1BMM4_T : L1BMCT<(ins lb2operand:$src, peoperand:$dst),
-                      "l1bmm4 $src $dst">;
+                      "l1bmm4 $src $dst", 1>;
 
 // l1bmd[<mabdiff>] $(l|ll)b(<a>|i) <pe>: distribute (3.6.8.20).
 def L1BMD   : L1BMC<(ins mabdiffoperand:$diff, lb2operand:$src,
                      peoperand:$dst),
-                    "l1bmd$diff $src $dst">;
+                    "l1bmd$diff $src $dst", 1>;
 def L1BMD_T : L1BMCT<(ins mabdiffoperand:$diff, lb2operand:$src,
                       peoperand:$dst),
-                     "l1bmd$diff $src $dst">;
+                     "l1bmd$diff $src $dst", 1>;
 
 // ---- PE -> L1BM collect ----------------------------------------------------
 
 // l1bmm@<mabadr> <pe> $(l|ll)b(<a>|i): 16x1 individual (.10/.11).
 def L1BMM_AT   : L1BMC<(ins mabsetoperand:$at, peoperand:$src,
                         lb2operand:$dst),
-                       "l1bmm$at $src $dst">;
+                       "l1bmm$at $src $dst", 2>;
 def L1BMM_AT_T : L1BMCT<(ins mabsetoperand:$at, peoperand:$src,
                          lb2operand:$dst),
-                        "l1bmm$at $src $dst">;
+                        "l1bmm$at $src $dst", 2>;
 
 // l1bmm4@<mabadr> <pe> $(l|ll)b(<a>|i): 4x4 individual (.16/.17).
 def L1BMM4_AT   : L1BMC<(ins mabsetoperand:$at, peoperand:$src,
                          lb2operand:$dst),
-                        "l1bmm4$at $src $dst">;
+                        "l1bmm4$at $src $dst", 2>;
 def L1BMM4_AT_T : L1BMCT<(ins mabsetoperand:$at, peoperand:$src,
                           lb2operand:$dst),
-                         "l1bmm4$at $src $dst">;
+                         "l1bmm4$at $src $dst", 2>;
 
 // l1bmd[<mabdiff>] <pe> $(l|ll)b(<a>|i): collect (3.6.8.21).
 def L1BMD_C   : L1BMC<(ins mabdiffoperand:$diff, peoperand:$src,
                        lb2operand:$dst),
-                      "l1bmd$diff $src $dst">;
+                      "l1bmd$diff $src $dst", 2>;
 def L1BMD_C_T : L1BMCT<(ins mabdiffoperand:$diff, peoperand:$src,
                         lb2operand:$dst),
-                       "l1bmd$diff $src $dst">;
+                       "l1bmd$diff $src $dst", 2>;
 
 // ---- Reduce forms ----------------------------------------------------------
 //
@@ -186,16 +242,16 @@ def L1BMD_C_T : L1BMCT<(ins mabdiffoperand:$diff, peoperand:$src,
 
 class L1BMR<string op>
     : L1BMC<(ins peoperand:$src, lb2operand:$dst),
-            !strconcat("l1bmr", op, " $src $dst")>;
+            !strconcat("l1bmr", op, " $src $dst"), 2>;
 class L1BMRT<string op>
     : L1BMCT<(ins peoperand:$src, lb2operand:$dst),
-             !strconcat("l1bmr", op, " $src $dst")>;
+             !strconcat("l1bmr", op, " $src $dst"), 2>;
 class L1BMR4<string op>
     : L1BMC<(ins peoperand:$src, lb2operand:$dst),
-            !strconcat("l1bmr4", op, " $src $dst")>;
+            !strconcat("l1bmr4", op, " $src $dst"), 2>;
 class L1BMR4T<string op>
     : L1BMCT<(ins peoperand:$src, lb2operand:$dst),
-             !strconcat("l1bmr4", op, " $src $dst")>;
+             !strconcat("l1bmr4", op, " $src $dst"), 2>;
 
 foreach p = [["dfadd","DFADD"], ["ffadd","FFADD"], ["hfadd","HFADD"],
              ["dmax","DMAX"], ["fmax","FMAX"], ["hmax","HMAX"],
@@ -210,4 +266,39 @@ foreach p = [["dfadd","DFADD"], ["ffadd","FFADD"], ["hfadd","HFADD"],
   def "L1BMR_"#p[1]#"_T"  : L1BMRT<p[0]>;
   def "L1BMR4_"#p[1]    : L1BMR4<p[0]>;
   def "L1BMR4_"#p[1]#"_T" : L1BMR4T<p[0]>;
+}
+
+//===----------------------------------------------------------------------===//
+// Masked L1BM->PE broadcast forms (3.6.2). The transfer result is a
+// maskable output: the zero-flush mask prints after the mnemonic, the
+// write mask after the (single) destination. PE->L1B collect forms are
+// not maskable outputs and have no masked twin.
+//===----------------------------------------------------------------------===//
+class L1BMC_M<string opc, dag extra>
+    : PEExpr<(outs),
+             !con(extra, (ins peoperand:$dst, maskoperand:$zmask,
+                          maskoperand:$wmask)),
+             !strconcat(opc, "$zmask $src $dst$wmask")> {
+  let Itinerary = IIC_l1bm;
+  let TSFlags{9-8} = 1;
+  let TSFlags{14} = 1;
+  let TSFlags{15} = 1;
+}
+def L1BMP_M : L1BMC_M<"l1bmp", (ins lb2operand:$src)>;
+def L1BMM_M : L1BMC_M<"l1bmm", (ins lb2operand:$src)>;
+def L1BMM4_M : L1BMC_M<"l1bmm4", (ins lb2operand:$src)>;
+def L1BMD_M : L1BMC_M<"l1bmd", (ins mabdiffoperand:$diff, lb2operand:$src)>;
+
+// Three-destination L1BM broadcasts (3.6.1).
+def L1BMP3 : L1BMC<(ins lb2operand:$src, peoperand:$d0, peoperand:$d1,
+                        peoperand:$d2),
+                  "l1bmp $src $d0 $d1 $d2", 1> {
+  let TSFlags{17} = 1;
+  let TSFlags{20-18} = 3;
+}
+def L1BMM3 : L1BMC<(ins lb2operand:$src, peoperand:$d0, peoperand:$d1,
+                        peoperand:$d2),
+                  "l1bmm $src $d0 $d1 $d2", 1> {
+  let TSFlags{17} = 1;
+  let TSFlags{20-18} = 3;
 }

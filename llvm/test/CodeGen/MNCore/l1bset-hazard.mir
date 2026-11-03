@@ -1,0 +1,39 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-hazard %s -o - | FileCheck %s
+#
+# Section 3.6.3.3 port rule between an L2BM->L1B transfer and an
+# L1BM->L2B transfer applies only when their L1B sets overlap (3.6.7.1).
+#
+# L1B-set packing: [7] present, [6] isList, [31:16] 8-bit list mask.
+#   [0,4] = 0xC0 | (0x11<<16) = 1114304;  [1,5] = 0xC0 | (0x22<<16).
+# l2bm@<l1badr> names a single L1B: mabsetoperand = (1<<4) | adr (3.6.7.5).
+
+--- |
+  target triple = "mncore2"
+  define void @overlap() { ret void }
+  define void @disjoint() { ret void }
+...
+---
+name:            overlap
+body:             |
+  bb.0:
+    ; [0,4] then @0 -> overlap -> two empty steps.
+    ; CHECK-LABEL: name: overlap
+    ; CHECK: L2BMB 1114304, 0, 0
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: L2BM_PT 16, 512, 0
+    L2BMB 1114304, 0, 0
+    L2BM_PT 16, 512, 0
+...
+---
+name:            disjoint
+body:             |
+  bb.0:
+    ; [0,4] then @1 -> disjoint -> no gap.
+    ; CHECK-LABEL: name: disjoint
+    ; CHECK-NOT: NOP
+    ; CHECK: L2BMB 1114304, 0, 0
+    ; CHECK-NEXT: L2BM_PT 17, 512, 0
+    L2BMB 1114304, 0, 0
+    L2BM_PT 17, 512, 0
+...

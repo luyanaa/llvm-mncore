@@ -114,6 +114,15 @@ def MNCoreUnitMATY : FuncUnit;   // $ly referenced this step
 // the ALU reads its inputs at issue.
 def IIC_alu : InstrItinClass;
 
+// Assembly-level ALU expressions whose operands are all packed peoperand
+// immediates (MNCoreInstrALU.td). They reserve the same ALU slot, but they
+// have no register defs or uses, so the itinerary carries no operand
+// cycles: the read-after-write spacing for the memories they touch is
+// handled by the hazard pass, not by the scheduler. Giving them IIC_alu's
+// [4, 0, 0] cycles would stamp a latency onto an input immediate and invent
+// a scheduling edge that blocks legal bundling.
+def IIC_alupe : InstrItinClass;
+
 // Constants written to the register file (zero / imm) follow the same
 // "1 step later" read-after-write rule.
 def IIC_const : InstrItinClass;
@@ -175,6 +184,10 @@ def MNCoreItins : ProcessorItineraries<
     InstrItinData<IIC_alu,
                   [InstrStage<1, [MNCoreUnitALU]>],
                   [4, 0, 0]>,
+    // Packed-immediate ALU: same slot, no register operand cycles.
+    InstrItinData<IIC_alupe,
+                  [InstrStage<1, [MNCoreUnitALU]>],
+                  []>,
     // Constants (zero/imm) are ALU expressions too — same group slot.
     InstrItinData<IIC_const,
                   [InstrStage<1, [MNCoreUnitALU]>],

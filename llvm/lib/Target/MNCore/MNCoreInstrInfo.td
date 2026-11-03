@@ -70,6 +70,7 @@ let PrintMethod = "printTagOperand" in
 let Itinerary = IIC_wait in
 def WAIT : PEExpr<(outs), (ins tagimm:$tag), "wait $tag">;
 
+
 //===----------------------------------------------------------------------===//
 // ALU expressions (scalar core)
 //
@@ -101,6 +102,11 @@ def LXOR : ALU2<"lxor">;
 def LINC : ALU1<"linc">;
 def LDEC : ALU1<"ldec">;
 def LNOT : ALU1<"lnot">;
+// lsl with register operands: the shift amount is the second input
+// (3.6.12.17). Used by the wide-constant materialization in
+// MNCoreDAGToDAGISel::Select; the assembly-level packed form lives in
+// MNCoreInstrALU.td.
+def LSLR : ALU2<"lsl">;
 
 // zero <dst>: write all-zero to the destination PE memory.
 let isReMaterializable = 1, Itinerary = IIC_const in
@@ -114,8 +120,31 @@ def ZERO : PEExpr<(outs GRF:$dst), (ins), "zero $dst">;
 let PrintMethod = "printImmLiteral" in
   def immlit : Operand<i64>;
 
+// Typed immediate literal (section 3.2.2). Packs
+//   [3:0]  type    : 0=i 1=s 2=ui 3=us 4=f 5=h
+//   [35:4] payload : the 32-bit word the Alu places in every word slot.
+//                    For s/us/f/h the word is the 16-bit value replicated
+//                    twice (the half-precision numeric types).
+// The `u` (xoxo) option belongs to the opcode (immu), not the operand.
+let PrintMethod = "printImmTyped" in
+  def immlitx : Operand<i64>;
+
+// `imm` is the isel-facing materialization of a signed 32-bit constant
+// into a GRF register; its literal prints as `i"<s32>"`. TSFlags[16]
+// marks it as an imm command (see MNCoreInstrFormats.td).
 let isReMaterializable = 1, Itinerary = IIC_const in
-def IMM : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "imm $imm, $dst">;
+def IMM : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "imm $imm, $dst"> {
+  let TSFlags{16} = 1;
+}
+
+// immu <payload> <dst>: the `u` (xoxo) option of 3.6.12.3 — the 32-bit
+// word is placed in the odd word slots and the other two are zero, so
+// the high half of the 64-bit result holds the word and the low half is
+// zero. Used to materialize constants with a zero low word.
+let isReMaterializable = 1, Itinerary = IIC_const in
+def IMMU : PEExpr<(outs GRF:$dst), (ins immlit:$imm), "immu $imm, $dst"> {
+  let TSFlags{16} = 1;
+}
 
 //===----------------------------------------------------------------------===//
 // Pseudo instructions

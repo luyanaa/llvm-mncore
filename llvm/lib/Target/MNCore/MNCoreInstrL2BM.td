@@ -74,51 +74,61 @@ def l1badr : Operand<i64>;
 // All occupy the "l2bm" group except l2bmdarw which has its own
 // "l2bmdarw" group. Operand order is the .vsm "source then destination"
 // order; the @<l1bset> qualifier is a leading operand on the opcode.
+//
+// Direction tags (TSFlags [11:10]) drive the §3.6.3 hazard latencies:
+//   1 = L1B->L2B   2 = L2B->L1B   3 = L1B-internal multicast / DAR.
+// They are not a co-issue constraint — l2bm is a single group already —
+// they only tell the dependency builder which write->read distance a
+// following transfer must respect.
 //===----------------------------------------------------------------------===//
+class L2BMExpr<dag outs, dag ins, string asmstr, int dir>
+    : PEExpr<outs, ins, asmstr> {
+  let TSFlags{11-10} = dir;
+}
 
 // Broadcast L2BM -> L1BM: l2bmb[@<l1bset>] $lc<addr> $lb<addr>
 let Itinerary = IIC_l2bm in
-def L2BMB : PEExpr<(outs),
+def L2BMB : L2BMExpr<(outs),
                    (ins l1bsetoperand:$set, lcoperand:$src, lboperand:$dst),
-                   "l2bmb$set $src $dst">;
+                   "l2bmb$set $src $dst", 2>;
 
 // Distribute-broadcast L2BM -> L1BM: l2bmb2[@<l1bset>] $lc $lb
 let Itinerary = IIC_l2bm in
-def L2BMB2 : PEExpr<(outs),
+def L2BMB2 : L2BMExpr<(outs),
                     (ins l1bsetoperand:$set, lcoperand:$src, lboperand:$dst),
-                    "l2bmb2$set $src $dst">;
+                    "l2bmb2$set $src $dst", 2>;
 
 // Distribute L2BM -> L1BM: l2bmd[@<l1bset>] $lc $lb
 // (l2bmd is overloaded — see L2BMD_L1B below for the L1BM->L2BM collect
 // direction; the assembler distinguishes them by operand order.)
 let Itinerary = IIC_l2bm in
-def L2BMD_D : PEExpr<(outs),
+def L2BMD_D : L2BMExpr<(outs),
                      (ins l1bsetoperand:$set, lcoperand:$src, lboperand:$dst),
-                     "l2bmd$set $src $dst">;
+                     "l2bmd$set $src $dst", 2>;
 
 // Point transfer L1BM -> L2BM: l2bm@<l1badr> $lb<addr> $lc<addr>
 let Itinerary = IIC_l2bm in
-def L2BM_PT : PEExpr<(outs),
+def L2BM_PT : L2BMExpr<(outs),
                      (ins l1badr:$l1b, lboperand:$src, lcoperand:$dst),
-                     "l2bm@$l1b $src $dst">;
+                     "l2bm@$l1b $src $dst", 1>;
 
 // Collect L1BM -> L2BM: l2bmd $lb<addr> $lc<addr>
 let Itinerary = IIC_l2bm in
-def L2BMD_C : PEExpr<(outs),
+def L2BMD_C : L2BMExpr<(outs),
                      (ins lboperand:$src, lcoperand:$dst),
-                     "l2bmd $src $dst">;
+                     "l2bmd $src $dst", 1>;
 
 // Internal multicast L1BM -> L1BM: l2bmi@<l1bset> $lb<addr0> $lb<addr1>
 let Itinerary = IIC_l2bm in
-def L2BMI : PEExpr<(outs),
+def L2BMI : L2BMExpr<(outs),
                    (ins l1bsetoperand:$set, lboperand:$src, lboperand:$dst),
-                   "l2bmi$set $src $dst">;
+                   "l2bmi$set $src $dst", 3>;
 
 // DAR stage: l2bmdars $lc<addr>@.<l2b> $dar<addr>
 let Itinerary = IIC_l2bm in
-def L2BMDARS : PEExpr<(outs),
+def L2BMDARS : L2BMExpr<(outs),
                       (ins lcoperand:$src, daroperand:$dst),
-                      "l2bmdars $src $dst">;
+                      "l2bmdars $src $dst", 3>;
 
 // DAR write drain: l2bmdarw — own group, co-issues with any l2bm.
 let Itinerary = IIC_l2bmdarw in
@@ -133,15 +143,15 @@ def L2BMDARW : PEExpr<(outs), (ins), "l2bmdarw">;
 
 let Itinerary = IIC_l2bm in
 class L2BMR<string op>
-    : PEExpr<(outs),
+    : L2BMExpr<(outs),
              (ins l1bsetoperand:$set, lboperand:$src, lcoperand:$dst),
-             !strconcat("l2bmr", op, "$set $src $dst")>;
+             !strconcat("l2bmr", op, "$set $src $dst"), 1>;
 
 let Itinerary = IIC_l2bm in
 class L2BMR2<string op>
-    : PEExpr<(outs),
+    : L2BMExpr<(outs),
              (ins lboperand:$src, lcoperand:$dst),
-             !strconcat("l2bmr2", op, " $src $dst")>;
+             !strconcat("l2bmr2", op, " $src $dst"), 1>;
 
 // rrn opcodes (section 3.5.5), same set as the MV reduce ops.
 foreach p = [["dfadd","L2BMR_DFADD","L2BMR2_DFADD"],

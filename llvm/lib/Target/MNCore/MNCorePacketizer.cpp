@@ -18,7 +18,16 @@
 //   * at most 2 of the 3 MAU groups (mau-calc, mau-mwrite, mau-mread)
 //     per step;
 //   * nop is exclusive with every expression except wait;
-//   * the same matrix-register face ($lx/$ly) appears at most once.
+//   * the same matrix-register face ($lx/$ly) appears at most once;
+//   * two expressions never write the same PE operand, reads of one
+//     addressable space all use the same address, an LM space read and
+//     written in one step covers the same address, and `imm` never
+//     co-issues with an LM0 access;
+//   * a vfma/vmul's second input matches the co-issued mwrite's input in
+//     source operand, sign inversion, extend and reduce;
+//   * a zero-flush mask appears on at most one expression per step, and
+//     every mask specifier in a step shares one mask word length
+//     (the last three groups in MNCoreRegions.h).
 //
 // (The face rule is also partly covered by MATX/MATY functional units;
 // isLegalToPacketizeTogether is the authoritative check and also guards
@@ -27,6 +36,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MNCoreInstrInfo.h"
+#include "MNCoreRegions.h"
 #include "MNCoreSubtarget.h"
 #include "llvm/CodeGen/DFAPacketizer.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -108,6 +118,22 @@ private:
   // the §3.6.4 "same precision" sub-rule applies when two of the three
   // MAU groups co-issue. Read from the opcode text.
   char mauPrecision(const MachineInstr &MI) const;
+
+  // L1BM / L2BM transfer direction (TSFlags [9:8] / [11:10]), used for
+  // the §3.6.4 co-issue rule and the §3.6.3 hazard latencies.
+  //   l1dir: 0=none 1=L1B->PE(read) 2=PE->L1B(write) 3=turnaround
+  //   l2dir: 0=none 1=L1B->L2B 2=L2B->L1B 3=L1B-internal/DAR
+  static unsigned l1Direction(const MachineInstr &MI) {
+    return (unsigned)((MI.getDesc().TSFlags >> 8) & 0x3);
+  }
+  static unsigned l2Direction(const MachineInstr &MI) {
+    return (unsigned)((MI.getDesc().TSFlags >> 10) & 0x3);
+  }
+  static bool isL1BM(const MachineInstr &MI) { return l1Direction(MI) != 0; }
+  // Turnaround ($lbi) form — set on the *_T twin via TSFlags bit 12.
+  static bool l1IsTurn(const MachineInstr &MI) {
+    return (MI.getDesc().TSFlags >> 12) & 1;
+  }
 };
 
 bool MNCorePacketizerList::isPEExpression(const MachineInstr &MI) const {
@@ -194,6 +220,48 @@ bool MNCorePacketizerList::isLegalToPacketizeTogether(SUnit *SUI,
   if (FI != 0 && FI == FJ)
     return false;
 
+  // §3.6.4 L1BM co-issue: at most one l1bm and one l1bm-turnaround slot
+  // per step (the DFA enforces that), and the two may co-issue only when
+  // they move data in *opposite* directions — a PE->L1B write that fills
+  // the turnaround register plus the L1B->PE read that drains it. Two
+  // same-direction L1BM ops always collide on the encoding field
+  // (broadcast+broadcast or collect+collect => "field conflict").
+  if (isL1BM(I) && isL1BM(J)) {
+    unsigned DI = l1Direction(I), DJ = l1Direction(J);
+    if (DI == DJ)
+      return false; // same direction => field conflict
+  }
+
+  // \xC2\xA73.6.4 operand rules the resource DFA cannot see. The packetizer calls
+  // this once per instruction already in the packet, so judging the single
+  // pair (SUI, SUJ) covers the whole step: no two expressions write the
+  // same PE operand, reads of one addressable space share one address, an
+  // LM space read and written in one step covers the same address, and
+  // `imm` forbids any LM0 access.
+  if (mncore::peConflict(I, J))
+    return false;
+
+  // The vfma/vmul + mwrite sub-rule: when those two co-issue, the vector
+  // expression's second input and the mwrite input must read the same PE
+  // operand and agree on sign inversion / extend / reduce.
+  if (mncore::vfmaMwriteShapeConflict(I, J))
+    return false;
+
+  // \xC2\xA73.6.4 step-wide mask rules: a zero-flush mask on at most one expression
+  // per step, and every present mask specifier agreeing on the mask word
+  // length. These are not pairwise, so check the prospective step: the
+  // packet already accumulated plus the instruction being added (SUI). Do
+  // not add SUJ as well — it is already one of CurrentPacketMIs, and
+  // counting a member twice would double-count its masks.
+  {
+    SmallVector<const MachineInstr *, 4> Step;
+    Step.push_back(&I); // SUI — the newcomer
+    for (MachineInstr *MI : CurrentPacketMIs)
+      Step.push_back(MI);
+    if (mncore::maskStepConflict(Step))
+      return false;
+  }
+
   return true;
 }
 
@@ -218,6 +286,16 @@ public:
     assert(Packetizer.getResourceTracker() && "Empty DFA table!");
 
     for (MachineBasicBlock &MBB : MF) {
+      // Per-instruction grammar rules (fixed-value/mreadf placement,
+      // $nowrite exclusivity) are not repairable by reordering, so reject
+      // them outright rather than silently emitting illegal .vsm.
+      for (MachineInstr &MI : MBB)
+        if ((MI.getDesc().TSFlags & 0x1) &&
+            mncore::peInstructionConflict(MI))
+          report_fatal_error(
+              "MN-Core2: illegal PE operand placement (fixed-value/$mreadf "
+              "outside the first ALU input, or $nowrite with another output)",
+              false);
       MachineBasicBlock::iterator Begin = MBB.begin();
       MachineBasicBlock::iterator End = MBB.end();
       if (Begin != End)

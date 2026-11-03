@@ -26,9 +26,11 @@ class PassRegistry;
 FunctionPass *createMNCoreISelDag(MNCoreTargetMachine &TM,
                                   CodeGenOptLevel OptLevel);
 FunctionPass *createMNCorePacketizer();
+FunctionPass *createMNCoreHazard();
 void initializeMNCoreAsmPrinterPass(PassRegistry &);
 void initializeMNCoreDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeMNCorePacketizerPass(PassRegistry &);
+void initializeMNCoreHazardPass(PassRegistry &);
 
 } // end namespace llvm
 

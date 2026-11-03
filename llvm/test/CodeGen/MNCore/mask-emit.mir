@@ -1,0 +1,55 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# Mask application text (sections 3.6.2.1 write mask / 3.6.2.2 zero-flush).
+# The mask operand prints as "/(ll)?(<4-bit pattern>|$imr<adr>)(t|p)":
+#   * zero-flush lands after the mnemonic:  <opc>/(...) ...
+#   * write mask lands after the destination: ... $dst/(...)
+# A clear present bit prints nothing, so the plain spellings are unchanged.
+#
+# Mask packing: [0] present, [1] ll, [2] var, [15:3] value, [18] zero.
+#   fixed pattern 0111 -> value 7; write mask = 1|(7<<3) = 57;
+#   zero-flush = 57 | (1<<18) = 262201.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ALU write mask after the destination
+    ; CHECK: fmin $lr0v $lm0v $ls0v/0111
+    FMIN_M 67108880, 67108882, 67108881, 0, 57
+    ; ALU zero-flush after the mnemonic
+    ; CHECK: fmin/0111 $lr0v $lm0v $ls0v
+    FMIN_M 67108880, 67108882, 67108881, 262201, 0
+    ; MAU (vfma) write mask after the destination
+    ; CHECK: fvfma $lr0v $lm0v $ln0v $ls0v/0111
+    FVFMA_M 67108880, 67108882, 67108883, 67108881, 0, 57
+    ; absent masks -> plain spelling
+    ; CHECK: hvmul $llr0vr $lm0v $llt
+    HVMUL_M 67109152, 67108882, 36, 0, 0
+
+    ; ---- automatic word-length hint (3.6.2.1) ----
+    ; 2-longword mask on a longword destination -> 't'
+    ; CHECK: fmin $lr0v $lm0v $ls0v/ll0111t
+    FMIN_M 67108880, 67108882, 67108881, 0, 59
+    ; longword mask on a 2-longword destination -> 'p'
+    ; CHECK: fmin $lm0v $ls0v $llr0v/0111p
+    FMIN_M 67108882, 67108881, 67108896, 0, 57
+
+    ; masked block-float form keeps its /<n> suffix
+    ; CHECK: hbfn/8 $ls0v $lr8v/0111
+    HBFN_M 8, 67108881, 67117072, 0, 57
+
+    ; ---- masked L1BM->PE broadcast (3.6.2) ----
+    ; CHECK: l1bmp/0111 $lb0 $lr0v
+    L1BMP_M 0, 67108880, 262201, 0
+    ; CHECK: l1bmp $lb0 $lr0v/0111
+    L1BMP_M 0, 67108880, 0, 57
+
+    RET
+...

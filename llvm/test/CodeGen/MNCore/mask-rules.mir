@@ -1,0 +1,112 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-packetizer %s -o - | FileCheck %s
+
+# Section 3.6.4 step-wide mask rules (sections 3.6.2.1 write mask and
+# 3.6.2.2 zero-flush mask):
+#   * a zero-flush mask is applied at most once per step;
+#   * when several mask applications share a step, they all use the same
+#     mask word length (longword vs 2-longword).
+#
+# Masks are tested on ALU expressions (an ALU output is maskable; a masked
+# mwrite is not expressible, since mwrite's only destination is the matrix
+# register, which 3.6.2.1 does not list). The two ALU expressions here are
+# from the same group, so they cannot share a step anyway — the pair is
+# ALU + MAU, which co-issue across groups.
+#
+# Mask operand packing: [0] present, [1] ll, [2] var, [15:3] value,
+# [18] zero. write mask 0111 = 57; zero-flush 0111 = 262201;
+# write mask ll 0111 = 59. (The 't'/'p' word-length hint is [17:16].)
+#
+# Def operand layouts:
+#   FMIN_M  sx, sy, dst, zmask, wmask
+#   FVFMA_M sx, sy, sz, dst, zmask, wmask
+
+--- |
+  target triple = "mncore2"
+  define void @two_zeromask() { ret void }
+  define void @one_zeromask() { ret void }
+  define void @mask_len_mismatch() { ret void }
+  define void @mask_len_match() { ret void }
+  define void @mask_entry_mismatch() { ret void }
+  define void @mask_entry_match() { ret void }
+...
+---
+# Two zero-flush masks in one step -> illegal, split.
+name:            two_zeromask
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: two_zeromask
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FMIN_M
+    ; CHECK: FVFMA_M
+    FMIN_M 67108880, 67108882, 67108881, 262201, 0
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 262201, 0
+    RET
+...
+
+# Only one zero-flush mask -> legal, one step.
+name:            one_zeromask
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: one_zeromask
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: FMIN_M
+    ; CHECK-NEXT: FVFMA_M
+    ; CHECK-NEXT: }
+    FMIN_M 67108880, 67108882, 67108881, 262201, 0
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 0, 0
+    RET
+...
+
+# Two write masks with different word lengths (longword vs 2-longword) ->
+# illegal, split.
+name:            mask_len_mismatch
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: mask_len_mismatch
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FMIN_M
+    ; CHECK: FVFMA_M
+    FMIN_M 67108880, 67108882, 67108881, 0, 57
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 0, 123
+    RET
+...
+
+# Two write masks with the same word length -> legal.
+name:            mask_len_match
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: mask_len_match
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: FMIN_M
+    ; CHECK-NEXT: FVFMA_M
+    ; CHECK-NEXT: }
+    FMIN_M 67108880, 67108882, 67108881, 0, 57
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 0, 0
+    RET
+...
+---
+# Two write masks reading different fixed mask-register entries -> illegal
+# (3.6.2.1: the entry address must be uniform across a step), split.
+name:            mask_entry_mismatch
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: mask_entry_mismatch
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FMIN_M
+    ; CHECK: FVFMA_M
+    FMIN_M 67108880, 67108882, 67108881, 0, 57
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 0, 65
+...
+---
+# Same fixed entry in both masks -> legal.
+name:            mask_entry_match
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: mask_entry_match
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: FMIN_M
+    ; CHECK-NEXT: FVFMA_M
+    ; CHECK-NEXT: }
+    FMIN_M 67108880, 67108882, 67108881, 0, 57
+    FVFMA_M 67108882, 67108883, 67108884, 67108885, 0, 0
+...

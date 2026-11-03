@@ -1,0 +1,19 @@
+# RUN: not llc -mtriple=mncore2 %s -o - 2>&1 | FileCheck %s
+#
+# Section 3.6.1.20: the fixed-value input operands ($l2bid/$l1bid/$mabid/
+# $peid/$subpeid/$msb1) are legal only as the ALU's FIRST input operand.
+# Here $msb1 (kind 15) sits in the second input position, which the
+# backend rejects instead of emitting illegal .vsm.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK: illegal PE operand placement
+    ADD_i 67108881, 15, 67108880
+    RET
+...

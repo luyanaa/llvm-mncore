@@ -40,6 +40,13 @@ body:             |
     ; Result precision-reduce: l1bmrffaddr $llr0v $lb0
     ; CHECK: l1bmrffaddr $llr0v $lb0
     L1BMR_FFADDR 67108896, 0
+    ; Turnaround co-issue (3.6.4/3.6.8.2): a PE->L1B 16x1 individual
+    ; collect fills $lbi while the co-issued 16x1 broadcast drains it.
+    ; The two must share the MAB kind (l1bmm@ + l1bmm) — a reduce op
+    ; cannot pair with a broadcast turnaround.
+    ; CHECK: l1bmm@3 $lr8v $lbi; l1bmm $lbi $lr0v
+    L1BMM_AT 19, 67117072, 1
+    L1BMM_T 1, 67108880
     ; 4x4 broadcast: l1bmm4 $lb0 $lr0v
     ; CHECK: l1bmm4 $lb0 $lr0v
     L1BMM4 0, 67108880

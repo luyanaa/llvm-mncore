@@ -1,0 +1,87 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# ALU opcode catalogue (section 3.6.12, table 3.9). One representative of
+# each opcode family. Every source is $ls0v/$ln0v (never written here) and
+# every destination is a distinct even $lr address, so nothing is read after
+# being written: the hazard pass inserts no nops and emission order matches
+# the MIR order. GRF addresses must be 2-aligned for a `v` access.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ---- untyped (3.6.12.4): msl / msr, PE-to-PE circular shift ----
+    ; CHECK: msl $ls0v $lr0v
+    MSL 67108881, 67108880
+    ; CHECK: msr $ls0v $lr2v
+    MSR 67108881, 67110928
+
+    ; ---- int one-input: bitwise not, logical not (3.6.12.7/.8) ----
+    ; CHECK: inot $ls0v $lr4v
+    INOT 67108881, 67112976
+    ; CHECK: ilnot $ls0v $lr6v
+    ILNOT 67108881, 67115024
+
+    ; ---- inc / dec with the unsigned option (3.6.12.6) ----
+    ; CHECK: ulinc $ls0v $lr8v
+    UINC_l 67108881, 67117072
+    ; CHECK: sdec $ls0v $lr10v
+    DEC_s 67108881, 67119120
+
+    ; ---- float one-input: rsqrt / floor / ftoi (3.6.12.9/.10/.11) ----
+    ; CHECK: drsqrt $ls0v $lr12v
+    RSQRT_d 67108881, 67121168
+    ; CHECK: ffloor $ls0v $lr14v
+    FLOOR_f 67108881, 67123216
+    ; CHECK: ufftoi $ls0v $lr16v
+    UFTOI_f 67108881, 67125264
+
+    ; ---- block float (3.6.12.12) ----
+    ; CHECK: dbfn $ls0v $lr18v
+    BFN_d 67108881, 67127312
+    ; half precision: /<n> mantissa length, 6..9
+    ; CHECK: hbfn/8 $ls0v $lr44v
+    HBFN 8, 67108881, 67153936
+    ; CHECK: hbfe/6 $ls0v $lr46v
+    HBFE 6, 67108881, 67155984
+
+    ; ---- copy (3.6.12.5) ----
+    ; CHECK: lpassa $ls0v $lr22v
+    PASSA_l 67108881, 67131408
+
+    ; ---- both two-input: max / min / packbit (3.6.12.13/.14) ----
+    ; CHECK: ulmax $ls0v $ln0v $lr24v
+    UMAX_l 67108881, 67108883, 67133456
+    ; CHECK: fmin $ls0v $ln0v $lr26v
+    MIN_f 67108881, 67108883, 67135504
+    ; CHECK: hpackbit $ls0v $ln0v $lr28v
+    PACKBIT_h 67108881, 67108883, 67137552
+
+    ; ---- int two-input bitwise / arith (3.6.12.15/.16) ----
+    ; CHECK: iand $ls0v $ln0v $lr30v
+    AND_i 67108881, 67108883, 67139600
+    ; CHECK: uiadd $ls0v $ln0v $lr32v
+    UADD_i 67108881, 67108883, 67141648
+
+    ; ---- shifts (3.6.12.17): lsl, and lsr with the unsigned option ----
+    ; CHECK: slsl $ls0v $ln0v $lr34v
+    LSL_s 67108881, 67108883, 67143696
+    ; CHECK: ullsr $ls0v $ln0v $lr36v
+    ULSR_l 67108881, 67108883, 67145744
+
+    ; ---- ReLU family (3.6.12.18) ----
+    ; CHECK: frelu $ls0v $ln0v $lr38v
+    RELU_f 67108881, 67108883, 67147792
+    ; CHECK: dlrelud $ls0v $ln0v $lr40v
+    LRELUD_d 67108881, 67108883, 67149840
+    ; CHECK: hilrelud $ls0v $ln0v $lr42v
+    ILRELUD_h 67108881, 67108883, 67151888
+
+    RET
+...

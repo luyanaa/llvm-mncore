@@ -1,0 +1,85 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# Typed immediate literals (3.2.2 / 3.6.12.3), the `u` (xoxo) option,
+# fixed-value input operands (3.6.1.20, table 3.5) and multi-destination
+# output operands (<dst_0> [<dst_1>..], 3.6.1).
+#
+# Typed literal packing: [3:0] type (0=i 1=s 2=ui 3=us 4=f 5=h),
+# [35:4] the 32-bit word placed in every word slot. Half-precision numeric
+# types replicate their 16-bit value into both halves of the word.
+#
+# Packed peoperands (autostride, width 1=l / 2=ll):
+#   $lr0v = 16,  $lr2v = 2064,  $ls0v = 17,  $ln0v = 19,
+#   $llm0v = 34, $lls0v = 33,  $lb0 = 0
+# Fixed-value kinds: 10=$l2bid 11=$l1bid 12=$mabid 13=$peid 14=$subpeid
+# 15=$msb1.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ---- typed immediates ----
+    ; CHECK: imm i"42" $lr0v
+    IMM_P 672, 67108880
+    ; CHECK: imm s"32767" $lr2v
+    IMM_P 34359214065, 67110928
+    ; CHECK: imm us"0x8000" $lr4v
+    IMM_P 34360262659, 67112976
+    ; CHECK: imm f"1" $lr6v
+    IMM_P 17045651460, 67115024
+    ; CHECK: imm h"1.5" $lr8v
+    IMM_P 16643252229, 67117072
+    ; ---- u (xoxo): s"1" leaves the odd words zero ----
+    ; CHECK: immu s"1" $lr10v
+    IMMU_P 1048593, 67119120
+
+    ; ---- fixed-value input operand (3.6.1.20) ----
+    ; CHECK: ipassa $msb1 $llm0
+    PASSA_i 15, 34
+
+    ; ---- multi-destination output operands (3.6.1) ----
+    ; CHECK: dvpassa $lm0v $ln0v $lr0v
+    DVPASSA2 67108882, 67108883, 67108880
+    ; CHECK: lpassa $llm0v $ln0v $lls0v
+    LPASSA2 67108898, 67108883, 67108897
+    ; CHECK: l1bmp $lb0 $lr0v $lm0v
+    L1BMP2 0, 67108880, 67108882
+
+    ; ---- T-register spellings (3.6.1.12: the prefix is ignored) ----
+    ; CHECK: ipassa $t $lr0v
+    PASSA_i 4, 67108880
+    ; CHECK: ipassa $lt $lr0v
+    PASSA_i 20, 67108880
+
+    ; ---- multi-line write-mask directive (3.6.2.1) ----
+    ; CHECK: maskrs 5
+    MASK_DIR 646
+    ; CHECK: mask 0
+    MASK_DIR 0
+
+    ; ---- three destinations ----
+    ; CHECK: dvpassa $lm0v $ln0v $lr0v $ls0v
+    DVPASSA3 67108882, 67108883, 67108880, 67108881
+    ; CHECK: lpassa $llm0v $ln0v $lls0v $lr0v
+    LPASSA3 67108898, 67108883, 67108897, 67108880
+    ; CHECK: l1bmp $lb0 $lr0v $lm0v $ln0v
+    L1BMP3 0, 67108880, 67108882, 67108883
+
+    ; ---- mask-register destination (3.6.1.13) ----
+    ; CHECK: lpassa $llm0v $ln0v $omr1
+    LPASSA_O 67108898, 67108883, 4294967297
+    ; CHECK: fvfma $ls0v $lm0v $ln0v $lr0v $omr2
+    FVFMA_O 67108881, 67108882, 67108883, 67108880, 4294967298
+
+    ; ---- matvec two-destination form ----
+    ; CHECK: fmfma $lx $ls0v $ln0v $lr0v $lm0v
+    XMDFMFMA2 0, 67108881, 67108883, 67108880, 67108882
+
+    RET
+...

@@ -1,0 +1,58 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-hazard %s -o - | FileCheck %s
+
+# Section 3.6.3.1: an MV command that reads L2BM must wait one empty step
+# after an L1BM->L2BM transfer (the assembler checker assumes the MV
+# touches its whole region on issue, so overlap is assumed without
+# comparing addresses). Section 3.6.3.2: an L2BM->L1BM transfer after an
+# L1BM->L2BM transfer needs three empty steps (L2BM port collision).
+#
+# MV operand order is (params, src, dst) and mvoperand kind 2 is $lc:
+#   src = 2 -> L2BM address 0 read;  dst = 1 -> DRAM address 0 write.
+# L2BM_PT operands are (@<mabadr>, $lb<addr>, $lc<addr>) = (5, 512, 0);
+# 512 encodes $lb32 (lb2operand [17:2] = address).
+
+--- |
+  target triple = "mncore2"
+  define void @l2b_to_mv() { ret void }
+  define void @l2b_to_l2b() { ret void }
+  define void @no_conflict() { ret void }
+...
+---
+# L1B->L2B write then an MV reading L2BM -> one nop step.
+name:            l2b_to_mv
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: l2b_to_mv
+    ; CHECK: L2BM_PT 5, 512, 0
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: MVP 0, 2, 1
+    L2BM_PT 5, 512, 0
+    MVP 0, 2, 1
+...
+---
+# L1B->L2B write then L2B->L1B read -> three nop steps.
+name:            l2b_to_l2b
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: l2b_to_l2b
+    ; CHECK: L2BM_PT 5, 512, 0
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: L2BMB 0, 0, 0
+    L2BM_PT 5, 512, 0
+    L2BMB 0, 0, 0
+...
+---
+# An MV writing L2BM (dst side) does not trigger 3.6.3.1, and a PE
+# expression that does not touch L2BM needs no gap.
+name:            no_conflict
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: no_conflict
+    ; CHECK-NOT: NOP
+    ; CHECK: L2BM_PT 5, 512, 0
+    ; CHECK-NEXT: MVP 0, 1, 2
+    L2BM_PT 5, 512, 0
+    MVP 0, 1, 2
+...

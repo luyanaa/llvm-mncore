@@ -1,0 +1,110 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-packetizer %s -o - | FileCheck %s
+
+# Section 3.6.4 sub-rule: when a `vfma`/`vmul` and an `mwrite` co-issue, the
+# vector expression's second input and the mwrite input must read the same PE
+# operand and agree on sign inversion (-), precision extend (e) and precision
+# reduce (r). Sign inversion is section 3.6.9.22, extend 3.6.9.23, reduce
+# 3.6.9.24.
+#
+# Packed peoperand immediates:
+#   $lm0v   = 67108882   (LM0@0)
+#   $lm0ve  = 67108946   (+ bit6 e)
+#   -$lm0v  = 67109010   (+ bit7 neg)
+#   $lm0vr  = 67109138   (+ bit8 r)
+#   $lm4v   = 67112978   (LM0@4)
+#
+# FVFMA operands: sx, sy, sz, dst — sy is immediate 1.
+# W_XFMWRITE operands: src, $lx0 — src is immediate 0.
+
+--- |
+  target triple = "mncore2"
+  define void @shape_same() { ret void }
+  define void @shape_diff_addr() { ret void }
+  define void @shape_diff_neg() { ret void }
+  define void @shape_diff_ext() { ret void }
+  define void @shape_diff_red() { ret void }
+  define void @vadd_exempt() { ret void }
+...
+---
+# Same source and same shape -> legal, one step.
+name:            shape_same
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: shape_same
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: FVFMA
+    ; CHECK-NEXT: W_XFMWRITE
+    ; CHECK-NEXT: }
+    FVFMA 67108880, 67108882, 67108883, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...
+
+# Different source address for the second input -> split.
+name:            shape_diff_addr
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: shape_diff_addr
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FVFMA
+    ; CHECK: W_XFMWRITE
+    FVFMA 67108880, 67112978, 67108883, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...
+
+# Same source but sign inversion differs -> split.
+name:            shape_diff_neg
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: shape_diff_neg
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FVFMA
+    ; CHECK: W_XFMWRITE
+    FVFMA 67108880, 67109010, 67108883, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...
+
+# Same source but precision extend differs -> split.
+name:            shape_diff_ext
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: shape_diff_ext
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FVFMA
+    ; CHECK: W_XFMWRITE
+    FVFMA 67108880, 67108946, 67108883, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...
+
+# Same source but precision reduce differs -> split.
+name:            shape_diff_red
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: shape_diff_red
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: FVFMA
+    ; CHECK: W_XFMWRITE
+    FVFMA 67108880, 67109138, 67108883, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...
+
+# vadd is not in the vfma/vmul family, so a mismatched input shape does not
+# trigger the rule. Both read LM0@0 (the read-uniformity rule is satisfied);
+# only the sign-inversion bit differs, which vadd ignores -> legal. (Contrast
+# shape_diff_neg, where the same operands under vfma are split.)
+name:            vadd_exempt
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: vadd_exempt
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: FVADD
+    ; CHECK-NEXT: W_XFMWRITE
+    ; CHECK-NEXT: }
+    FVADD 67108880, 67109010, 67108881
+    W_XFMWRITE 67108882, 0
+    RET
+...

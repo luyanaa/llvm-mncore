@@ -1,0 +1,143 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-packetizer %s -o - | FileCheck %s
+
+# Section 3.6.4 per-step operand rules, enforced by the packetizer on top of
+# the resource DFA (see MNCoreRegions.h). Each function is a candidate pair
+# from two different expression groups, so the DFA would happily bundle them;
+# the operand rule is what splits the illegal ones.
+#
+#   * two expressions must not write the same PE operand;
+#   * reads of one addressable space must all use the same address;
+#   * an LM space read and written in one step must cover the same address;
+#   * `imm` forbids any LM0 access in the same step.
+#
+# Packed peoperand immediates (autostride, width=1, 'v'):
+#   $lr0v=67108880  $ls0v=67108881  $lm0v=67108882  $ln0v=67108883
+#   $lr2v=67110928  $lm4v=67112978  $lr4v=67112976
+
+--- |
+  target triple = "mncore2"
+  define void @same_write() { ret void }
+  define void @distinct_write() { ret void }
+  define void @diff_read() { ret void }
+  define void @same_read() { ret void }
+  define void @lm_rw_diff() { ret void }
+  define void @lm_rw_same() { ret void }
+  define void @imm_lm0() { ret void }
+...
+---
+# Two writes of $lr0v (l1bmp writes the PE dst, fmax writes its dst) -> split.
+name:            same_write
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: same_write
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: L1BMP
+    ; CHECK: MAX_f
+    ; CHECK: RET
+    ; l1bmp $lb0 $lr0v
+    L1BMP 0, 67108880
+    ; fmax $ls0v $ln0v $lr0v
+    MAX_f 67108881, 67108883, 67108880
+    RET
+...
+
+# Writes of different operands ($lr0v and $lr2v) -> one step.
+name:            distinct_write
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: distinct_write
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: L1BMP
+    ; CHECK-NEXT: MAX_f
+    ; CHECK-NEXT: }
+    L1BMP 0, 67108880
+    ; fmax $ls0v $ln0v $lr2v
+    MAX_f 67108881, 67108883, 67110928
+    RET
+...
+
+# Two reads of GRF1 at different addresses ($ls0v vs $lr2v's space is GRF0,
+# so use two GRF1 reads): l1bmp reads nothing in GRF, so read GRF1 twice via
+# fmax ($ls0v, GRF1@0) and a second ALU is the same group. Instead pair an
+# ALU reading GRF1@0 with an mwrite reading GRF1 at a different address.
+# Here: fmax reads $ls0v (GRF1@0); l2bmb touches no PE operand, so it bundles
+# freely. The conflicting GRF1 read comes from a third group below.
+# diff_read: ALU reads $ls0v (GRF1@0), L1B->PE form is a write. Use mwrite,
+# whose PE source is a read: dmwrite $ls2v (GRF1@2) vs fmax reading $ls0v.
+name:            diff_read
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: diff_read
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: MAX_f
+    ; CHECK: W_XDMWRITE
+    ; CHECK: RET
+    ; fmax reads $ls0v (GRF1@0)
+    MAX_f 67108881, 67108883, 67112976
+    ; dmwrite $ls2v $lx0 -- PE source is GRF1@2, a different GRF1 address
+    W_XDMWRITE 67110929, 0
+    RET
+...
+
+# Same GRF1 read address on both ($ls0v) -> legal, one step.
+name:            same_read
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: same_read
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: MAX_f
+    ; CHECK-NEXT: W_XDMWRITE
+    ; CHECK-NEXT: }
+    MAX_f 67108881, 67108883, 67112976
+    ; dmwrite $ls0v $lx0 -- same GRF1 address as fmax's read
+    W_XDMWRITE 67108881, 0
+    RET
+...
+
+# LM0 read and LM0 write at different addresses in one step -> split.
+# fmax reads $lm0v (LM0@0); l1bmp writes $lm4v (LM0@4).
+name:            lm_rw_diff
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: lm_rw_diff
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: MAX_f
+    ; CHECK: L1BMP
+    ; CHECK: RET
+    MAX_f 67108882, 67108883, 67112976
+    ; l1bmp $lb0 $lm4v
+    L1BMP 0, 67112978
+    RET
+...
+
+# LM0 read and write of the SAME address -> explicitly allowed, one step.
+name:            lm_rw_same
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: lm_rw_same
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: MAX_f
+    ; CHECK-NEXT: L1BMP
+    ; CHECK-NEXT: }
+    MAX_f 67108882, 67108883, 67112976
+    ; l1bmp $lb0 $lm0v
+    L1BMP 0, 67108882
+    RET
+...
+
+# `imm` forbids any LM0 access in the same step. l2bmb touches no PE operand,
+# so the conflict is purely the imm<->LM0 rule: imm writes a GRF register
+# while fmax reads $lm0v.
+name:            imm_lm0
+body:             |
+  bb.0:
+    liveins: $grf0_0
+    ; CHECK-LABEL: name: imm_lm0
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: IMM
+    ; CHECK: MAX_f
+    ; CHECK: RET
+    $grf0_0 = IMM 42
+    MAX_f 67108882, 67108883, 67112976
+    RET
+...

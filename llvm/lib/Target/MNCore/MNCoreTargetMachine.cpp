@@ -71,6 +71,11 @@ void MNCorePassConfig::addPreEmitPass() {
   // 4-cycle step so the AsmPrinter can emit them as one ';'-separated
   // .vsm line.
   addPass(createMNCorePacketizer());
+  // Insert the `nop` steps section 3.6.3 requires for data-race / port
+  // -collision spacing. Runs AFTER the packetizer so the step numbering
+  // matches the final bundled layout — bundled expressions count as one
+  // step, and a NOP lands as a whole empty step between them.
+  addPass(createMNCoreHazard());
 }
 
 MachineFunctionInfo *MNCoreTargetMachine::createMachineFunctionInfo(
@@ -86,4 +91,5 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMNCoreTarget() {
   initializeMNCoreAsmPrinterPass(PR);
   initializeMNCoreDAGToDAGISelLegacyPass(PR);
   initializeMNCorePacketizerPass(PR);
+  initializeMNCoreHazardPass(PR);
 }

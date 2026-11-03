@@ -8,14 +8,19 @@
 
 #include "MNCoreInstPrinter.h"
 #include "MNCoreMCTargetDesc.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <cstring>
 
 using namespace llvm;
 
@@ -66,6 +71,51 @@ void MNCoreInstPrinter::printImmLiteral(const MCInst *MI, unsigned OpNum,
   // The selection pattern only matches constants that fit a signed
   // 32-bit word, so a plain signed-decimal rendering is always legal.
   O << "i\"" << (int32_t)Imm << "\"";
+}
+
+// Typed immediate literal (3.2.2). Operand packing:
+//   [3:0]  type    : 0=i 1=s 2=ui 3=us 4=f 5=h
+//   [35:4] payload : the 32-bit word value (half types: the 16-bit value
+//                    replicated twice; float types: the raw bit pattern).
+// `u` (xoxo) is an opcode variant (immu), so it is not encoded here.
+void MNCoreInstPrinter::printImmTyped(const MCInst *MI, unsigned OpNum,
+                                      raw_ostream &O) {
+  uint64_t V = MI->getOperand(OpNum).getImm();
+  unsigned Type = V & 0xf;
+  uint32_t Word = (uint32_t)((V >> 4) & 0xffffffffULL);
+  switch (Type) {
+  case 1: // signed half integer: value replicated into both halves
+    O << "s\"" << (int16_t)(Word & 0xffff) << '"';
+    return;
+  case 2: // unsigned single integer
+    O << "ui\"0x" << format_hex_no_prefix(Word, 8, /*Upper=*/false) << '"';
+    return;
+  case 3: // unsigned half integer
+    O << "us\"0x" << format_hex_no_prefix(Word & 0xffff, 4, false) << '"';
+    return;
+  case 4: { // single-precision float, printed with round-trip precision
+    float F;
+    std::memcpy(&F, &Word, sizeof(F));
+    O << "f\"" << format("%.9g", (double)F) << '"';
+    return;
+  }
+  case 5: { // half-precision float
+    APFloat H(APFloat::IEEEhalf(), APInt(16, Word & 0xffff));
+    bool LosesInfo = false;
+    H.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven, &LosesInfo);
+    O << "h\"" << format("%.9g", H.convertToDouble()) << '"';
+    return;
+  }
+  default: // i
+    O << "i\"" << (int32_t)Word << '"';
+    return;
+  }
+}
+
+void MNCoreInstPrinter::printBFMantOperand(const MCInst *MI, unsigned OpNum,
+                                           raw_ostream &O) {
+  // hbfn/<n>, hbfe/<n>: mantissa length, an integer 6..9 (3.6.12.12).
+  O << '/' << MI->getOperand(OpNum).getImm();
 }
 
 // --- MV instruction operand helpers (section 3.5) ---------------------
@@ -203,7 +253,16 @@ void MNCoreInstPrinter::printPEOperand(const MCInst *MI, unsigned OpNum,
   case 7:  O << "$lbf";     goto done;
   case 8:  O << "$mreadf";  goto done;
   case 9:  O << "$nowrite"; goto done; // dummy output sink
-  case 4:  O << "$llt";     goto done; // T register: always 2-lw
+  case 4: // T register: the (l|ll) prefix is accepted but ignored (3.6.1.12)
+    O << (Width == 2 ? "$llt" : Width == 1 ? "$lt" : "$t");
+    goto done;
+  // Section 3.6.1.20 fixed-value inputs (ALU first operand only).
+  case 10: O << "$l2bid";   goto done;
+  case 11: O << "$l1bid";   goto done;
+  case 12: O << "$mabid";   goto done;
+  case 13: O << "$peid";    goto done;
+  case 14: O << "$subpeid"; goto done;
+  case 15: O << "$msb1";    goto done;
   default: break;
   }
   // Memory names $[(l|ll)](r|s|m|n)... — a pure width prefix:
@@ -274,6 +333,84 @@ void MNCoreInstPrinter::printMATSideOperand(const MCInst *MI,
                                             raw_ostream &O) {
   uint64_t V = MI->getOperand(OpNum).getImm();
   O << "$l" << ((V & 1) ? 'y' : 'x');
+}
+
+// Section 3.6.2 mask application, the shared "/(...)":
+//   "/(ll)?(<4-bit pattern>|$imr<adr>)" followed by an optional 't'/'p'
+// word-length hint. The operand packs:
+//   [0]     present
+//   [1]     ll     : 2-longword mask word length
+//   [2]     var    : variable entry ($imr) instead of a fixed pattern
+//   [15:3]  value  : fixed-entry 4-bit pattern, or variable-entry address
+//   [17:16] tp     : 0 none, 1 't' (truncate), 2 'p' (pad)
+void MNCoreInstPrinter::printMaskOperand(const MCInst *MI, unsigned OpNum,
+                                         raw_ostream &O) {
+  uint64_t V = MI->getOperand(OpNum).getImm();
+  if (!(V & 1))
+    return;
+  bool LL = (V >> 1) & 1;
+  bool Var = (V >> 2) & 1;
+  unsigned Value = (V >> 3) & 0xf;
+  bool Zero = (V >> 18) & 1;
+  O << '/';
+  if (LL)
+    O << "ll";
+  if (Var)
+    O << "$imr" << Value;
+  else
+    for (int I = 3; I >= 0; --I) // 4-bit pattern, MSB = cycle 1
+      O << ((Value >> I) & 1);
+  // Word-length hint (3.6.2.1): 't' when the mask is 2-lw but the masked
+  // PE destination is not, 'p' when the destination is 2-lw but the mask
+  // is not. The suffix changes no behavior, but assemble3 rejects a
+  // missing one and also rejects an unnecessary one, so derive it from
+  // the destination, which sits immediately before the mask operands
+  // (TSFlags 14/15 say how many mask operands this def carries).
+  const MCInstrDesc &D = MII.get(MI->getOpcode());
+  unsigned NMasks = (((D.TSFlags >> 14) & 1) + ((D.TSFlags >> 15) & 1));
+  unsigned DstIdx = MI->getNumOperands() - NMasks - 1;
+  unsigned TP = 0;
+  if (NMasks && DstIdx < MI->getNumOperands()) {
+    const MCOperand &Dst = MI->getOperand(DstIdx);
+    if (Dst.isImm()) {
+      uint64_t P = Dst.getImm();
+      if ((P & 0xf) <= 4) { // a PE-memory operand
+        unsigned DstW = (P >> 4) & 0x3; // 1=l, 2=ll
+        if (LL && DstW != 2)
+          TP = 1;
+        else if (!LL && DstW == 2)
+          TP = 2;
+      }
+    }
+  }
+  (void)Zero;
+  if (TP == 1)
+    O << 't';
+  else if (TP == 2)
+    O << 'p';
+}
+
+// Multi-line write-mask directive (3.6.2.1):
+//   mask[l|ll][r][s][t][m][n][k] <addr>
+// Packed: [0] ll, [6:1] enables in r,s,t,m,n,k order, [13:7] address.
+void MNCoreInstPrinter::printMaskDirective(const MCInst *MI, unsigned OpNum,
+                                           raw_ostream &O) {
+  uint64_t V = MI->getOperand(OpNum).getImm();
+  if (V & 1)
+    O << "ll";
+  static const char L[] = {'r', 's', 't', 'm', 'n', 'k'};
+  for (unsigned I = 0; I < 6; ++I)
+    if ((V >> (1 + I)) & 1)
+      O << L[I];
+  O << ' ' << ((V >> 7) & 0x7f);
+}
+
+// "$omr<addr>" — mask-register write destination (3.6.1.13). Packed as
+// (addr | marker<<32) so the PE-operand decoders can tell it apart from a
+// peoperand immediate.
+void MNCoreInstPrinter::printOMROperand(const MCInst *MI, unsigned OpNum,
+                                        raw_ostream &O) {
+  O << "$omr" << (MI->getOperand(OpNum).getImm() & 0x3f);
 }
 
 // "$(l|ll)b(<addr>|i)" — the L1BM operand of L1BM expressions.

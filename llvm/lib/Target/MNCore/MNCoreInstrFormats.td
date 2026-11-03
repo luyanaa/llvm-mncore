@@ -77,9 +77,51 @@ class MAUExpr<dag outs, dag ins, string asmstr, list<dag> pattern = [],
   let TSFlags{7-5} = pr;
 }
 
+// L1BM / L2BM expressions tag their transfer direction in TSFlags so the
+// packetizer can enforce two families of rules the itinerary cannot see:
+//
+//   * §3.6.4 co-issue — two L1BM expressions may share a step only when
+//     one is the turnaround register's complementary-direction partner
+//     (a PE->L1B write filling $lbi plus an L1B->PE read draining it).
+//     Two same-direction L1BM ops conflict on the same encoding field.
+//   * §3.6.3 hazards — the per-direction write->read latencies
+//     (data-race / port-collision) the dependency builder consults.
+//
+// These bits are set by the L1BMC/L1BMCT and L2BM defs directly; the
+// packetizer reads them via l1Direction/l2Direction.
+//   [9:8]  l1dir : 0=none 1=L1B->PE (read) 2=PE->L1B (write)
+//                  3=turnaround (uses $lbi; dir-of-the-read side)
+//   [11:10] l2dir: 0=none 1=L1B->L2B 2=L2B->L1B 3=L1B-internal/DAR
+//   [13]   vfma  : vfma/vmul — the section 3.6.4 sub-rule that pins the
+//                  second input's source/shape to mwrite's input applies
+//                  only to this group member (vadd/vpassa are excluded).
+//   [14]   zmask : this def carries a zero-flush mask operand (3.6.2.2) as
+//                  its second-to-last `ins` operand. The operand's own
+//                  present bit says whether this particular instance uses it.
+//   [15]   wmask : this def carries a write-mask operand (3.6.2.1) as its
+//                  last `ins` operand.
+// A masked def's operand list therefore ends with [.., $zmask, $wmask]; the
+// PE-access decoder drops those trailing immediates before decoding.
+//   [16]   isImm : this is the `imm` / `immu` command (3.6.12.3). Its first
+//                  `ins` operand is the literal, not a PE operand, so the
+//                  decoder drops it; and the command may not co-issue with
+//                  any LM0 access (the LM0 address shares the immediate
+//                  bit field).
+//   [17]   mdst  : multi-destination form (`<dst_0> [<dst_1>..]`, 3.6.1).
+//                  The PE-access decoder reads the write count from
+//                  TSFlags[20:18] instead of assuming the last operand is
+//                  the only destination.
+//   [20:18] ndst : number of PE destination operands of a multi-dst form
+//                  (only meaningful when [17] is set).
+//   [21]   isMV  : an MV command line (section 3.5), not a PE expression.
+//                  The hazard pass counts MV lines as steps and tracks
+//                  their L2BM operand for the 3.6.3.1/.2 gaps.
+
 // A complete MV instruction line.
 class MVInst<dag outs, dag ins, string asmstr, list<dag> pattern = []>
-    : MNCoreInst<outs, ins, asmstr, pattern>;
+    : MNCoreInst<outs, ins, asmstr, pattern> {
+  let TSFlags{21} = 1;
+}
 
 // Pseudo instructions used only inside the compiler.
 class PseudoMN<dag outs, dag ins, string asmstr, list<dag> pattern = []>
