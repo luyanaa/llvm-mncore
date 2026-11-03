@@ -1,0 +1,71 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# MAU expression emission (sections 3.6.9-3.6.11). All operands are
+# packed immediates — field layouts are documented in
+# MNCoreInstrL1BM.td (peoperand) and MNCoreInstrMAU.td (matoperand,
+# matside). Each expression is a PE expression and may share a step via
+# ';', subject to the section 3.6.4 rules (2-of-3-MAU, same precision,
+# same face at most once).
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ---- matvec: single-precision on $lx ----
+    ; CHECK: fmfma $lx $lr0v $ln0v $ls0v
+    XFMFMA 0, 67108880, 67108883, 67108881
+    ; matvec product on $ly
+    ; CHECK: fmmul $ly $lr0v $ln0v
+    YFMMUL 1, 67108880, 67108883
+    ; double-precision with u half-select on $lx
+    ; CHECK: dmfmau $lx $lr0v $ln0v $nowrite
+    XDMFMAU 0, 67108880, 67108883, 9
+    ; pseudo-single on $lx
+    ; CHECK: gmmul $lx $lr0v $ln0v
+    XGMMUL 0, 67108880, 67108883
+    ; half-precision on $ly
+    ; CHECK: hmmul $ly $llr0v $lln0v
+    YHMMUL 1, 67108896, 67108899
+
+    ; ---- vector ops ----
+    ; CHECK: fvfma $lr0v $lm0v $ln0v $ls0v
+    FVFMA 67108880, 67108882, 67108883, 67108881
+    ; CHECK: hvmul $llr0vr $lm0v $llt
+    HVMUL 67109152, 67108882, 4
+    ; vector add then passa share one step (both mau-calc? no — only
+    ; one mau-calc per step; these two are the same group so they must
+    ; NOT bundle — check they stay on separate lines)
+    ; CHECK: dvadd $lr0v $ln0v $ls0v
+    DVADD 67108880, 67108883, 67108881
+    ; CHECK: fvpassa $mauf $lr0v
+    FVPASSA 5, 67108880
+    ; sign-inverted input
+    ; CHECK: dvadd -$lm0v -$lr0v $ln0v
+    DVADD 67109010, 67109008, 67108883
+
+    ; ---- mwrite / mread ----
+    ; CHECK: dmwrite $lr0v $lx0
+    W_XDMWRITE 67108880, 0
+    ; CHECK: gmwrite $ls0v $ly4
+    W_YGMWRITE 67108881, 9
+    ; CHECK: hmwrite $llr0v $llx0
+    W_XHMWRITE 67108896, 512
+    ; CHECK: dmread $lx0 $lr0v
+    W_XDMREAD 0, 67108880
+    ; CHECK: hmread $llx0 $llr0v
+    W_XHMREAD 512, 67108896
+
+    ; ---- two MAU groups, same precision, different faces: legal ----
+    ; fmfma($lx) + fmwrite($ly): same precision 'f', faces X/Y differ.
+    ; CHECK: fmfma $lx $lr0v $ln0v $ls0v; fmwrite $lr0v $ly0
+    XFMFMA 0, 67108880, 67108883, 67108881
+    W_YFMWRITE 67108880, 1
+    RET
+...

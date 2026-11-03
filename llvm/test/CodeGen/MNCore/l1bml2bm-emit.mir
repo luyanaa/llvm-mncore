@@ -1,0 +1,103 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# L1BM / L2BM expression emission (sections 3.6.7 / 3.6.8). All operands
+# are packed immediates — field layouts are documented in
+# MNCoreInstrL1BM.td / MNCoreInstrL2BM.td. Each expression is a PE
+# expression and may share a step via ';'.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ---- L1BM expressions ----
+    ; CHECK: l1bmp $lb0 $lr0v
+    L1BMP 0, 67108880
+    ; 2-longword broadcast to LM0: l1bmp $llb0 $llm32v
+    ; CHECK: l1bmp $llb0 $llm32v
+    L1BMP 2, 67141666
+    ; word-width LM1 dst in a 1-lw broadcast: l1bmp $lb0 $n8v
+    ; CHECK: l1bmp $lb0 $n8v
+    L1BMP 0, 67117059
+    ; 16x1 MAB broadcast: l1bmm $lb0 $lr0v.
+    ; CHECK: l1bmm $lb0 $lr0v
+    L1BMM 0, 67108880
+    ; 16x1 individual: l1bmm@2 $lr0v $lb16
+    ; CHECK: l1bmm@2 $lr0v $lb16
+    L1BMM_AT 18, 67108880, 64
+    ; 16x1 reduce: l1bmrffadd $llr0v $llb0
+    ; CHECK: l1bmrffadd $llr0v $llb0
+    L1BMR_FFADD 67108896, 2
+    ; 16x1 reduce w/ half->single extend: l1bmrffadd $lr0ve $llb0
+    ; CHECK: l1bmrffadd $lr0ve $llb0
+    L1BMR_FFADD 67108944, 2
+    ; Result precision-reduce: l1bmrffaddr $llr0v $lb0
+    ; CHECK: l1bmrffaddr $llr0v $lb0
+    L1BMR_FFADDR 67108896, 0
+    ; 4x4 broadcast: l1bmm4 $lb0 $lr0v
+    ; CHECK: l1bmm4 $lb0 $lr0v
+    L1BMM4 0, 67108880
+    ; 4x4 individual: l1bmm4@1 $lr0v $lb0
+    ; CHECK: l1bmm4@1 $lr0v $lb0
+    L1BMM4_AT 17, 67108880, 0
+    ; 4x4 reduce: l1bmr4dfadd $lr0v $lb0
+    ; CHECK: l1bmr4dfadd $lr0v $lb0
+    L1BMR4_DFADD 67108880, 0
+    ; Distribute with MAB rotation: l1bmd+1 $lb0 $lr0v
+    ; CHECK: l1bmd+1 $lb0 $lr0v
+    L1BMD 33, 0, 67108880
+    ; Collect with negative rotation: l1bmd-1 $lr0v $lb0
+    ; CHECK: l1bmd-1 $lr0v $lb0
+    L1BMD_C 49, 67108880, 0
+
+    ; ---- L2BM expressions ----
+    ; Broadcast L2BM -> L1BM: l2bmb $lc0 $lb0
+    ; CHECK: l2bmb $lc0 $lb0
+    L2BMB 0, 0, 0
+    ; With an L1B-set mask qualifier: l2bmb@0/3 $lc0 $lb0
+    ; (lc/lb addrs must align to the per-cycle longword read width —
+    ; use 0 here so the emulator's l2bm.ladr alignment check holds).
+    ; CHECK: l2bmb@0/3 $lc0 $lb0
+    L2BMB 896, 0, 0
+    ; List qualifier form: l2bmb@[0,1] $lc0 $lb0
+    ; CHECK: l2bmb@[0,1] $lc0 $lb0
+    L2BMB 196800, 0, 0
+    ; Distribute: l2bmd $lc0 $lb0
+    ; CHECK: l2bmd $lc0 $lb0
+    L2BMD_D 0, 0, 0
+    ; Point L1BM -> L2BM: l2bm@5 $lb32 $lc0
+    ; CHECK: l2bm@5 $lb32 $lc0
+    L2BM_PT 5, 512, 0
+    ; Collect L1BM -> L2BM: l2bmd $lb0 $lc0
+    ; CHECK: l2bmd $lb0 $lc0
+    L2BMD_C 0, 0
+    ; Internal multicast to L1B 5: l2bmi@5 $lb0 $lb64. The L1B-side
+    ; address must be a multiple of 64 longwords (l2bm.ladr alignment).
+    ; CHECK: l2bmi@5 $lb0 $lb64
+    L2BMI 133, 0, 1024
+    ; Reduce into L2BM over L1B set {0}: l2bmrffadd@0 $lb0 $lc0
+    ; CHECK: l2bmrffadd@0 $lb0 $lc0
+    L2BMR_FFADD 128, 0, 0
+    ; Collect-reduce: l2bmr2ffadd $lb0 $lc0
+    ; CHECK: l2bmr2ffadd $lb0 $lc0
+    L2BMR2_FFADD 0, 0
+    ; DAR stage + drain: l2bmdars $lc0@.1 $dar16; l2bmdarw
+    ; CHECK: l2bmdars $lc0@.1 $dar16; l2bmdarw
+    L2BMDARS 3298534883328, 256
+    L2BMDARW
+    ; l2bmdarw co-issues with another l2bm expression.
+    ; CHECK: l2bmd $lc0 $lb0; l2bmdarw
+    L2BMD_D 0, 0, 0
+    L2BMDARW
+    ; Turnaround collect: PE->L1BM write targets $lbi only (3.6.8.2).
+    ; Kept away from other l1bm_collect ops — two collects conflict.
+    ; CHECK: l1bmd $lls8v $lbi
+    L1BMD_C_T 0, 67117089, 1
+    RET
+...

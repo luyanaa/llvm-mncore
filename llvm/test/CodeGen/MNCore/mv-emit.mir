@@ -1,0 +1,41 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# MV instruction emission (section 3.5). The packed operand immediates
+# encode (kind, addr, @group, .l2b); the packed params immediate encodes
+# /n<size>[i<tag>][nd<N>][p<prio>]. Each MV command is a solo statement —
+# never joined to a PE step by ';'.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+    ; A PDM->L2BM point transfer with a wait tag.
+    ; CHECK: mvp/n64i01 $p0@0 $lc0@2.1
+    MVP 72056498821267520, 1099511627776, 58274116272130
+    ; A DRAM-indirect PDM->DRAM transfer with an nd<N> reuse count.
+    ; CHECK: mvp/n256nd4 $p1600@1 $di512@2
+    MVP 71781612324389120, 3298534908928, 5497558147075
+    ; A DRAM->both-L2BMs broadcast.
+    ; CHECK: mvb2/n64 $d0 $lc0
+    MVB2 72057589742960704, 1, 2
+    ; A within-group L2BM->DRAM reduce.
+    ; CHECK: mvr2dfadd/n64 $lc0 $d0
+    MVR2_DFADD 72057589742960704, 2, 1
+    ; A PDM->DRAM distribute.
+    ; CHECK: mvd/n64 $p0@0 $d0
+    MVD 72057589742960704, 1099511627776, 1
+    ; The no-op MV line.
+    ; CHECK: mvnop
+    MVNOP
+    ; The wait tag pairs with the first transfer's i01.
+    ; CHECK: nop; wait i01
+    NOP
+    WAIT 1
+    RET
+...

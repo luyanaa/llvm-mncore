@@ -115,7 +115,8 @@ public:
     renderscript32, // 32-bit RenderScript
     renderscript64, // 64-bit RenderScript
     ve,             // NEC SX-Aurora Vector Engine
-    LastArchType = ve
+    mncore2,        // MN-Core2: Preferred Networks MN-Core2 accelerator
+    LastArchType = mncore2
   };
   enum SubArchType {
     NoSubArch,

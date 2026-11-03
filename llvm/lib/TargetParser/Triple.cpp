@@ -151,6 +151,8 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
     return "thumbeb";
   case ve:
     return "ve";
+  case mncore2:
+    return "mncore2";
   case wasm32:
     return "wasm32";
   case wasm64:
@@ -373,6 +375,9 @@ StringRef Triple::getArchTypePrefix(ArchType Kind) {
 
   case xtensa:
     return "xtensa";
+
+  case mncore2:
+    return "mncore2";
   }
 }
 
@@ -680,6 +685,7 @@ Triple::ArchType Triple::parseArch(StringRef ArchName) {
                   "dxilv1.9"},
                  Triple::dxil)
           .Case("xtensa", Triple::xtensa)
+          .Case("mncore2", Triple::mncore2)
           .Default(Triple::UnknownArch);
 
   // Some architectures require special parsing logic just to compute the
@@ -1008,6 +1014,7 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
   case Triple::tcele64:
   case Triple::thumbeb:
   case Triple::ve:
+  case Triple::mncore2:
   case Triple::xcore:
   case Triple::xtensa:
     return Triple::ELF;
@@ -1801,6 +1808,7 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
   case llvm::Triple::tcele64:
   case llvm::Triple::systemz:
   case llvm::Triple::ve:
+  case llvm::Triple::mncore2:
   case llvm::Triple::wasm64:
   case llvm::Triple::x86_64:
     return 64;
@@ -1996,6 +2004,7 @@ Triple Triple::get64BitArchVariant() const {
   case Triple::systemz:
   case Triple::tcele64:
   case Triple::ve:
+  case Triple::mncore2:
   case Triple::wasm64:
   case Triple::x86_64:
     // Already 64-bit.
@@ -2109,6 +2118,7 @@ Triple Triple::getBigEndianArchVariant() const {
   case Triple::x86_64:
   case Triple::xcore:
   case Triple::ve:
+  case Triple::mncore2:
   case Triple::csky:
   case Triple::xtensa:
 
@@ -2251,6 +2261,7 @@ bool Triple::isLittleEndian() const {
   case Triple::tcele64:
   case Triple::thumb:
   case Triple::ve:
+  case Triple::mncore2:
   case Triple::wasm32:
   case Triple::wasm64:
   case Triple::x86:

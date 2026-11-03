@@ -1,0 +1,79 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-packetizer %s -o - | FileCheck %s
+
+# Section 3.6.4 parallel-execution rules enforced by the packetizer:
+#   * same matrix face ($lx or $ly) at most once per step
+#   * at most 2 of the 3 MAU groups per step
+#   * two co-issued MAU groups must share the precision letter
+#
+# The -run-pass output is MIR, so we check for BUNDLE / opcode names.
+
+--- |
+  target triple = "mncore2"
+  define void @same_face() { ret void }
+  define void @three_mau_groups() { ret void }
+  define void @mixed_precision() { ret void }
+  define void @two_mau_ok() { ret void }
+...
+---
+# Two expressions on the SAME face ($lx): must not bundle.
+name:            same_face
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: same_face
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: XFMFMA
+    ; CHECK: XFMMUL
+    XFMFMA 0, 67108880, 67108883, 67108881
+    XFMMUL 0, 67108880, 67108883
+    RET
+...
+# Three MAU groups (calc+write+read) can never share a step even when
+# each pair would otherwise be legal. The packetizer keeps at most two
+# per step — the third lands on its own line.
+name:            three_mau_groups
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: three_mau_groups
+    ; All 'f' precision, different faces -> pair-legal, but the third
+    ; distinct group cannot join. Expect exactly one BUNDLE of two.
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: XFMFMA
+    ; CHECK-NEXT: W_YFMWRITE
+    ; CHECK-NEXT: }
+    ; CHECK: W_XFMREAD
+    XFMFMA 0, 67108880, 67108883, 67108881
+    W_YFMWRITE 67108880, 1
+    W_XFMREAD 16, 67108881
+    RET
+...
+# Two different MAU groups with DIFFERENT precision letters must not
+# bundle (the §3.6.4 same-precision sub-rule).
+name:            mixed_precision
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: mixed_precision
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: XFMFMA
+    ; CHECK: W_YGMWRITE
+    XFMFMA 0, 67108880, 67108883, 67108881
+    W_YGMWRITE 67108880, 1
+    RET
+...
+# Two different MAU groups with the SAME precision letter and different
+# faces DO bundle.
+name:            two_mau_ok
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: two_mau_ok
+    ; CHECK: BUNDLE {
+    ; CHECK-NEXT: XFMFMA
+    ; CHECK-NEXT: W_YFMWRITE
+    ; CHECK-NEXT: }
+    XFMFMA 0, 67108880, 67108883, 67108881
+    W_YFMWRITE 67108880, 1
+    RET
+...

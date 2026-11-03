@@ -1,0 +1,43 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+
+# PE-operand stream addressing modes (section 1.2 / 3.6.1). Both
+# autostride and flat forms print through the same packed peoperand.
+# Field layout documented in MNCoreInstrL1BM.td.
+
+--- |
+  target triple = "mncore2"
+  define void @f() { ret void }
+...
+---
+name:            f
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: f:
+
+    ; ---- flat mode: explicit per-cycle addresses ----
+    ; lpassa uses ALU group? No — use fvfma (mau) with flat operands.
+    ; fvfma $lm[0,4,10,14] $ln0v $ls0v $lr0v
+    ; CHECK: fvfma $lm[0,4,10,14] $ln0v $ls0v $lr0v
+    FVFMA 985334233956882, 67108883, 67108881, 67108880
+    ; flat with j modifier: fvfma $ln[0,2,4,6]j1 ...
+    ; CHECK: fvfma $ln[0,2,4,6]j1 $ls0v $lr0v $lm0v
+    FVFMA 865113409648067091, 67108881, 67108880, 67108882
+
+    ; ---- autostride modifiers (LM0 only for j<madpe> / t-indirect) ----
+    ; explicit adri + j: fvadd $lm0v2j3 ...
+    ; CHECK: fvadd $lm0v2j3 $ls0v $ln0v
+    FVADD 123146040508434, 67108881, 67108883
+    ; bare v (no adri) + j: fvadd $lm0vj1 $ls0v $ln0v
+    ; CHECK: fvadd $lm0vj1 $ls0v $ln0v
+    FVADD 52776625242130, 67108881, 67108883
+    ; T-register indirect (LM0 only): $lmt8v4
+    ; fvfma $lmt8v4 $ln0v $ls0v $lr0v
+    ; CHECK: fvfma $lmt8v4 $ln0v $ls0v $lr0v
+    FVFMA 281476251787282, 67108883, 67108881, 67108880
+    ; T-indirect with omitted inner addr: $lmt
+    ; CHECK: fvfma $lmt $ln0v $ls0v $lr0v
+    FVFMA 281474976710674, 67108883, 67108881, 67108880
+
+    RET
+...

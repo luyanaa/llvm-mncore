@@ -1,0 +1,85 @@
+# RUN: llc -mtriple=mncore2 -run-pass=mncore-packetizer %s -o - | FileCheck %s
+
+# Section 3.6.4 parallel-execution rules, as enforced by the DFA
+# (one slot per expression group per step) plus the packetizer's
+# structural checks.
+#
+#   * Two expressions from the same group (here two ALU ops) can never
+#     share a step.
+#   * Expressions from different groups may share a step.
+#   * nop is exclusive with everything except wait.
+
+--- |
+  target triple = "mncore2"
+  define void @alu_alu() { ret void }
+  define void @mixed_groups() { ret void }
+  define void @nop_alu() { ret void }
+  define void @nop_wait() { ret void }
+...
+---
+# Two ALU expressions -> two separate steps (the DFA refuses the second
+# MNCoreUnitALU reservation inside one packet, so no BUNDLE forms).
+name:            alu_alu
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $grf0_0, $grf0_1, $grf0_2, $grf0_3
+    ; CHECK-LABEL: name: alu_alu
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: $grf0_2 = LADD
+    ; CHECK: $grf0_0 = LADD
+    ; CHECK: RET
+    $grf0_2 = LADD killed $grf0_2, killed $grf0_3
+    $grf0_0 = LADD killed $grf0_0, killed $grf0_1
+    RET
+...
+
+# A LADD (ALU group) and an L1BMP (l1bm group) use different groups and
+# share one step -> they appear inside a single BUNDLE.
+name:            mixed_groups
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $grf0_0, $grf0_1
+    ; CHECK-LABEL: name: mixed_groups
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: $grf0_0 = LADD
+    ; CHECK-NEXT: L1BMP
+    ; CHECK-NEXT: }
+    $grf0_0 = LADD killed $grf0_0, killed $grf0_1
+    ; l1bmp $lb0 $lr0v: lb operand addr0, pe operand kind=r addr0 w=1 v=1
+    L1BMP 0, 1114129
+    RET
+...
+
+# nop is exclusive: a nop cannot share a step with a real ALU op, so
+# these stay on separate lines (no BUNDLE).
+name:            nop_alu
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $grf0_0, $grf0_1
+    ; CHECK-LABEL: name: nop_alu
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: NOP
+    ; CHECK: $grf0_0 = LADD
+    ; CHECK: RET
+    NOP
+    $grf0_0 = LADD killed $grf0_0, killed $grf0_1
+    RET
+...
+
+# ...but a nop CAN share a step with a wait.
+name:            nop_wait
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: nop_wait
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: NOP
+    ; CHECK-NEXT: WAIT
+    ; CHECK-NEXT: }
+    NOP
+    WAIT 0
+    RET
+...
