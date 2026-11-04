@@ -382,8 +382,10 @@ Finish 之后文件从 root 开始，于是得到 §2 的三段式布局。
 **构造器已验证（2026-11-04）**：`scripts/mnprog_build.py` 按上面这套规则
 从零实现 64 位 FlatBuffers，把 `mnprog.py` 解出的字段重新构造成 Program，
 对**全部 20 个本地样本逐字节相同**（含 0/1/3/6/12 个 fixup、0–7 个实参、
-空镜像 `ke.bin`、以及 49,664 B 的 `gen14.bin`）。这同时是 schema 完整性的
-判据：任何未解释的头部字节都会让某份文件对不上。三个必须踩准的点——
+空镜像 `ke.bin`、以及 49,664 B 的 `gen14.bin`），在 `suzhou` 上对
+`mncl_samples` 的 **105 个合法 Program 也全部 `IDENTICAL`**（见下文"全语料
+广度"）。这同时是 schema 完整性的判据：任何未解释的头部字节都会让某份文件
+对不上。三个必须踩准的点——
 ① 名字串要在 `strings` 向量**之后**、Kernel table 之前创建（否则它落到
 最高地址，整个文件错位）；② 回填 vtable `soffset` 时下标是"自该表起已
 前插的字节数"，不是文件尾部偏移；③ instblock 的 64 B 对齐。三者任一写错
@@ -426,9 +428,10 @@ cd ~/hdrprobe && python3 -I mnprog.py --check *.bin
 "另一种布局"的 `gen16.bin`）。
 
 **全语料广度（2026-11-04，`suzhou`）**：`mncl_samples` 的 106 个 `.bin` 中
-**105 个是合法 Program 且 `--check` 全过**（逐文件加 `timeout` 与内存上限跑的，
-不是一次批量）。第 106 个 `wrapped42.bin`（551 B）**根本不是 Program**：它是
-某次编译失败留下的 ASCII 文本（内容为 `0`/`1` 与换行），不是截断的二进制。
+**105 个是合法 Program**：`--check` 全过，且 `mnprog_build.py` 对这 105 个
+**全部逐字节重建成功**（105/105 `IDENTICAL`）。逐文件加 `timeout` 与内存上限
+跑的，不是一次批量。第 106 个 `wrapped42.bin`（551 B）**根本不是 Program**：
+它是某次编译失败留下的 ASCII 文本（内容为 `0`/`1` 与换行），不是截断的二进制。
 这次运行顺带暴露了解码器的一个真实缺陷——它曾无条件信任向量长度字段，遇到
 该文件时按垃圾长度申请内存、撑到 2 GB 被 OOM kill（整批 `rc=137`）；现在
 `vec_count()` 要求长度字段描述的对象必须落在文件内，同一文件 0.01 s 内返回
@@ -532,7 +535,8 @@ cmp <(tail -c 49408 x.bin) <(tail -c 49408 out.bin) && echo IDENTICAL
    `Kernel` 六个字段、`Argument` 枚举、`Fixup` 三字段、`StorageSpec`
    布局、三段式文件布局、以及逐字节复现所需的创建顺序都已确定，
    `mnprog.py --check` 在 20/20 个样本上通过，且 `mnprog_build.py` 从这些
-   字段把全部 20 个样本**逐字节重建**出来（已进本地回归）。
+   字段把全部 20 个本地样本**逐字节重建**出来（已进本地回归）；在 `suzhou`
+   的 105 个合法 `mncl_samples` 上重建同样 105/105 `IDENTICAL`。
    **仍未定的只有一项**：`Target` 枚举除 `MNCore2`(=0) 以外的取值——
    `mnclc -t MNCore1/3` 崩溃、MNIR 路径硬断言只支持 MNCore2，这套工具链
    产不出样本。下一项工作不再是格式研究，而是把 `block_encoder.py` 的镜像
