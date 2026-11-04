@@ -1,0 +1,270 @@
+# LLVM 产物 → MNIR → `mnrt` 动态 offload：接缝调查 (2026-11-04)
+
+本文回答一个具体问题：**LLVM 后端已经产出 `.vsm` 之后，怎样把这些产物接进
+MNIR / MN-Core 运行时，最终做到动态 offload。** 所有结论都在 `suzhou` 上
+可复现；本文只记录**实测到的**事实与由事实推出的设计，不写"应该大概如此"。
+
+---
+
+## 0. 结论摘要（先看这一段）
+
+1. **MNIR 是编译器 IR，不是运行时格式。** 设备唯一可装载的二进制是
+   `mncore::Program`（FlatBuffers）：**变长头 + N×128 B 指令块**。MNIR
+   （文本或二进制 AST）只是生产 Program 的一种输入。
+2. **供应商的 MNIR 只提供了两个可用接缝**：
+   * `mncl::mnir::Driver::CompileAll()` —— 输入 `.mnir`/`.mnbc`，输出
+     `mncore::Program`；**已验证可用**；
+   * `mncl::mnir::Compile(CompileOptions)` —— **本版本是 2 字节 `ud2` 桩，
+     调用即 SIGILL，禁止使用**。
+3. **`--dump-mnir` 的文本不是可回灌格式。** 它打出来的 `immu 16` 无法被
+   同一个解析器读回（正确拼写是 `imm u 16`），且一旦目标是 `alloc(GRF0,…)`
+   变量会命中一条真实的 `ud2`。⇒ **MNIR 文本不能当交换格式用。**
+4. **`.mnbc`（二进制 MNIR AST）可以当交换格式用**，且已经证明是**逐字节
+   等价**的：`gen14.c` → mnclc 产 `.mnbc` → 外部驱动重新编译 → 产出的
+   **49408 B 指令镜像与 `mnclc -o` 的输出完全一致**（只有头部里的内核名
+   不同）。探针：`~/libmnrt/tools/mnir_probe/check_mnir.sh`。
+5. **对 LLVM 后端而言，MNIR 不是合适的接缝**：LLVM 发的是指令级文本
+   （`.vsm`，每条对应 292-bit PE / 82-bit MV），MNIR 在其**上一层**（有
+   `alloc`/`cast`/切片/循环）。把 LLVM 降到 MNIR 等于重写一遍后端。
+   正确的关系是：**两者都是 Program 的生产者，在 Program 层汇合。**
+6. 因此动态 offload 的落点是 **`mnrt` 的 provider 分层**（§5），不是"让
+   LLVM 说 MNIR"。
+
+---
+
+## 1. 供应商流水线的完整剖面（实测）
+
+```
+k.c ──clang──► LLVM IR ──mncore::translator::Translator──► MNIR AST
+                                                             │
+                          ┌──────────────────────────────────┴───────────────┐
+                          │ mncl::mnir::Driver::CompileAll                   │
+                          │  (.mnir 文本 | .mnbc 二进制 AST)                 │
+                          └──────────────────────────────────┬───────────────┘
+                                                             ▼
+                                              mncore::Program (FlatBuffers)
+                                                             │
+                          ┌──────────────────────────────────┴───────────┐
+                          ▼                                              ▼
+                 cl host API（设备）                          assemble3（仿真器）
+       clCreateProgramWithBinaryPath → clSetKernelArg        .vsm → GPFN3/4 app
+```
+
+证据（均在本机 `suzhou` 实测，2026-11-04）：
+
+| 事实 | 证据 |
+|---|---|
+| `mnclc` 有 `--dump-mnir` / `--dump-mnbc` | `mnclc --help` |
+| 两个 dump 都落盘为 `<entry>-<out>.{mnir,mnbc}` 与 `-opt` 变体 | 实测 gen14 |
+| `Driver::CompileAll` 接受 `.mnir` 与 `.mnbc` | `libmnir.so` 字符串 `fatal: expected .mnir or .mnbc, but got unknown file format` |
+| MNIR 路径只支持 MNCore2 | 目标传 1 时 `Check 'target == mncore::Target::MNCore2' failed! the MNIR path supports MNCore2 only` |
+| host 侧二进制入口是 Program | `mncl/host/cl/cl.h`：`clCreateProgramWithBinaryPath` |
+
+`libmnir.so` 导出的公开头文件（`/opt/pfn/pfcomp/hpc/mncl/include/mncl/mnir/`）
+里有完整的东西：`parse.h` / `print.h` / `driver.h` / `compile.h`，以及
+**ANTLR 语法 `mnir.g4`** 和 **FlatBuffers schema `mnir.fbs`**。也就是说
+MNIR 文本格式本身是公开文档化的——坏的不是语法，是实现。
+
+---
+
+## 2. 三种容器必须分清（这是最容易混的一步）
+
+| 容器 | 生产者 | 消费者 | 特征 |
+|---|---|---|---|
+| **`mncore::Program`** | `mnclc -o`、`Driver::CompileAll` | 设备 runtime（cl API） | 变长 FlatBuffers 头 + N×128 B 块 |
+| **GPFN app** | `assemble3 --binary` / `--app2` | `gpfn3_package_main`（仿真器） | `--binary` 在偏移 **64** 有 magic `"GPFN3"`；`--app2` 是另一版本，无该 magic |
+| **裸 `.vsm` 文本** | `llc`、`mnclc --dump`? | `assemble3` | 每行一条指令 |
+
+**Program 的头部长度不是常量**，它随重定位表增长。用
+`hdr = len(image) − instblock` 实测：
+
+| 样本 | fixup 数 | args | instblock | 文件 | 头长 |
+|---|---|---|---|---|---|
+| gen28 | 1 | 2 | 256 | 512 | **256** |
+| gen6 | 3 | 1 | 2176 | 2496 | **320** |
+| gen26 | 3 | 2 | 768 | 1088 | **320** |
+| gen10 | 4 | 2 | 1024 | 1344 | **320** |
+| gen47 | 12 | 2 | 3072 | 3584 | **512** |
+
+这与 [`mncore_kernel_abi_v1.md`](mncore_kernel_abi_v1.md) §13 里"模板溯源"
+发现的 256/320/512 三态是**同一件事**：头部是 FlatBuffers，头部里带着
+fixup/arg 表，所以早期写死 256 的提取器才会切错。
+
+> **推论**：LLVM 侧要直接产 Program，缺的不是"块编码"（已有
+> `block_encoder.py`），而是**头部 FlatBuffers 的 schema**。schema 可通过
+> 头文件或实测反解，见 §6。
+
+---
+
+## 3. MNIR 文本：为什么不能当交换格式
+
+`--dump-mnir` 的输出看起来像汇编，实际上有三处不可逆：
+
+1. **拼写不对称。** dump 打 `immu 16`，而语法（`mnir.g4`）里是
+   `imm : 'imm' 'u'?;`，解析器只认 `imm u 16`。把一整份 dump 里的
+   `immu` 批量改成 `imm u` 后，`mnclc` 的 MNIR 驱动仍报
+   `line 6:0 no viable alternative at input 'imm'`。
+2. **解析器会段错误级地挂掉。** `immu 16 -> a/1000` 单独可以过；
+   加上 `var a = alloc(GRF0, 1, lw, temp)` 之后，进程在
+   `libmnir.so` 的 `mncl::mnir::Parse()` 里执行到一条 `ud2`
+   （vaddr `0x1e5416`，位于 `std::from_chars<unsigned long>` 的内联实现里，
+   即"空输入被当成 unreachable"）。同样输入给 `zero -> a/1000` 则正常
+   返回诊断。**这是实现缺陷，不是我们用法不对**——同一版本自己的 dump
+   自己也读不回来。
+3. dump 里带 `#MNIRRegionHandle` / `#unknown-loc` 这类只供人看的注解。
+
+结论：**`--dump-mnir` 是调试输出，不是序列化格式。** 任何依赖"dump →
+改 → 回灌"的路线都不成立。
+
+**`.mnbc` 没有这个问题**：它是 schema 化的 FlatBuffers AST，`CompileAll`
+直接吃，且结果可验证（§4）。
+
+---
+
+## 4. 已验证的接缝：`.mnbc` → Program，逐字节等价
+
+复现脚本：`suzhou:~/libmnrt/tools/mnir_probe/check_mnir.sh`（用法
+`check_mnir.sh <kernel.c> [entry]`）。它对同一个 C 源做两条独立路线：
+
+```
+(a) mnclc --allow_pe_args --mnir --dump --dump-mnbc -e k -o ref.bin k.c
+(b) 上面的 <entry>-*-opt.mnbc ──► mnircc ──► out.bin
+```
+
+然后比较两个 Program 的**尾部 `size of instblock` 字节**：
+
+```
+PASS  gen14.c  Program 49664 B / 49664 B, image 49408 B identical
+```
+
+即：**指令镜像逐字节相同**，两个文件只在头部（内核名 `k` vs `entry`）
+有差异。这条链路把"供应商的 MNIR 实现"变成了一个**可脚本化、可回归的
+黑盒**，也是判断"我们的 Program 是否等于供应商的 Program"的现成 oracle。
+
+实现细节（`tools/mnir_probe/`）：
+
+* `mnircc.cpp` —— 只调 `mncl::mnir::Driver::CompileAll`；
+* `shim/` —— 三份最小 ABI 兼容桩头文件。**原因**：`driver.h` 依赖
+  `flatbuffers/*` 与 `mncl/device/translator_generated.h`，而这两个在
+  安装树里**都没有**（`flatbuffer_builder.h` 全机搜不到，`flatc` 也不在）。
+  桩只补 `Driver` 声明所需的最小面；`Result<>` 用的是**真**头文件
+  `diagnostics.h`。因此 `mnircc` 的正确性靠"输出了与 mnclc 相同的镜像"
+  来证明，而不是靠"能编译过"。
+* **不要**用 `mncl::mnir::Compile(CompileOptions)`：`nm -D -S` 显示其
+  符号大小 **2 字节**，调用即 SIGILL（`ud2` 桩）。
+
+---
+
+## 5. 动态 offload 的接入设计（目标形态）
+
+`mnrt` v1 的定位（`libmnrt/README.md`）是 "synchronous enqueue; `.vsm` text
+input; bindings recorded but not relocated"。要支撑动态 offload，按
+**输入层**而不是"语言层"拆 provider：
+
+| provider | 输入 | 后端 | 状态 | 用途 |
+|---|---|---|---|---|
+| `emulator`（现状） | `.vsm` 文本 | `assemble3` → `gpfn3_package_main` | 已实现、已过 E3 | 开发/回归 |
+| **`program`（新增，目标）** | `mncore::Program` | 直接交给设备 runtime（cl host API） | 未实现 | **真实 offload** |
+| **`mnir`（新增，开发期）** | `.mnbc` | `Driver::CompileAll` → `program` provider | 原型已通（本文 §4） | 供应商等价 oracle、调试 |
+
+要点：
+
+1. **Program 是唯一的长期二进制 ABI。** `.vsm` 与 `.mnbc` 都只应是
+   "编译期输入"，运行期只认 Program。这与设备侧 cl API 的实际契约一致。
+2. **relocation 在 Program 的头部（fixup/arg 表）里**，不在指令流里。
+   这解释了 §2 的头部尺寸变化，也解释了为什么 `mnrt_bind_buffer()`
+   现在只能"记录"：v1 没有 Program 层的绑定实现。编译期的 v2 契约
+   （`.vsm` 行尾 `# @mncore.fixup <site>` + sidecar，见
+   [`mncore_kernel_abi_v1.md`](mncore_kernel_abi_v1.md) §13）是它的**输入
+   来源**，不是它的替代品。
+3. **异步**：v1 是同步的（`mnrt_enqueue` 内部 `system()` 两次）。真实
+   offload 需要对映 `clEnqueueNDRangeKernel` + `cl_event` 的语义；
+   provider 能力位（`mnrt_info.feature_bits`）已经预留，现在恒为 0
+   （"no async, no relocation yet"）。
+4. **多 kernel / Program 常驻**：动态 offload 意味着一个 Program 反复
+   入队。v1 每次入队都要重写临时 `.vsm` 并重跑 `assemble3`，这是必须
+   消掉的成本项。
+
+---
+
+## 6. LLVM 后端怎么落到 Program 上
+
+三条路，按推荐顺序：
+
+### A. 直接构造 Program（推荐，长期主线）
+
+```
+llc → .vsm ──► canonical.py ──► block_encoder.py ──► N×128 B 镜像
+                                                          │
+                                          + Program 头（FlatBuffers）
+                                                          ▼
+                                                  mncore::Program
+```
+
+* 块编码已有；**缺口是头部 schema**。
+* 头部内容可从三处交叉确定：`mnclc --dump` 的头部清单（`target` /
+  `# of kernels` / `name` / `# of args` / `# of fixup` /
+  `size of instblock` / `debug info`）、§2 的三种实测头长、以及
+  `_createRelocatedKernelVsm` 的反编译（已确认 offset 0 是头尺寸、
+  后续字段为相对偏移、payload 是长度前缀的 128 B 记录向量）。
+* 验收即本文 §4 的等价判据：**对同一 kernel，头部之外必须与供应商的
+  Program 逐字节一致**。
+
+### B. 复用供应商 MNIR（作为 oracle，不作主路径）
+
+`.mnbc` 路线已可用，但它要求我们先有 MNIR AST，而 LLVM 后端没有、也不
+应该有。定位：**只用来验证 A**（同一 kernel 的两份 Program 互相比对）。
+
+### C. `.vsm` → `assemble3` → GPFN app（只对仿真器）
+
+现状即此。注意 `assemble3 --binary` / `--app2` 产的是 **GPFN app**
+（`--binary` 在偏移 64 有 `"GPFN3"` magic，`--app2` 为另一版本），
+**不是 Program**；且 MNCL loader 拒绝 assemble3 的封装（§13 已记录）。
+所以 C 永远不能升级成真实 offload 路径。
+
+---
+
+## 7. 验收与回归
+
+已加入 `~/libmnrt/tools/mnir_probe/`（独立目标，不并入 `make check`，
+因为它需要 `sde64` 与 mncl 安装）：
+
+```
+tools/mnir_probe/check_mnir.sh <kernel.c> [entry]
+  PASS  镜像逐字节等价
+  FAIL  mnclc 失败 / 无 .mnbc / 镜像不一致（打印首个差异字节）
+```
+
+判据是**字节级**的，不是"能跑通"。任何未来的 Program 生成器（路线 A）
+应当直接复用同一个比较函数。
+
+---
+
+## 8. 复现命令
+
+```bash
+# 供应商流水线剖面
+sde64 -hsw -- mnclc --allow_pe_args --mnir --dump --dump-mnir --dump-mnbc \
+    -e k -o x.bin gen14.c
+# → k-x.mnir / k-x-opt.mnir / k-x.mnbc / k-x-opt.mnbc / x.bin
+
+# MNIR 二进制 AST → Program，并与 x.bin 比对
+sde64 -hsw -- ./mnircc k-x-opt.mnbc out.bin
+cmp <(tail -c 49408 x.bin) <(tail -c 49408 out.bin) && echo IDENTICAL
+
+# 一键回归
+~/libmnrt/tools/mnir_probe/check_mnir.sh ~/libmnrt/mncl_samples/gen14.c
+```
+
+---
+
+## 9. 未解项（不得当成已解决）
+
+1. **Program 头部的完整 FlatBuffers schema 未反解**：字段偏移、fixup/
+   arg 表的表项布局、`byte_site` 的编码。路线 A 的前置条件。
+2. **MNIR 文本解析器的两处 `ud2`**（`immu` + GRF0 目标）是供应商实现
+   缺陷；不要围绕它设计任何流程，也不要假定下一版本已修。
+3. **`mnrt` 的 provider 分层尚未落地**：`program` provider、异步事件、
+   Program 常驻都还是设计，不是代码。
+4. **`--dump-mnir` 的 `immu` 拼写** 是否在更新版本里改正，未知；本文
+   所有结论基于 `mnclc` 2026-10-15 构建。

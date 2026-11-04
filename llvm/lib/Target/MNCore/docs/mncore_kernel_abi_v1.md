@@ -912,3 +912,29 @@ MVInstr     { opcode; params; Operand src, dst; }
 解码 → Canonical IR → 128 B Block Encoder）可行；下一步按同一差分法扩展
 opcode 字段宽度与其余操作数类别（ALU/MAU/MV/L2BM/掩码），并与 E0 的
 mnclc 侧字段图在 Canonical IR 汇合。
+
+
+## 14. MNIR 接缝与 Program 容器（2026-11-04）
+
+§13 记录的"镜像头长 256 / 320 / 512 三态"不是随机噪声，而是
+**FlatBuffers 头部随 fixup/arg 表增长**。用
+`hdr = len(image) − size of instblock` 对同一批样本重算：
+
+| 样本 | fixup | args | instblock | 文件 | 头长 |
+|---|---|---|---|---|---|
+| gen28 | 1 | 2 | 256 | 512 | 256 |
+| gen6 | 3 | 1 | 2176 | 2496 | 320 |
+| gen26 | 3 | 2 | 768 | 1088 | 320 |
+| gen10 | 4 | 2 | 1024 | 1344 | 320 |
+| gen47 | 12 | 2 | 3072 | 3584 | 512 |
+
+因此 `mnclc -o` 的真实产物是 **`mncore::Program` = 变长 FlatBuffers 头 +
+N×128 B 指令块**；`block_encoder.py` 产的是后段，头部（含重定位/参数表）
+仍是缺口。这也说明 **relocation 属于 Program 头，不属于指令流**，
+与 §13.3 的 loader 契约一致。
+
+供应商 MNIR 的两个可用/不可用入口、`.mnbc` 与 `.mnir` 的可回灌性差异、
+以及面向动态 offload 的 `mnrt` provider 分层设计，见
+[`mncore_mnir_offload.md`](mncore_mnir_offload.md)。一句话：
+**MNIR 是 Program 的生产者之一，不是运行时格式；LLVM 与 MNIR 应在
+Program 层汇合。**
