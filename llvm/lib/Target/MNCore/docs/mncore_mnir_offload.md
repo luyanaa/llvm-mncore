@@ -243,9 +243,10 @@ llc → .vsm ──► canonical.py ──► block_encoder.py ──► N×128 
                                                   mncore::Program
 ```
 
-* 块编码已有，头部 schema 已反解（§6 A.1）⇒ **剩下的只是写构造器**：
-  按 §6 A.1 的创建顺序用 64 位 FlatBuffers 语义把六字段 Kernel 填出来，
-  再用 `mnprog.py` 与本文 §4 的字节判据回归。
+* 块编码已有，头部 schema 已反解（§6 A.1），构造器也已写出并**逐字节复现
+  全部 20 个本地样本**（`scripts/mnprog_build.py`）⇒ 剩下的工程问题是把
+  镜像（`block_encoder.py`）与头部（`mnprog_build.py`）接成一条管线，
+  而不是再研究格式。
 * 头部内容有三处独立来源可交叉验证：`mnclc --dump` 的头部清单（`target` /
   `# of kernels` / `name` / `# of args` / `# of fixup` /
   `size of instblock` / `debug info`）、§2 的实测切分、以及供应商
@@ -378,6 +379,16 @@ Finish 之后文件从 root 开始，于是得到 §2 的三段式布局。
 `payload[2]` 复用 `payload[1]` 的 `vtable@2020`（`soffset` = −12）。
 所以"每张表各写一个 vtable"的朴素构造器**不可能**逐字节相同。
 
+**构造器已验证（2026-11-04）**：`scripts/mnprog_build.py` 按上面这套规则
+从零实现 64 位 FlatBuffers，把 `mnprog.py` 解出的字段重新构造成 Program，
+对**全部 20 个本地样本逐字节相同**（含 0/1/3/6/12 个 fixup、0–7 个实参、
+空镜像 `ke.bin`、以及 49,664 B 的 `gen14.bin`）。这同时是 schema 完整性的
+判据：任何未解释的头部字节都会让某份文件对不上。三个必须踩准的点——
+① 名字串要在 `strings` 向量**之后**、Kernel table 之前创建（否则它落到
+最高地址，整个文件错位）；② 回填 vtable `soffset` 时下标是"自该表起已
+前插的字节数"，不是文件尾部偏移；③ instblock 的 64 B 对齐。三者任一写错
+都只表现成"差几十/几百字节"，不会报错。
+
 由此 `L`、`blk`、`tail` 都是可算的，不再需要经验规则。尾部区
 （`[L+blk,EOF)`）就是按上表顺序**最后建**的三样东西：`arguments` union
 向量、`arguments_type` 向量、各实参 payload 表。实测 `tail` 只取
@@ -441,9 +452,18 @@ cd ~/hdrprobe && python3 -I mnprog.py --check *.bin
 llvm/test/CodeGen/MNCore/Inputs/prog/{ke,s28,gen26,gen16}.bin   mnclc 产出的 Program
 llvm/test/CodeGen/MNCore/scripts/mnprog.py                    解码器（parse/show/check）
 llvm/test/CodeGen/MNCore/scripts/check_prog.py                逐字段钉住期望值
+llvm/test/CodeGen/MNCore/scripts/mnprog_build.py              从零 64 位 FlatBuffers
+                                                              构造器（--write / 比对）
 scripts/run_regression.sh 的 "Program container schema" 阶段  4 正 + 1 负（负例断言
                                                               错误期望必须被拒绝）
+scripts/run_regression.sh 的 "Program rebuild" 阶段            4 个 fixture 重建后必须
+                                                              逐字节 IDENTICAL + 1 负
+                                                              （截断 8 B 必须被拒）
 ```
+
+构造器阶段是 schema 完整性的**可执行判据**：它不复用任何解码中间产物，
+只吃 `mnprog.parse()` 的字段字典，按 §6 A.1 的顺序重建。任一字段语义写错、
+对齐漏掉或 vtable 未复用，都会让某个 fixture 变成 `DIFFERS`。
 
 这一阶段是纯 Python 的，`--local` 就会跑，用来保证 §6 A.1 的 schema 结论
 （`L`/`blk`/`tail`、实参 tag、fixup 三元组）在未来改动中不被悄悄改掉。
@@ -465,6 +485,10 @@ tools/mnir_probe/mnprog.py [--check] FILE...         # Program 容器解码/校�
   （与本仓库 scripts/mnprog.py 同一份；打印 target / kernel 名 / n_args /
    n_fixup / L / blk / tail / 实参种类 / payload / fixup 三元组，--check
    额外断言 §6 A.1 的不变量）
+
+tools/mnir_probe/mnprog_build.py [--write OUT] FILE...   # 重建并比对
+  （与本仓库 scripts/mnprog_build.py 同一份；IDENTICAL / DIFFERS + 首个差异
+   字节。远端 106 个 mncl_samples 用它做广度验证，见下）
 ```
 
 判据是**字节级**的，不是"能跑通"。任何未来的 Program 生成器（路线 A）
@@ -496,10 +520,12 @@ cmp <(tail -c 49408 x.bin) <(tail -c 49408 out.bin) && echo IDENTICAL
 1. **Program 头部 schema 已于 2026-11-04 完整反解**（§6 A.1）：`Program` /
    `Kernel` 六个字段、`Argument` 枚举、`Fixup` 三字段、`StorageSpec`
    布局、三段式文件布局、以及逐字节复现所需的创建顺序都已确定，
-   `mnprog.py --check` 在 20/20 个样本上通过。**仍未定的只有一项**：
-   `Target` 枚举除 `MNCore2`(=0) 以外的取值——`mnclc -t MNCore1/3` 崩溃、
-   MNIR 路径硬断言只支持 MNCore2，这套工具链产不出样本。下一项工作是
-   **写构造器**（按 A.1 的顺序生成头部），而不是继续反解。
+   `mnprog.py --check` 在 20/20 个样本上通过，且 `mnprog_build.py` 从这些
+   字段把全部 20 个样本**逐字节重建**出来（已进本地回归）。
+   **仍未定的只有一项**：`Target` 枚举除 `MNCore2`(=0) 以外的取值——
+   `mnclc -t MNCore1/3` 崩溃、MNIR 路径硬断言只支持 MNCore2，这套工具链
+   产不出样本。下一项工作不再是格式研究，而是把 `block_encoder.py` 的镜像
+   与 `mnprog_build.py` 的头部接成一条从 `.vsm` 到 Program 的管线。
 2. **MNIR 文本解析器的两处 `ud2`**（`immu` + GRF0 目标）是供应商实现
    缺陷；不要围绕它设计任何流程，也不要假定下一版本已修。
 3. **`mnrt` 的 provider 分层尚未落地**：`program` provider、异步事件、

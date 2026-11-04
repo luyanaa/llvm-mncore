@@ -110,6 +110,32 @@ else
   echo "PASS prog:negative"
 fi
 
+# Program rebuild: reconstruct each fixture from its decoded fields with a
+# from-scratch 64-bit FlatBuffers writer and require byte identity.  This is
+# the completeness proof for the schema: every header byte -- creation order,
+# the instblock 64-byte alignment, vtable sharing -- has to come out right.
+echo "===== Program rebuild (byte-identical) ====="
+progrebuild() {
+  t=$1
+  if python3 -I $TD/scripts/mnprog_build.py $PR/$t.bin | grep -q '^IDENTICAL'; then
+    echo "PASS rebuild:$t"
+  else
+    echo "FAIL rebuild:$t"; fail=$((fail+1))
+  fi
+}
+for t in ke s28 gen26 gen16; do progrebuild $t; done
+# Negative fixture: truncate the last 8 bytes of s28 (its re-derived tail) and
+# the rebuild must fail -- the rebuilt file is 512 B, the input 504 B.  If this
+# passes, the comparison is not actually comparing.
+tmpp=$(mktemp "${TMPDIR:-/tmp}/progneg.XXXXXX")
+head -c 504 $PR/s28.bin > $tmpp
+if python3 -I $TD/scripts/mnprog_build.py $tmpp >/dev/null 2>&1; then
+  echo "FAIL rebuild:negative (modified file accepted)"; fail=$((fail+1))
+else
+  echo "PASS rebuild:negative"
+fi
+rm -f $tmpp
+
 remfail=0
 if [ $LOCAL_ONLY = 0 ]; then
   echo "===== assemble3 + gpfn3_package_main ====="
