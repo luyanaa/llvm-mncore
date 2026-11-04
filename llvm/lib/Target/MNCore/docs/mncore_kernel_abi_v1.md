@@ -917,7 +917,7 @@ mnclc 侧字段图在 Canonical IR 汇合。
 ## 14. MNIR 接缝与 Program 容器（2026-11-04）
 
 §13 记录的"镜像头长 256 / 320 / 512 三态"不是随机噪声，而是
-**FlatBuffers 头部随 fixup/arg 表增长**。用
+**FlatBuffers 头部随 fixup 表增长**。用
 `hdr = len(image) − size of instblock` 对同一批样本重算：
 
 | 样本 | fixup | args | instblock | 文件 | 头长 |
@@ -932,6 +932,11 @@ mnclc 侧字段图在 Canonical IR 汇合。
 N×128 B 指令块**；`block_encoder.py` 产的是后段，头部（含重定位/参数表）
 仍是缺口。这也说明 **relocation 属于 Program 头，不属于指令流**，
 与 §13.3 的 loader 契约一致。
+
+头长跟着 **fixup 数**走，不跟 arg 数走：同一 kernel 1 arg → 2 args 时
+文件与头长都不变（49664 B / 256 B），只有偏移 112、120 处的两个 8 字节
+字段移动。头部结构本身的初步反解（root table / vtable / 内核名字段）
+见 [`mncore_mnir_offload.md`](mncore_mnir_offload.md) §6 A.1。
 
 供应商 MNIR 的两个可用/不可用入口、`.mnbc` 与 `.mnir` 的可回灌性差异、
 以及面向动态 offload 的 `mnrt` provider 分层设计，见
