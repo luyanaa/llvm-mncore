@@ -75,21 +75,46 @@ MNIR 文本格式本身是公开文档化的——坏的不是语法，是实现
 | **GPFN app** | `assemble3 --binary` / `--app2` | `gpfn3_package_main`（仿真器） | `--binary` 在偏移 **64** 有 magic `"GPFN3"`；`--app2` 是另一版本，无该 magic |
 | **裸 `.vsm` 文本** | `llc`（本后端） | `assemble3` | 每行一条指令 |
 
-**Program 的头部长度不是常量**，它随重定位表增长。用
-`hdr = len(image) − instblock` 实测：
+**Program 是"FlatBuffer 前缀 + 内嵌镜像 + 尾部实参区"的 64 位 FlatBuffers**
+（2026-11-04 完整反解，schema 与证据见 §6 A.1）。文件固定分三段：
 
-| 样本 | fixup 数 | args | instblock | 文件 | 头长 |
-|---|---|---|---|---|---|
-| gen28 | 1 | 2 | 256 | 512 | **256** |
-| gen6 | 3 | 1 | 2176 | 2496 | **320** |
-| gen26 | 3 | 2 | 768 | 1088 | **320** |
-| gen10 | 4 | 2 | 1024 | 1344 | **320** |
-| gen47 | 12 | 2 | 3072 | 3584 | **512** |
+```
+[0,          L)      FlatBuffer 前缀：root table → kernels 向量 → Kernel table
+                     （内核名字符串、fixup 向量、空 strings 向量都在这一段）
+[L,          L+blk)  Kernel::instblock 向量的数据 = 指令镜像（位打包）
+[L+blk,      EOF)    最早构建的对象：arguments_type / arguments 向量与每个
+                     实参的 union payload（FlatBuffers 反向构建，越早建地址越高）
+```
 
-这与 [`mncore_kernel_abi_v1.md`](mncore_kernel_abi_v1.md) §13 里"模板溯源"
-发现的 256/320/512 三态是**同一件事**：头部是 FlatBuffers，头部里带着
-fixup 表，所以早期写死 256 的提取器才会切错。（arg 表**不**改变头长——
-§6 A.1 的 1→2 args 差分里文件大小不变。）
+`blk` 就是 instblock 长度 u64，位于 `L−8`；`L` 恒为 8 的倍数，`blk` 恒为
+128 的倍数。旧口径的"头长" `hdr = len(file) − instblock = L + tail` 因此
+**不是常量**：fixup 越多 `L` 越大，实参越多/越复杂 `tail` 越大。
+
+| 样本 | fixup | args | blk | 文件 | L | tail = hdr − L |
+|---|---|---|---|---|---|---|
+| gen14 | 0 | 1 | 49408 | 49664 | 192 | 64 |
+| gen28 | 1 | 2 | 256 | 512 | 192 | 64 |
+| gen6 | 3 | 1 | 2176 | 2496 | 256 | 64 |
+| gen26 | 3 | 2 | 768 | 1088 | 256 | 64 |
+| gen10 | 4 | 2 | 1024 | 1344 | 256 | 64 |
+| gen47 | 12 | 2 | 3072 | 3584 | 448 | 64 |
+| gen16 | 6 | 7 | 1536 | 2048 | 320 | 192 |
+| Ls1（2 指针 + 1 标量） | 5 | 3 | 1792 | 2304 | 320 | 192 |
+
+`L` 由 FlatBuffer 的构建顺序与对齐决定（fixup 向量每项 24 B，实参越多
+payload 越多），**没有闭式公式**——实测 0–1 fixup 都是 192，3 个 256，
+12 个 448。要用就直接读 `L−8` 处的 u64（或按 §6 A.1 的顺序构建后 `Finish`）。
+
+> **`gen16.bin` 不再是反例。** 旧文档把它记成"另一种布局"：它在偏移 184
+> 有一串 `2,1 / 4,2 / 6,3 / 8,4`，而镜像长度像在 104。真相是它
+> `L=320 / blk=1536 / tail=192`（7 个指针实参），`prog.py` 早先的头长
+> 启发式在这里选错了候选。按 schema 解码 20/20 全通过，见 §6 A.1。
+
+所以旧文档里"头长随 fixup 数走（0/1→256、3/4→320、12→512）"和
+"`u64(hdr−72) == len(file) − hdr`（104/106 命中）"都只是 `tail == 64` 的
+特例：那时 `hdr−72 = L−8` 恰好就是 instblock 的长度字段。实参 ≥ 3 或含标量
+时 `tail` 变为 128/192，这两条经验规则随即失效——**不要**再把它们当契约，
+用 §6 A.1 的 schema 或 `mnprog.py` 直接切分。
 
 > **推论**：LLVM 侧要直接产 Program，缺的不是"块编码"（已有
 > `block_encoder.py`），而是**头部 FlatBuffers 的 schema**。schema 可通过
@@ -217,86 +242,165 @@ llc → .vsm ──► canonical.py ──► block_encoder.py ──► N×128 
                                                   mncore::Program
 ```
 
-* 块编码已有；**缺口是头部 schema**。
-* 头部内容可从三处交叉确定：`mnclc --dump` 的头部清单（`target` /
+* 块编码已有，头部 schema 已反解（§6 A.1）⇒ **剩下的只是写构造器**：
+  按 §6 A.1 的创建顺序用 64 位 FlatBuffers 语义把六字段 Kernel 填出来，
+  再用 `mnprog.py` 与本文 §4 的字节判据回归。
+* 头部内容有三处独立来源可交叉验证：`mnclc --dump` 的头部清单（`target` /
   `# of kernels` / `name` / `# of args` / `# of fixup` /
-  `size of instblock` / `debug info`）、§2 的三种实测头长、以及
-  `_createRelocatedKernelVsm` 的反编译（已确认 offset 0 是头尺寸、
-  后续字段为相对偏移、payload 是长度前缀的 128 B 记录向量）。
+  `size of instblock` / `debug info`）、§2 的实测切分、以及供应商
+  `CreateProgram`/`CreateKernel` 的导出符号（§6 A.1）。
 * 验收即本文 §4 的等价判据：**对同一 kernel，头部之外必须与供应商的
   Program 逐字节一致**。
 
-#### A.1 反解的起点：已确认的结构（2026-11-04 差分实验）
+#### A.1 Program 头部：schema 已完整反解（2026-11-04）
 
-头部**是真正的 FlatBuffers**（自带 vtable），不是手写结构。以 `gen14`
-（1 kernel / 1 arg / 0 fixup / instblock 49408 / 文件 49664）为例：
+**证据来自供应商自己的符号，不是字节猜谜。** `libmncl.so` 保留了 FlatBuffers
+生成代码的符号，`nm -D | c++filt` 直接给出两个构造函数的**完整参数表**：
 
-* 偏移 0 是 root uoffset `48`，root table 在 48；
-* 偏移 40 是它的 vtable：`vtable_size=8`（2 个字段）、`table_size=16`、
-  `f0` 缺省、`f1`(+8) = 8；
-* 偏移 80 是另一个 vtable（`size=16`、`table_size=56`、6 个字段，全为 8
-  字节槽）；`--scan` 会把它算出的候选 table 同时报在偏移 96 和 128。
-  二者跨 56 字节互相重叠，**最多只有一个是真的**——这是"无 schema 扫描"
-  的固有限制，需要靠差分（下一条）定夺。
-* 偏移 104 处的 `+48` 指向内核名：**字符串长度在 152，字符从 160 开始**
-  （8 字节对齐的串布局；`k`→`kk` 差分确认）。
+```
+mncore::CreateProgram(FlatBufferBuilderImpl<false>&, mncore::Target,
+                      Offset<Vector<Offset<mncore::Kernel>>>)
 
-差分实验（同一份源码只改一处，`fbwalk.py` 逐字段对比）：
+mncore::CreateKernel(FlatBufferBuilderImpl<false>&,
+                     Offset<String>,                       // f0 name
+                     Offset<Vector<Argument>>,             // f1 arguments_type
+                     Offset<Vector<Offset<void>>>,         // f2 arguments (union)
+                     Offset<Vector<Fixup const*>>,         // f3 fixups  (struct vector)
+                     Offset<Vector<unsigned char>>,        // f4 instblock
+                     Offset<Vector<Offset<String>>>)       // f5 strings
+```
 
-| 改动 | 文件大小 | 头长 | 变化字节 |
-|---|---|---|---|
-| 内核名 `k` → `kk`（1 arg） | 49664 → 49664 | 256 → 256 | 仅 **152**（串长 1→2）与 **161**（第二个字符） |
-| 1 arg → 2 args | 49664 → 49664 | 256 → 256 | 仅 **112** 与 **120**：`49528/49504` → `49512/49480` |
+同库里还有 `CreateVectorOfStructs<Fixup>`、`CreateVectorOfStructs<Location>`、
+`CreateVector<Argument>`、`data<Argument>`——struct/标量向量与偏移向量分得
+很清楚，字段顺序即参数顺序。据此写出的 schema：
 
-由此可以**修正一个容易搞错的直觉**：头部长度跟着 **fixup 数**走
-（0/1→256、3/4→320、12→512，见 §2），**不跟 arg 数走**——本组实验里
-arg 数 1→2 时文件与头长都没变，只有两个 8 字节字段移动（它们更像
-"数据区地址/长度"，随参数占用的设备空间变化）。
+```fbs
+table Program { target: Target = MNCore2; kernels: [Kernel]; }
 
-复现：
+table Kernel {
+  name:           string;        // f0
+  arguments_type: [Argument];    // f1  每个实参 1 字节
+  arguments:      [void];        // f2  union payload，长度必须等于 f1
+  fixups:         [Fixup];       // f3  24 B struct 向量
+  instblock:      [ubyte];       // f4  指令镜像（位打包）
+  strings:        [string];      // f5  实测恒为空向量
+}
+
+enum  Argument : ubyte { DRAM = 1, Scalar = 2 };   // 目前观测到的取值
+struct Fixup { u64 bin_index; u64 addr_table_index; u64 storage_spec_index; }
+```
+
+**这是 64 位 FlatBuffers**：`uoffset_t`/`soffset_t` = 8 B、`voffset_t` = 2 B、
+向量长度是 u64、struct 步长 8 对齐。判据不是"看起来像"：六字段 Kernel
+table 的槽位偏移是 8/16/24/32/40/48、`table_size = 56`（32 位下这些会是
+4/8/12/…、28），名字串的长度 u64 在字符前 8 字节。`Vector<Argument,
+unsigned long>` 的 `size_type = unsigned long` 也印证了这一点。
+
+**字段逐条证据**（全部可复现，脚本见 §7）：
+
+| 字段 | 语义 | 证据 |
+|---|---|---|
+| Program.target | 目标机枚举，缺省 0 = MN-Core 2 | `--dump` 打 `target: MN-Core 2`；root vtable 的 f0 在所有样本里都**缺省**（即取默认值 0） |
+| Kernel.name | 内核名 | `k`→`kk` 差分只改长度字节与第二个字符 |
+| f1 arguments_type | 每实参 1 字节 | `DRAM i32*` → `01`；`i32/i16/i64/f32/f64` 标量 → `02`（见下） |
+| f2 arguments | 每实参一个 union payload 表 | 见"payload 规则" |
+| f3 fixups | 24 B struct 向量 | 4 个 fixup ⇒ 向量占 `8+96`，镜像长度字段正好后移 96 B；12 个 ⇒ 288 B |
+| f4 instblock | 镜像本体 | 长度字段的值 = `--dump` 的 `size of instblock`，数据段逐字节 = 镜像 |
+| f5 strings | 未用 | 116 个 `mncl_samples` + 全部实验核里长度恒为 0，且位置固定在 kernel table 之后 |
+
+`Argument` 只有 1/2 两个值：把标量写成 `u8` 会被编译器挡下
+（`mnir_backend.cc`：`Check failed: size == 2 || size == 4 || size == 8`），
+说明该枚举描述的是"实参种类"而不是宽度——宽度在 payload 里。
+
+**Fixup 的三个 u64**（24 B，无填充）。字段名直接取自 `libmncl.so` 里驱动器
+自检字符串，语义由受控实验确定：
+
+| 槽 | 名字（驱动器自检原文） | 实测语义 |
+|---|---|---|
+| 0 | `fixup.bin_index < inst_slots.size()` | 该重定位点所在指令在 **M 流水指令序列**里的序号（`nop` 填充与 `l2bmd`/`l1bmp` 等 L 流水指令不计入；`mvp`/`mvb`/`mvnop` 计入） |
+| 1 | `fixup.addr_table_index < n_inout` | 实参下标（与 `mncore_write_pio32(…, 1u << mnaddr_table_index)` 的位号一致） |
+| 2 | `fixup.storage_spec_index < storage_states_.size()` | 该 DRAM 实参内部的 **128 B 存储片下标** = 字节偏移 / 128 |
+
+判定实验（每条只改一个变量）：
+
+* 槽 1：`w1.c` 交换两个实参的使用顺序后，两个 fixup 的该槽从 `(0,0)` 变成
+  `(1,0)`；`v2.c` 的 4 条 punicast 落在 `a,a+64,c,c+64` 上 → `(0,0,1,1)`。
+* 槽 2：`v1.c` 的 `a+0/32/64/96`（i32，即 0/128/256/384 B）→ `0,1,2,3`；
+  `v2.c` 的 `a+64`、`c+64`（256 B）→ `2`。**单位是 128 B，不是元素数。**
+* 槽 0：`Ls1.c` 比 `v1.c` 多一段标量加载序言（`mvb` + `l2bmd` + `l1bmp`），
+  第一条 punicast 的槽值从 `0` 变成 `6`，而 `l2bmd`/`l1bmp` 不计数时恰好
+  是 6；`Ls3.c` 有两段标量序言，第一条 punicast 变成 `12`。同一文件里每条
+  punicast 组（`mvp`+`mvnop`）固定 +2。
+
+> 注意槽 0 **不是**镜像里的字节偏移，也不是 dump 的行号：`w1.c` 的两条
+> `mvp` 在 dump 里是第 3/9 行、镜像里跨 256 B，而槽值是 `0,2`。
+
+**payload 规则**（f2 的第 i 个元素）：
+
+* `Argument::DRAM`（1）：**空 table**，`vtable {size=4, table_size=8}`，零字段。
+  DRAM 地址由运行期 addr_table 给出，Program 里只声明"这个实参是 DRAM 指针"。
+* `Argument::Scalar`（2）：`vtable {size=6, table_size=16}`，一个字段
+  `f0 = Vector<StorageSpec>`，长度 1，struct 为
+  `{kind=9, offset=0, size}`，`size ∈ {2,4,8}` 由实参宽度决定
+  （`i16`→2、`i32/f32`→4、`i64/f64`→8；`u8` 被编译器拒绝）。
+
+> **读表陷阱**：flatbuffers 的 `table_size` 把 **table 前的对齐填充**算进去，
+> 所以同为"零字段空表"会看到 `{4,8}` 与 `{4,12}` 两种 vtable（差 4 B 填充）。
+> 这不是两种类型。同理标量 payload 的 `{6,16}` 只是"8 B soffset + 8 B 字段"。
+
+**布局与构建顺序**（要逐字节复现就必须照这个顺序）：
+
+```
+创建顺序（FlatBuffers 反向构建 ⇒ 早建的对象落在高地址，即文件尾部）：
+  1. 每个实参的 payload table（按实参 0..n-1）
+  2. arguments_type 向量（1 B/元素）
+  3. arguments union 向量（8 B/元素）
+  4. instblock 向量            ← 镜像，长度字段在 L−8
+  5. fixups 向量（24 B/元素）
+  6. 空 strings 向量
+  7. Kernel table → kernels 向量 → root table
+Finish 之后文件从 root 开始，于是得到 §2 的三段式布局。
+```
+
+由此 `L`、`blk`、`tail` 都是可算的，不再需要经验规则。尾部区
+（`[L+blk,EOF)`）就是按上表顺序**最后建**的三样东西：`arguments` union
+向量、`arguments_type` 向量、各实参 payload 表。实测 `tail` 只取
+64 / 128 / 192 三种值：指针实参 0–2 个 → 64 B，3–5 个 → 128 B，6–8 个 →
+192 B（gen16 的 7 个实参正好 192）；每含一个**标量**实参再加 64 B
+（2 实参含 1 个 `f64` 标量 → 128 B；上表 Ls1 的 3 实参含 1 标量 → 192 B）。
+它们是"对象大小向上取整到 8 字节"的自然结果，解码时直接算，不要当公式用。
+
+**复现**（`tools/mnir_probe/mnprog.py`，见 §7）：
+
 ```bash
-sde64 -hsw -- mnclc --allow_pe_args --mnir --dump -e k O -o a.bin a.c
-python3 -I fbwalk.py a.bin        # 打印 root table / vtable / 字段候选
+cd ~/hdrprobe && python3 -I mnprog.py --check *.bin
+=== gen16.bin  size 2048
+  Program  target=0 (field absent = default)  kernels=1
+  Kernel   name='k'  n_args=7  n_fixup=6  n_strings=0
+  image    L=320  blk=1536  tail=192  (file = L+blk+tail)
+  args     [0]DRAM, [1]DRAM, [2]DRAM, [3]DRAM, [4]DRAM, [5]DRAM, [6]DRAM
+  payload[0] empty vt{4,8} no fields (pointer arg)
+  payload[1] empty vt{4,12} no fields (pointer arg)
+  ...
+  fixup[0] bin_index=0 addr_table_index=0 storage_spec_index=0
+  fixup[1] bin_index=2 addr_table_index=1 storage_spec_index=0
+  ...
+  CHECK    OK
+...
+20/20 checked OK
 ```
 
-**头尾固定 72 字节区（已批量验证）**：对 `mncl_samples/*.bin` 的 106 个
-Program 做统一检验——假设"头长 `hdr ∈ {256,320,512}`，且
-`u64(hdr − 72) == len(file) − hdr`"（即头部最后 72 字节的首字段就是
-instblock 字节数）：
+`--check` 断言的是：`L+blk+tail == size`、`blk % 128 == 0`、`L`/`tail`
+为 8 的倍数、`n_args == len(arguments)`、每个 tag ∈ {1,2}、标量 payload
+必带 `StorageSpec` 而指针 payload 必须为空、每个 `addr_table_index < n_args`、
+`storage_spec_index` 落在镜像范围内、`bin_index` 严格递增。**20/20 全过**
+（覆盖 0/1/3/6/12 个 fixup、0–7 个实参、空镜像 `ke.bin`、以及此前被当成
+"另一种布局"的 `gen16.bin`）。
 
-```
-HIT=104 MISS=2       (python3 -I hdr_probe.py mncl_samples/*.bin)
-```
-
-104 个命中里既有 256 头的 gen14/gen28，也有 320 头的 gen26；另外 4 个
-256 B 的**纯头文件**（空镜像）按 `size == 0` 单独判定为命中。2 个未命中
-都可解释，**没有一个是"规则被推翻"**：
-
-* `wrapped42.bin` 551 B：`551 − 256 = 295` 不是 128 的倍数，
-  **它根本不是 Program**（不是合法容器）；
-* `gen16.bin` 2048 B：其 184..255 区被一串小整数
-  （`2,1 / 4,2 / 6,3 / 8,4`）填满，instblock 大小（1792）改出现在偏移
-  104。它的源文件现已无法编译（`__0 is an immediate destination but is
-  fixed on LM0…`），**来源不可复现**，因此只记为"另一种布局"，不作为
-  规则的反例使用。
-
-这条规则的意义：即使 schema 未知，**块大小在头里的位置已经确定**，
-程序可以先用它切分头/镜像（比按文件长度猜头长更可靠）。它独立复现了
-§2 那张表的每一行——gen6 `320/2176`、gen26 `320/768`、gen47 `512/3072`、
-gen28 `256/256`，**完全不依赖 `--dump`**。
-
-**内核名字段的位置关系（3 个样本上一致，未推广）**：三个头部布局不同的
-样本里，指向内核名的那个字段总在"名字前面 48 字节"，而 kernel table
-的起点总在"名字前面 56 字节"：
-
-| 样本 | root uoffset | kernel table | 指向名字的字段 | 名字长度/字符 |
-|---|---|---|---|---|
-| gen14（1 arg/0 fixup） | 48 | @96 | @104 (`+48`) | 152 / 160 |
-| gen28（2 args/1 fixup） | 24 | @72 | @80 (`+48`) | 128 / 136 |
-| gen16（另类布局） | 32 | @80 | @88 (`+48`) | 136 / 144 |
-
-这足以说明 kernel table 的形状是**固定的**（6 个 8 字节槽），只是整体
-在头里浮动；但**其余 5 个槽的语义仍未确定**，不能据此写构造器。
+**仍未定死的只有一处：`Target` 的非 0 取值。** `mnclc -t MNCore1/3` 直接崩溃
+（栈回溯在编译器里），MNIR 路径还硬断言 `target == Target::MNCore2`，所以
+除 0 以外的枚举值**没有任何可产出的样本**。这不是没查到，是这套工具链
+产不出来——记在 §9，不要臆造。
 
 ### B. 复用供应商 MNIR（作为 oracle，不作主路径）
 
@@ -314,8 +418,21 @@ gen28 `256/256`，**完全不依赖 `--dump`**。
 
 ## 7. 验收与回归
 
-已加入 `~/libmnrt/tools/mnir_probe/`（独立目标，不并入 `make check`，
-因为它需要 `sde64` 与 mncl 安装）：
+**已进本仓库回归（本地，无需 mncl/sde64）**：
+
+```
+llvm/test/CodeGen/MNCore/Inputs/prog/{ke,s28,gen26,gen16}.bin   mnclc 产出的 Program
+llvm/test/CodeGen/MNCore/scripts/mnprog.py                    解码器（parse/show/check）
+llvm/test/CodeGen/MNCore/scripts/check_prog.py                逐字段钉住期望值
+scripts/run_regression.sh 的 "Program container schema" 阶段  4 正 + 1 负（负例断言
+                                                              错误期望必须被拒绝）
+```
+
+这一阶段是纯 Python 的，`--local` 就会跑，用来保证 §6 A.1 的 schema 结论
+（`L`/`blk`/`tail`、实参 tag、fixup 三元组）在未来改动中不被悄悄改掉。
+样本**不要就地重生成**：钉住的数字就是证据。
+
+**需要 mncl 与 sde64 的样本级回归**（独立目标，不并入 `make check`）：
 
 ```
 tools/mnir_probe/check_mnir.sh <kernel.c> [entry]   # 单样本
@@ -326,10 +443,16 @@ tools/mnir_probe/sweep_mnir.sh [样本目录]            # 全样本，xargs -P 
   结果写到 $MNIR_SWEEP_LOG（默认 ~/mnir_sweep_last.txt），末尾 PASS/FAIL/TOTAL
   注意：sweep 固定用 entry `k`，非 `k` 的核会显示为 FAIL（用 check_mnir.sh
   指定 entry 重跑即可，如 ka4.c→kname、ka5b.c→k2）
+
+tools/mnir_probe/mnprog.py [--check] FILE...         # Program 容器解码/校验
+  （与本仓库 scripts/mnprog.py 同一份；打印 target / kernel 名 / n_args /
+   n_fixup / L / blk / tail / 实参种类 / payload / fixup 三元组，--check
+   额外断言 §6 A.1 的不变量）
 ```
 
 判据是**字节级**的，不是"能跑通"。任何未来的 Program 生成器（路线 A）
-应当直接复用同一个比较函数。
+应当直接复用同一个比较函数；但它**先要过上面那条本地阶段**——
+头部数字对不上时，逐字节比较是没有意义的。
 
 ---
 
@@ -353,14 +476,13 @@ cmp <(tail -c 49408 x.bin) <(tail -c 49408 out.bin) && echo IDENTICAL
 
 ## 9. 未解项（不得当成已解决）
 
-1. **Program 头部的完整 FlatBuffers schema 未反解**：字段偏移、fixup/
-   arg 表的表项布局、`byte_site` 的编码。路线 A 的前置条件。安装树里
-   只有 `mncl/mnir/mnir.fbs`（`namespace mncl.mnir.ast;`，`root_type MNIR;`，
-   纯 AST），**没有** Program 的 schema（`translator_generated.h` /
-   `flatbuffers/*` 也都不在）。已在 §6 A.1 拿到起点（root table / vtable
-   位置、内核名字段、arg 数触发的两个字段），但**离"能自己写出逐字节
-   相同的头"还差得远**：56 字节的六字段 table 各字段语义未定，fixup 表
-   尚未定位。
+1. **Program 头部 schema 已于 2026-11-04 完整反解**（§6 A.1）：`Program` /
+   `Kernel` 六个字段、`Argument` 枚举、`Fixup` 三字段、`StorageSpec`
+   布局、三段式文件布局、以及逐字节复现所需的创建顺序都已确定，
+   `mnprog.py --check` 在 20/20 个样本上通过。**仍未定的只有一项**：
+   `Target` 枚举除 `MNCore2`(=0) 以外的取值——`mnclc -t MNCore1/3` 崩溃、
+   MNIR 路径硬断言只支持 MNCore2，这套工具链产不出样本。下一项工作是
+   **写构造器**（按 A.1 的顺序生成头部），而不是继续反解。
 2. **MNIR 文本解析器的两处 `ud2`**（`immu` + GRF0 目标）是供应商实现
    缺陷；不要围绕它设计任何流程，也不要假定下一版本已修。
 3. **`mnrt` 的 provider 分层尚未落地**：`program` provider、异步事件、

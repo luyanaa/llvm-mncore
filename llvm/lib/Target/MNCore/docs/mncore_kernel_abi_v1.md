@@ -917,26 +917,38 @@ mnclc 侧字段图在 Canonical IR 汇合。
 ## 14. MNIR 接缝与 Program 容器（2026-11-04）
 
 §13 记录的"镜像头长 256 / 320 / 512 三态"不是随机噪声，而是
-**FlatBuffers 头部随 fixup 表增长**。用
-`hdr = len(image) − size of instblock` 对同一批样本重算：
+**64 位 FlatBuffers 头部 + 内嵌镜像 + 尾部实参区**。`hdr = len(image) −
+size of instblock` 其实是 `L + tail`，其中 `L` 是镜像在文件里的起点：
 
-| 样本 | fixup | args | instblock | 文件 | 头长 |
-|---|---|---|---|---|---|
-| gen28 | 1 | 2 | 256 | 512 | 256 |
-| gen6 | 3 | 1 | 2176 | 2496 | 320 |
-| gen26 | 3 | 2 | 768 | 1088 | 320 |
-| gen10 | 4 | 2 | 1024 | 1344 | 320 |
-| gen47 | 12 | 2 | 3072 | 3584 | 512 |
+| 样本 | fixup | args | instblock | 文件 | L | tail |
+|---|---|---|---|---|---|---|
+| gen14 | 0 | 1 | 49408 | 49664 | 192 | 64 |
+| gen28 | 1 | 2 | 256 | 512 | 192 | 64 |
+| gen6 | 3 | 1 | 2176 | 2496 | 256 | 64 |
+| gen26 | 3 | 2 | 768 | 1088 | 256 | 64 |
+| gen10 | 4 | 2 | 1024 | 1344 | 256 | 64 |
+| gen47 | 12 | 2 | 3072 | 3584 | 448 | 64 |
+| gen16 | 6 | 7 | 1536 | 2048 | 320 | 192 |
+| Ls1 | 5 | 3（含 1 标量） | 1792 | 2304 | 320 | 192 |
 
-因此 `mnclc -o` 的真实产物是 **`mncore::Program` = 变长 FlatBuffers 头 +
-N×128 B 指令块**；`block_encoder.py` 产的是后段，头部（含重定位/参数表）
-仍是缺口。这也说明 **relocation 属于 Program 头，不属于指令流**，
-与 §13.3 的 loader 契约一致。
+因此 `mnclc -o` 的真实产物是 **`mncore::Program`**：`[0,L)` 是
+FlatBuffers 前缀（root → kernels → `Kernel` 表，含 fixup 向量），
+`[L, L+blk)` 是**内嵌在 FlatBuffers 里**的 `instblock` 向量（`blk`
+就是 `L−8` 处的 u64，恒为 128 的倍数），`[L+blk, EOF)` 是按构建顺序
+最早生成的 `arguments_type`/`arguments` 向量与各实参 payload。
+`block_encoder.py` 产的是中段。
 
-头长跟着 **fixup 数**走，不跟 arg 数走：同一 kernel 1 arg → 2 args 时
-文件与头长都不变（49664 B / 256 B），只有偏移 112、120 处的两个 8 字节
-字段移动。头部结构本身的初步反解（root table / vtable / 内核名字段）
-见 [`mncore_mnir_offload.md`](mncore_mnir_offload.md) §6 A.1。
+**旧说法"头长跟着 fixup 数走、不跟 arg 数走"需要修正**：`tail` 恰恰跟着
+**实参**走（0–2 个指针实参 64 B，3–5 个 128 B，6–8 个 192 B，每含一个
+标量实参再加 64 B）。`k`→`kk` 与 1→2 args 那两组差分的文件/头长都不变，
+是因为 `tail` 在这两组里恰好都还在 64 B 这一档（实测只出现 64/128/192
+三个值，每档 64 B），而不是它不随实参变化。
+
+**schema 已完整反解**（六个字段、`Argument` 枚举、`Fixup` 三字段的语义
+与创建顺序），见 [`mncore_mnir_offload.md`](mncore_mnir_offload.md) §6 A.1；
+解码器 `tools/mnir_probe/mnprog.py --check` 在 20/20 个样本上通过。
+这也确认 **relocation 属于 Program 头，不属于指令流**，与 §13.3 的
+loader 契约一致。
 
 供应商 MNIR 的两个可用/不可用入口、`.mnbc` 与 `.mnir` 的可回灌性差异、
 以及面向动态 offload 的 `mnrt` provider 分层设计，见

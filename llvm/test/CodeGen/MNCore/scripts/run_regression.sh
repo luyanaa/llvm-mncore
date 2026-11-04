@@ -7,6 +7,9 @@
 #   run_regression.sh --allow-offline # FileCheck + remote if reachable;
 #                                      # an unreachable ssh is not a failure
 #   run_regression.sh --strict        # add assemble3 --hazard on remote runs
+#
+# The "Program container schema" stage is pure Python over committed mnclc
+# fixtures, so it runs in every mode including --local.
 set -u
 TD=/Users/yanlu/Documents/llvm-mncore/llvm/test/CodeGen/MNCore
 BD=/Users/yanlu/Documents/llvm-mncore/build-mncore
@@ -78,6 +81,34 @@ while IFS= read -r spec; do
     echo "PASS $t"
   fi
 done <<< "$NEG"
+
+# Program container: mnclc-produced mncore::Program fixtures, decoded and
+# pinned field by field. Fully local (pure Python, no mncl, no sde64), so it
+# runs even offline. These pin the FlatBuffers schema recovered in
+# docs/mncore_mnir_offload.md §6 A.1 -- the same numbers must survive any
+# future Program *writer*.
+echo "===== Program container schema ====="
+PR=$TD/Inputs/prog
+progchk() {
+  t=$1; shift
+  if python3 -I $TD/scripts/check_prog.py "$@" >/dev/null 2>&1; then
+    echo "PASS prog:$t"
+  else
+    echo "FAIL prog:$t"; fail=$((fail+1))
+  fi
+}
+progchk ke    $PR/ke.bin    size=256  name=k nargs=0 nfixup=0 L=192 blk=0    tail=64
+progchk s28   $PR/s28.bin   size=512  name=k nargs=2 nfixup=1 L=192 blk=256  tail=64  tags=1,1 fx=0/0/0
+progchk gen26 $PR/gen26.bin size=1088 name=k nargs=2 nfixup=3 L=256 blk=768  tail=64  tags=1,1 fx=0/0/0,2/0/0,4/1/0
+progchk gen16 $PR/gen16.bin size=2048 name=k nargs=7 nfixup=6 L=320 blk=1536 tail=192 tags=1,1,1,1,1,1,1 fx=0/0/0,2/1/0,4/2/0,6/3/0,8/4/0,10/5/0
+# Negative fixture: a deliberately wrong expectation must be rejected.  If it
+# is accepted, the checker stopped comparing and the four PASSes above mean
+# nothing.
+if python3 -I $TD/scripts/check_prog.py $PR/gen16.bin nargs=6 >/dev/null 2>&1; then
+  echo "FAIL prog:negative (wrong nargs accepted)"; fail=$((fail+1))
+else
+  echo "PASS prog:negative"
+fi
 
 remfail=0
 if [ $LOCAL_ONLY = 0 ]; then
