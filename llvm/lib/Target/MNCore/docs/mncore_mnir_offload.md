@@ -363,6 +363,21 @@ unsigned long>` 的 `size_type = unsigned long` 也印证了这一点。
 Finish 之后文件从 root 开始，于是得到 §2 的三段式布局。
 ```
 
+**instblock 向量按 64 字节对齐**创建（相当于 `StartVector(1, blk, align=64)`）：
+创建它时的填充量 = `(−(已写字节数 + blk)) mod 64`。这解释了三件此前说不清的事：
+① 所有样本的镜像起点 `L` 都是 64 的倍数（192/256/320/448）；
+② 0 实参样本（`ke`/`add1`/`sh2`/`k2u`）里 `L` 与 union 向量之间恒有
+**48 字节的零**（`blk` 是 128 的倍数 ⇒ `(16 + blk) mod 64 = 16` ⇒ 补 48）；
+③ `gen16` 的同一个间隙是 **40 字节**：它创建 instblock 前已写 152 B，
+`(152 + 1536) mod 64 = 24` ⇒ 补 40。写构造器时必须复现这个对齐，
+否则镜像起点会差几十字节，整个文件对不上。
+
+另一个必须复现的行为是 **vtable 复用**：形状相同的表共用一个 vtable，
+表在自己的 vtable 之前时 `soffset` 为负。`gen16` 的 7 个指针 payload 里，
+`payload[3..6]` 全部指向 `vtable@2036`（`soffset` = −36/−44/−52/−60），
+`payload[2]` 复用 `payload[1]` 的 `vtable@2020`（`soffset` = −12）。
+所以"每张表各写一个 vtable"的朴素构造器**不可能**逐字节相同。
+
 由此 `L`、`blk`、`tail` 都是可算的，不再需要经验规则。尾部区
 （`[L+blk,EOF)`）就是按上表顺序**最后建**的三样东西：`arguments` union
 向量、`arguments_type` 向量、各实参 payload 表。实测 `tail` 只取
