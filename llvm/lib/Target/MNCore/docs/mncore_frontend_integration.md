@@ -176,7 +176,9 @@ third_party/mncore/
 **真实 Triton 前端（M1 进展）**：`ASTSource → TTIR → TTGIR → mncore →
 LLVM → .vsm → assemble3 → gpfn3` 已跑通：
 
-* 指针参数映射为静态 DRAM 基址（arg i → `128*i` longword，待 relocation）；
+* 指针参数**不**折叠为静态基址：整 tile `tt.load/store` 生成 `mncore.dma`
+  的 `src_arg` / `dr_arg`，地址字段为占位 0，静态偏移进 fixup 记录
+  （kernel ABI §13）。宿主/loader 绑定 arg → DRAM 基址后装配；
 * `tt.load`/`tt.store` 的 **整 tile `base + arange(0,256)`** 已下降为两平面
   `mncore.dma` + `mncore.vec.load/store` + `mncore.dma.store`；
 * **load 路径数值正确**：DRAM 0..63 写入 1..64，经 MV→L2B→l1bmd 后，PE
@@ -202,19 +204,81 @@ mncore 合法化（它们使用 GPU layout、指针参数与 `tt.load/store`）�
    下降为 `mncore.dma` + 两平面 `vec.load/store`；
 3. DMA 的平面布局必须与所选元素顺序一致（plane-major 可直接连续搬运）。
 
-### 2.4 指针参数与重定位（关键）
+### 2.3c MAB/MAB4 存储边界：**判为不可推导，以负向回归钉住**（2026-11-04）
+
+`ttg.local_store` 的 MAB/MAB4 路径不再作为"待实现项"悬置，而是明确判为
+**不可从 Triton 布局推导**，并各自给出物理理由：
+
+* **MAB store 不可推导**：目标指令 `l1bmm@<mabadr> <pe_src> $lb<addr>`
+  需要一个 0..15 的**物理 MAB 选择子**；linear layout 只证明 lane 位 2..4
+  被复制（16 个 MAB 内容相同），并不能确定"写哪一个 MAB"。且一次传输的
+  源操作数是**单个 PE 的双长语操作数**，不是整个 4-PE MAB lane——即便选定
+  选择子，`vector<4xf32>` 也只覆盖 8 长语平面中的一个 PE 切片。
+* **MAB4 store 不可表达**：`l1bmm4@<k>` 只写 4 个 MAB 组中的**一个**，而
+  4 组内容不同（lane 位 4 与 warp 位选组）；`mncore.vec.store` 只有一个
+  value token，无法描述 4 个按组的源，故不是"未实现"，而是 ABI 表达力不足。
+* 替代路径（不在本轮实现）：前端显式发出 `mncore.vec.store`（自带
+  `set`，0..15 / 0..3），或先按组切分张量再逐组存储。
+* **回归**：`tests/t8_mab_store_reject.mlir`、`tests/t8_mab4_store_reject.mlir`
+  与 `tests/run_t8.py` 断言两条拒绝及其诊断文本，防止未来改动**静默**
+  挑一个选择子或丢掉分组。
+
+### 2.3d 测试自动化入口（2026-11-04）
+
+`third_party/mncore/tests/run_all.py` 是单一入口，按顺序跑
+T0（插件导入/后端发现，兼作 `libtriton.so` 安装）→ T1..T7（布局与模式）
+→ T8（MAB/MAB4 负向）→ T9（`tt.dot`/GEMM 契约）→ R（重定位契约
+`run_reloc.py`）→ F（`run_frontend.py`）。`--remote` 追加
+`run_e2e_add.py`（经 ssh 调 assemble3/gpfn3，与 CPU golden 逐元素对拍）。
+2026-11-04 实测 12 个 stage 全通过（含 remote）；T9 加入后为 13。
+`run_t1..t9` 可单独运行：`python run_tN.py <fixture>.mlir`。
+
+
+### 2.3e `tt.dot` / GEMM 路径：前端打开，后端门禁（2026-11-04）
+
+**前端（已通）**：真实 `@triton.jit` 的 32×32×32 `tl.dot` 能走完
+TTIR→TTGIR。为此 `MncoreOptions` 必须提供 `tl.dot` 语义例程读取的字段
+（`sanitize_overflow`、`allowed_dot_input_precisions=("ieee",)`、
+`default_dot_input_precision`、`max_num_imprecise_acc_default`、
+`deprecated_fp8_dot_operand_dtypes`），且 `get_codegen_implementation`
+必须返回 `min_dot_size` 钩子（否则前端直接断言失败）。产物布局为
+`#ttg.blocked<{sizePerThread=[4,4], threadsPerWarp=[4,8], warpsPerCTA=[2,1],
+order=[1,0]}>`：每线程（= 每 PE）4×4 的 C tile，A/B 则是
+`#ttg.dot_op<{opIdx=0/1, parent=#blocked}>`。
+
+**后端（门禁）**：`tritongpu-to-mncore` 在进入线性遍历前拒绝任何
+`tt.dot`，按失败子句给诊断（精度 / 分块 / 布局）。三条子句的物理依据与
+MAU 矩阵几何见 `mncore_intrinsics_design.md` §22；核心事实是
+**ISA 没有矩阵×矩阵指令**，且 `fmaDotToLinearLayout` 把整个 K 维复制进
+寄存器，而 MAU 需要 K 以每 MAB 每 PE 一个元素的形式进入矩阵面。
+
+**为什么先门禁而不是先 lowering**：MAU 的三条矩阵指令
+（`mwrite`/`mfma`/`mread`）至今**没有任何数值 golden**，且 Layer B 对矩阵
+操作数统一打包 `width=2`，与 SDM 的每-cycle 访问量（x 为 word、y/dst 为
+longword）不一致（§22.4）。在 gpfn3 上把该差异实测闭合之前，把 `tt.dot`
+降级到这三条指令只会得到"算错但能跑"的结果，违反 fail-closed 准则。
+
+**回归**：`tests/run_t9.py`（前端 TTGIR + 三条拒绝子句）、`tests/
+t9_dot_contract.mlir`、`t9_dot_dtype_reject.mlir`、`t9_dot_shape_reject.mlir`。
+
+### 2.4 指针参数与重定位（关键）——**编译期已实现 (2026-11-04)**
 
 `.vsm` 的地址字段是静态的（`packPEOperand`/`packMVOperand` 只接受立即数），
 Triton 的运行时指针无法直接进入指令。因此：
 
-* `mncore` 层把 buffer 参数表达为 `symbol + static offset`；
-* `convert-mncore-to-llvm` 生成占位地址，并在模块 metadata 中记录
-  `{arg_index, byte_offset, access}` fixup；
-* loader（`mnrt`）在 `mnrt_load_program_ex` 时做重定位。
+* `mncore` 层把 buffer 参数表达为 `symbol + static offset`，即
+  `mncore.dma{src_arg}` / `mncore.dma.store{dr_arg}` 加 longword 静态偏移；
+* `convert-mncore-to-llvm` 生成占位地址 0，并把
+  `{arg, space, unit, addend_units, width_bits, opcode, operand}` 打包进
+  `llvm.mncore.mv.reloc` 的第 5 个参数；asm printer 输出
+  `# @mncore.fixup <site>` 行注释与文件尾的 sidecar 注释块；
+* loader（`mnrt`）在 `mnrt_load_program_ex` 时按 `site` 做重定位。
 
-当前 `mnrt` 只记录 binding、**尚未实现 relocation**（见
-`mncore_kernel_abi_v1.md` §10）。这是与运行时工作线的**交叉契约**，必须先冻结
-fixup 记录格式。
+格式已冻结在 `mncore_kernel_abi_v1.md` §13，编译期产生端已实现并有回归
+（`llvm/test/CodeGen/MNCore/mv-reloc.ll`、`mlir/test/Conversion/MNCoreToLLVM/
+lower.mlir`）。`mnrt` 仍只记录 binding、**尚未实现 relocation**；宿主侧参考
+消费端 `third_party/mncore/tests/mncore_fixup.py` 已按 §13.3 实现并被
+`run_reloc.py`、`run_e2e_add.py` 使用。
 
 **合法性门禁**：Triton pass 不得把动态 `tt.load` 指针无条件折叠为静态地址。
 只有当寻址能证明是 `buffer base + static offset`（且 offset 按 §13 的 unit
@@ -321,7 +385,7 @@ codegen。
 | F1 | 安装前缀；Triton/TVM 能链接 `MLIRMNCoreDialect` | 两个前端各自最小 C++ 链接测试 |
 | F2 | Triton `mnir` stage：单个 elementwise kernel | `.vsm` 可被 assemble3 接受 |
 | F3 | TileLang target kind + `CodeGenMNCore` | 单个 copy kernel 产出 `.vsm` |
-| F4 | buffer 参数 + fixup + `mnrt` 重定位 | 多 kernel buffer reuse 数值对拍 |
+| F4 | buffer 参数 + fixup + `mnrt` 重定位 | 多 kernel buffer reuse 数值对拍 | **编译期完成**：`mv.reloc` + sidecar + 宿主侧参考消费端；单 kernel 端到端数值通过。`mnrt` 消费端待实现 |
 | F5 | dot / GEMM 路径 | 与 CPU golden 对拍 |
 
 ---
@@ -431,3 +495,7 @@ cmake -G Ninja -S . -B ../triton-mncore-build \
 
 T3 的数值判据见 `mncore_mlir_dialect.md` §8.6（`A[m,p] = 100m + p` 的四种
 模式期望表）。在 T3 通过前，任何 Triton kernel 都不得宣称语义正确。
+
+> **编号说明**：上表是*里程碑*门禁（T1..T6 为能力阶段）；§2.3d 的
+> `run_t1..run_t8` 是*测试夹具*编号（按布局/模式覆盖划分），两者不是一套
+> 编号。可执行的单一入口只有 `tests/run_all.py`。

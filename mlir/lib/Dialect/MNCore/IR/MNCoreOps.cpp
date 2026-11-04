@@ -346,6 +346,17 @@ LogicalResult DmaOp::verify() {
   }
   if (getMvFlags() & ~uint32_t{0xf})
     return emitOpError() << "unknown MV flag bits in " << getMvFlags();
+  // The generated accessor is uint32_t (ODS I32Attr), so reinterpret it as
+  // signed before range-checking the -1 sentinel.
+  const int32_t srcArg = (int32_t)getSrcArg();
+  if (srcArg < -1 || srcArg > 0xff)
+    return emitOpError() << "src_arg must be -1 (absolute address) or a kernel "
+                            "argument index 0..255, got "
+                         << srcArg;
+  if (srcArg >= 0 && getSrcSpace() != 1)
+    return emitOpError()
+           << "a relocatable source must live in DRAM (src_space = 1); only "
+              "kernel buffer arguments are relocatable";
   return success();
 }
 
@@ -364,6 +375,11 @@ LogicalResult DmaStoreOp::verify() {
     if (addr > 0xffffffffULL)
       return emitOpError() << name << " must fit 32 bits, got " << addr;
   }
+  const int32_t drArg = (int32_t)getDrArg();
+  if (drArg < -1 || drArg > 0xff)
+    return emitOpError() << "dr_arg must be -1 (absolute address) or a kernel "
+                            "argument index 0..255, got "
+                         << drArg;
   return success();
 }
 

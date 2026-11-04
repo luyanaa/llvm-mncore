@@ -460,7 +460,8 @@ rec2 bytes7..9 的 24-bit 字段（LE）：1.0f=`FC 7F FE`、0.5f=`F8 7F FE`、
 
 ---
 
-## 13. Relocation 契约 v2（2026-11-03，待 runtime 实现）
+## 13. Relocation 契约 v2（2026-11-03 冻结；编译期 2026-11-04 已实现，
+runtime `mnrt` 消费端仍未实现）
 
 §3.4 的 metadata sidecar 目前只记录 buffer 绑定，**没有 relocation**
 （§10）。而 `.vsm` 的地址字段是静态立即数
@@ -475,7 +476,7 @@ rec2 bytes7..9 的 24-bit 字段（LE）：1.0f=`FC 7F FE`、0.5f=`F8 7F FE`、
 * 转换由 lowering 完成：`addend_units = byte_offset / unit_bytes`；不整除即
   拒绝，不做隐式取整。
 
-### 13.2 产生方式（编译期）
+### 13.2 产生方式（编译期）——**已实现 (2026-11-04)**
 
 带 buffer 基址的指令在 `.vsm` 中满足：
 
@@ -497,6 +498,34 @@ fixups:
 
 PE 操作数的 `operand` 位置按 `moncore_intrinsics_design.md` §3 的 intrinsic
 签名计（例如 `alu` 的 `sx` 为 1）。
+
+**实现路径（本仓库 → `.vsm`）**
+
+| 层 | 表达 |
+|---|---|
+| `mncore` dialect | `mncore.dma` / `mncore.dma.store` 的 `src_arg` / `dr_arg`（`-1` = 绝对地址）。此时 `src_addr` / `dr_addr` 解释为**相对 buffer 的静态偏移**（longword）。verifier 拒绝 `src_arg >= 0` 且 `src_space != DRAM`，以及超范围的 arg。 |
+| `convert-mncore-to-llvm` | 地址操作数改为 `mvop(..., 0, ...)`，指令 intrinsic 换成 `llvm.mncore.mv.reloc`，第 5 个参数是 `mncore::packReloc()` 打包的记录。冻结的 `llvm.mncore.mv` 4 参数 ABI 未改动。 |
+| isel | `mv.reloc` 与 `mv` 走同一 opcode 选择，多出的记录作为 MI 的第 4 个操作数（MCInst 也会带上，但 asm string 不引用它，故不影响指令文本）。 |
+| asm printer | 识别该操作数 → 行尾追加 ` # @mncore.fixup <site>`，site 按发射顺序从 0 递增；文件尾输出注释形式的 sidecar 块 `# @mncore.fixup.begin` … `# @mncore.fixup.end`。`assemble3` 忽略 `#` 注释，因此**同一条流**既是可汇编的 `.vsm`，也是带 sidecar 的产物。 |
+
+记录打包（`llvm/include/llvm/Target/MNCore/MNCoreIntrinsicOps.h::
+mncore::packReloc`，MLIR 与 asm printer 共用）：
+
+```
+[7:0] arg   [10:8] space   [11] unit   [19:12] width_bits
+[23:20] operand   [31:24] opcode   [63:32] addend_units (signed)
+```
+
+`width_bits == 0` 表示“无 fixup”（真实地址字段至少 1 bit）。
+
+参考消费端见 `../triton-mncore/third_party/mncore/tests/mncore_fixup.py`
+（`split()` / `relocate()`）：解析 sidecar 注释块、按字节绑定换算、检查
+unit 整除与 `width_bits` 越界、校验 `opcode`/`operand`/`space` 与行一致、
+剥离注释后交给 assemble3。契约测试
+`third_party/mncore/tests/run_reloc.py`（1 正例 + 7 负例 + 1 word-unit 正例）
+与 `tests/run_e2e_add.py`（端到端用它做宿主侧重定位）；
+`third_party/mncore/tests/run_all.py --remote` 把 R / E2E 一并纳入单一入口。
+
 
 ### 13.3 消费方式（loader）
 
@@ -522,9 +551,14 @@ PE 操作数的 `operand` 位置按 `moncore_intrinsics_design.md` §3 的 intri
 ### 13.5 验收
 
 * 双 kernel 共享同一 buffer：第二个 kernel 通过 site 读取第一个 kernel 写出
-  的数据，数值对拍通过；
+  的数据，数值对拍通过；——**待 `mnrt` 实现后验收**（参考消费端已就绪）。
 * 负例：未绑定 site、`byte_offset % unit != 0`、地址超出 `width_bits`，
-  三者都必须被拒绝。
+  三者都必须被拒绝。——**已由 `tests/run_reloc.py` 覆盖**，另加
+  space/opcode/operand 不符、sidecar 声明但未被引用的 site 两类 fail-closed 负例。
+* 端到端：`tests/run_e2e_add.py` 现在编译产出带 fixup 的 `.vsm`，由宿主侧
+  `mncore_fixup.relocate()` 绑定 `arg0/1/2 → 0/128/256` longword 后交给
+  assemble3；6 个被重定位操作数（2 个 load + 1 个 store，各两个 longword 平面）
+  与 CPU golden 逐元素一致。
 
 
 **Loader 解析器确认（Ghidra）**
@@ -708,36 +742,163 @@ MVInstr     { opcode; params; Operand src, dst; }
 * E4 仍需真实设备（本环境仅 emu2）。
 
 
-**E0 覆盖实测（后端语料，2026-11-04 第五次重分类，post-gen24）**
-`encoder/canonical.py` 对 `/tmp/*.vsm` 语料（122 个文件）逐指令分类：
-* 完全可编码（E0-template 或 E0-exact）：**26 个文件**；
-* 存在缺口的文件：96 个。剩余 UNKNOWN 按频次排序：
-  l2bmd(29) l1bmm@(21) fmin(14)+fmin/0111(3)+fmax(5) lpassa(13)
-  mvp/n64i02-06(35) l2bmdarw(8)+l2bmdars(4) wait(5) maskrs(3) quit(3)
-  l2bmb@0/3(4) l2bm@0(4) mvp/n256nd4(3) mvb2/n64(3) mvr2dfadd/n64(3) mvd/n64(3)
-  l1bmp/0111(2) mvp/n64(2) 尾项若干（各 1）。
-* 新增模板 257 条（post-gen5 → post-gen24：118 → 375），覆盖
+**E0 覆盖实测（后端语料，2026-11-04 最终重分类，post-gen57）**
+`encoder/canonical.py` 对语料（122 个 `.vsm`，已固化到
+`encoder/corpus/`）逐指令分类，两个指标：
+* **无 UNKNOWN：122/122 文件** —— 每条指令要么是 E0（模板/精确文本/映射），
+  要么是**有据记录的 `UNSUPPORTED`**（见下表）。"可达类已补齐"指这一项。
+* **严格 FILE-E0：47 个文件** —— 每条指令都落在 E0 模板族内；
+  其余 75 个文件的缺口全部来自下表的有据不可达类，不再是"待办"，
+  而是"该 oracle 无法表达"。
+* 模板表 **588 条**（gen5 → gen58：118 → 487 → 588）。488 之后新增的 102 条
+  来自 60 份 dump 的全量重导（见下"模板溯源"），不是新的探针类。
+* 回归：`~/libmnrt` 的 `make check` 跑三个脚本：
+  `encoder/block_encoder.py`（323/323 块逐字节重建 + immu 律）、
+  `encoder/regress_coverage.py`（钉住模板数、两个文件计数、每个不可达类的理由、
+  fail-closed 与正负夹具、逐字节可编码率下限）、`encoder/regress_templates.py`
+  （模板溯源，见下）。
+
+**必须区分的两个"覆盖"（2026-11-04 实测，避免误读）**
+语料 4728 条指令中 3724 条是 `IMAGE-EXCLUDED`（emulator-only `d get/set`），
+真实指令 **1004** 条，其构成为：
+| 口径 | 数量 | 含义 |
+|---|---|---|
+| 精确模板（逐字节可编码） | **88**（8.8%） | `block_encoder.py` 可查表直接出块 |
+| 类级 E0（opcode 已验证、文本未验证） | **832** | 该类至少有一条模板过 E0，但此寄存器/立即数组合未验证；`block_encoder` 对其 **fail closed** |
+| `UNSUPPORTED`（有据不可达） | **84** | 见下表 |
+
+因此"E0 完全覆盖 / 122-122 无 UNKNOWN"是**类级**结论，**不是**语料的逐字节可编码率。
+要让 llvm 产物直接可编码，还需二选一：补全文本变体（更多探针），或按类做
+**字段归纳**（用同类多条模板反解寄存器/立即数位域，再用全部模板做重建校验）。
+`regress_coverage.py` 现把 88 作为**下限**钉住，后续每次合并都必须让它单调上升。
+
+**本轮（post-gen33 → post-gen57）新增模板 62 条**，覆盖
+`fmin $ln0v $aluf -> $nowrite`、`fmax $ln0v $lm0v -> $nowrite; l1bmr_ffadd ...`、
+`l1bmr_fmax`、`fmin/fmax $lr0 $ls0 -> $ln0/1100`（scalar 经单向分派）、
+`dmin $ln0v $aluf -> $lm8v`、`dmax $ln0v $lm0v -> $ls0v`、
+`lpassa $lsN -> $lrN/1000`、`l1bmm@0..7 $ln0v -> $lb<4N>`（全部 8 个变体）、
+`l2bmd $lc0 -> $lb0` 与 `l2bmd $lb0 -> $lc0`（双向）、
+`l1bmd+13/+14/+15`。
+
+**对上一轮结论的更正（重要，均为探针污染所致）**
+上一版把 `l2bmd`、`l1bmm@`、`lpassa`、向量 `fmin/fmax` 记为"不可达"，**这是错的**：
+* `l2bmd` / `l1bmm@` 当时被判为"LM0 保留"，真实原因是探针里写了
+  `out[0] = buf[0]`（PE 局部数据直存 DRAM）。mnclc 对此报
+  `cannot put data to far memory 5`，该错误**连带**吞掉了整个内核的翻译，
+  使我们先看到 LM0 保留的次生错误。去掉该直存后，gen53 一次捕获
+  `l1bmm@0..7` 全部 8 条，gen55 一次捕获 `l2bmd` 双向。
+* `lpassa`、向量 `fmin/fmax` 可达：前者来自 `__builtin_l1bm_freduce_*`
+  的累加路径；后者来自 `__builtin_ffminx8/ffmaxx8/ffminx4/ffmaxx4/dfminx4`
+  （注意真实名字是**双 f 前缀** `ff...`，不是 `fminx8`；此外 `__builtin_*`
+  的 min/max 家族挂在 `__MNCL_DECLARE_PE_BUILTIN_1_FLOAT` 下）。
+  教训：探针里任何"PE→DRAM 直存"都会污染整轮编译，必须改用
+  L1BM/L2BM/DRAM 转移链或完全不加汇点。
+* 上一轮（post-gen5 → post-gen33）新增的 307 条模板，覆盖
   `l1bmr_ffadd/fmax/fmin`、`l2bmr_ffadd/fmax/fmin`、`mvr_ffadd/fmax/fmin`、
   `fvadd/fvmul/fvfma`、`dvadd/dvmulu/dvmuld/dvfmau/dvfmad`、
   `hvmul/hvadd/hvfma/hvpassa`、`dmwrite/dmread/dmmulu/dmfmau`、
   `mvp/n1024i01`、`mvp/n64i01`、`nop; wait i01`、
   `l1bmm4@N`、`l2bmb@N/0`、`l2bmb2`、`l2bmr2_*`、`l2bmi@0/5`、
   `dmax/dmin`、`hbfn/8`、`hbfe/6`、`msl/msr`、`l1bmd`/`l1bmd+N`、
+  `mvb2/mvb4/mvr2dfadd`、`l2bm@N`、`dbfn`、`sinc/sdec/linc/ldec`、
   及 gen14 附带的大量 `ilsl/ior/uipassa/uilsr` 寄存器初始化序列。
-* **不可达类（fail closed 或需非-builtin 路径）**：
-  `l2bmd`/`l2bmdarw`/`l2bmdars`（LM0 保留/未实现）、
-  `/0111`-masked 文本（无 mask-flag 表层）、
-  `wait`/`maskrs`/`quit`（调度器发射）、
-  `mvp/nNNNi02-i06`（调度器分配的依赖标签）、
-  `lpassa`（无对应 builtin）。
+
+**已证伪的"不可达"类及证据（每一类都有可复现的关闭理由，
+问题不再是"尚未尝试"，而是"该 oracle 无法表达"）**
+
+| 类（语料命中数） | 关闭该类的证据 |
+|---|---|
+| `mvp/n<N>i02..i06`（43） | tag 由 mnclc 调度器分配。C 表层**无 tag 参数**（129 条 `__builtin_l2b*` 与全部 MV builtin 逐一枚举，头文件无 wait/tag/async 声明）；12 路并发转移的压力探针 gen47 仍然逐条发射 `nop; wait i01`，即 91 份 dump 中只出现 `i01`。 |
+| `wait`＞i01（2） | 同上。附加证据：wait 块的 **tail 前 8 字节编码它所等待的那条转移的地址**（gen47：`...1022`/`1044`/`1066`/… 随前一 mvp 地址单调变化），因此该块**不是 PE 文本的函数**，仅靠模板无法生成。 |
+| `l2bmdars`、`l2bmdarw`（12） | mnclc 自身在发射前中止：`mnir_backend.cc:3510 unimplemented`，栈顶 `MNIRBackend::L2BMDARSend()`（gen56/gen57 可复现栈回溯）。 |
+| `l2bmb@<addr>/<immode≠0>`（4） | `__builtin_l2bm_unicast0..7` 只映射到 `l2bmb@N/0`；immode 仅由 `__builtin_l2bmi_*` 暴露（0..6，头文件明示 7 不提供）。 |
+| `/0111`-masked（7） | 头文件只有一条 mask 相关声明 `__builtin_debug_store_current_mask`，且注明"debug helper, no assembler instruction"：C 表层无法设置指令掩码。 |
+| `maskrs`、`mask`、`quit`（7） | 91 份 mnclc dump 中一次都没出现；内核终止与掩码恢复是镜像/尾块级，不在指令流内。 |
+| `mvd/n64`、`mvp/n256nd4`（6） | PDM 路径：`PDM builtins are supported only by the MN-Core 2 L1IR backend`；mnclc 的 `--help`（全文 17 行，已逐行核对）没有后端选择开关。 |
+
+以上全部由 `canonical.py` 的 `UNREACHABLE` 表逐条钉住，`regress_coverage.py`
+对每一类跑负向夹具（必须报 `UNSUPPORTED` 且带理由），并用一条虚构 opcode
+（`zzq_fake`）做 fail-closed 正控——它必须报 `UNKNOWN`，防止分类器"一律放行"。
 * **VSM→MNIR 映射**：canonical.py 新增 `vsm_to_mnir_text()`，
   处理 `l1bmm@N $src $dst` → `l1bmm@N $src -> $dst`、
   `mvp/nNNNiNN $src $dst` → `mvp/nNNNiNN $src -> $dst`、
   `l2bmb@[a,b]` → `l2bmb2`、`l2bmb@N/M` → `l2bmb@N/M`、
+  `l2bm@N` → `l2bm@N`，
   及 `VSM_TO_MNIR` opcode 表（reduce/dv/hv/dm/fv/l1bmm4/l2bmi/dmax/hbfn 家族）。
+* **分类器归一化漂移修复**：`_template_texts()` 原先用一张手写的前缀折叠表，
+  而 `opcode_of()` 用另一套规则，两边不一致导致 `l2bmd`(29) 与 `l1bmm@`(21)
+  在**已有精确模板**的情况下仍被判 UNKNOWN（`l2bmd` 被折叠成 `l2bm`，
+  `l1bmm@` 被折叠成 `l1bmm`）。现改为
+  `{opcode_of(t) for t in TEMPLATES}`，两侧由同一个归一化函数导出，
+  结构上不可能再漂移。仅此一处修复就让"无 UNKNOWN"文件数从 37 跳到 47。
+
+**模板溯源与错位回滚（2026-11-04 收尾，重要）**
+模板表此前是"逐轮合并"的累积物，没有任何机制能证明它与 dump 一致。收尾轮做了
+一次全量重导，发现并修正了一类**结构性错误**：
+
+* **镜像头长度不是常量**，必须由算术导出：`hdr = len(image) - 128*nblocks`。
+  实测 60 份镜像里 `256`（55 份）、`320`（gen6 / gen10 / gen26）、`512`（gen47）。
+  早期提取器把 256 写死，对 320 头的镜像**每个块提前 64 B**，切出的"头"实际跨越
+  了相邻块边界。
+* **错位可机械判别**：正常块在块内偏移 **104** 有固定尾标 `0c00000070000000004780ff03`
+  （= `TAIL_BODY` 的固定段）；wait/nop 类块在同一 24 B 常量处偏移 **30**。
+  提前 64 B 的块会把这个标记推到偏移 **40**——一个合法块永远不会出现的位置。
+* 据此逐条核对 487 条模板，命中 **18 条**由 gen6/gen10/gen26 错位提取而来的条目
+  （含 `nop; wait i01`、`mvp/n64i01 …`、`mvb2/mvb4 …`、`l1bmr_*`/`l2bmr_*`、
+  `mvr_*`、以及一条 `zero -> $ln0v [first-block]` 伪条目）。全部按**对齐样本**
+  重建（每条都有唯一对齐来源，无歧义），伪条目删除。
+* 同时把 60 份 dump 全部重导并合并：**+102 条**此前从未合并的真实模板，
+  与已有模板**零冲突**（这本身就是一次跨批次一致性校验）。
+* 新增 `encoder/oracle/`（60 份 dump，2253 块，916 KB）与
+  `encoder/regress_templates.py`，把"模板表必须能由 oracle 重导"变成回归不变量：
+  S1 除末块外每块尾标在 104/30、每镜像至多一个无标记块且必为末块；
+  S2 同一文本 → 同一 60 B 头（60 份 dump 全量，无例外）；
+  S3 纯 nop 头唯一且等于 `TEMPLATES['nop']`；
+  S4/S5 oracle 与模板双向一致；S6 计数钉死（588）。
+  这一类错误今后不可能再静默发生。
+* **复现性已验证**：`kb8 / gen30 / gen14 / gen39` 用同一 mnclc
+  （`/opt/pfn/pfcomp/hpc/mncl/bin/mnclc`，2026-10-15）与同一组 flag 重编，
+  **逐字节一致**；且默认（L1IR）后端输出与两者都不同（2304 B vs 7936 B），
+  故 oracle 全集确为 `--mnir` 产物。
+
+**编码器边界的新发现（供下一阶段 E1 使用）**
+块级布局：`[0..59]` 指令头 + `[60..127]` 尾区；正常块尾区 = 44 B 零 +
+`0c00000070000000004780ff030000000000000000040000`（24 B 固定段，其起点即块内偏移
+104）。`block_encoder.py` 目前一律产出 `模板头 + TAIL_BODY`，两个边界**尚未覆盖**：
+
+1. **带 wait 的块**：尾区前 8 B 编码被等待转移的地址，随上下文变化
+   （gen47 的 wait 块各不相同），所以 `nop; wait i01` 虽有模板头，
+   尾部不能取常量 `TAIL_BODY`。
+2. **末块尾区只有实测的三态，且与"是否纯填充"无关**（此前的表述已被证伪）：
+   60 份镜像中末块尾区为
+   * **33 份**：固定的非零终止记录
+     `…0001 000000 18000000 00000000 01000000 00000000 01000000 04080004…`
+     （其中 32 份是无尾标标记的末块，另一份是 gen6——末块为 wait 块但尾区取此记录）；
+   * **20 份**：全零（`TAIL_FINAL`）；
+   * **4 份**（gen10 / gen26 / gen28 / gen47）：末块是普通 wait 块，尾区为
+     `…0002 000000 30… 18…` 的等待描述符。
+   末块**可以载真实指令而尾区全零**（`l1bmm@0`、`fftoi`、`l1bmm4@3`、`uipassa`…），
+   也**可以载同一指令而尾区非零**：kb8 与 gen30 的末块 PE 文本与 60 B 头
+   **逐字节相同**，仅尾区不同。因此"末块尾标由末块文本决定"不成立。
+   选择函数**尚未归因**。已排除的候选（均有受控实验）：
+   * 末块是否为转移：6 个新内核都以一次 L1BM upload 结尾 → 全零，但 gen30
+     （末块 `l1bmm@0`）非零；
+   * 指令家族：`lzerox4+lincx4` 无 upload 时非零，加一次 upload 后全零；
+     而 `izero+iinc+idec` + 2 次 upload（gen30 去 i64 变体）仍非零；
+   * 镜像规模/块数：全零组最大 39 块，但非零组含 1..3 块的 gen12/gen32/gen38。
+   已纪实的结论只有：**尾区取值是镜像级上下文，不是块文本的函数**，E1 之前必须
+   由 oracle 匹配或由调度器语义决定，不能取常量。
+   另外：**55 份镜像中恰有一个无标记块，且它在 55/55 里都是末块**；其余 5 份
+   （以 wait 块结尾）没有无标记块。这一点已由 `regress_templates.py` 的 S1 钉住。
+
+现有 selftest 的 323 个样本恰好都不含这两类，所以 323/323 仍成立；
+它们在 E1（loader 接受）之前必须按样本补齐，属于**已知未闭合项**，
+不得据此宣称镜像已可装载。
+
 早期按 6 测试组的手工清单（alu/mau/l1bml2bm/mv/mask/imm-fixed）已由模板表驱动
-的自动分类取代。同一 oracle 循环继续补齐其余类。**“E0 完全覆盖”验收标准不变**：
-对后端语料（排除 emulator-only `d get/set`）`canonical.py` 报告 100% 可编码。
+的自动分类取代。**“E0 完全覆盖”验收标准不变**：对后端语料
+（排除 emulator-only `d get/set`）`canonical.py` 不得报告任何 `UNKNOWN`
+——该条件现已在 122/122 文件上达成。
 
 
 **assemble3 292-bit 解码启动（2026-11-04）**

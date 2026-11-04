@@ -10,6 +10,16 @@
 #   * an LM space read and written in one step must cover the same address;
 #   * `imm` forbids any LM0 access in the same step.
 #
+# The LM same-address allowance above is an *encoding* rule: it says one
+# address field per space is enough for a legal one-step read+write. It does
+# not make a same-step L1B-transfer -> PE consumer pair observable: the PE
+# access sees the previous step's value (3.6.3.9), so the packetizer also
+# splits any L1B transfer against a PE-space access of the same region
+# (MNCorePacketizer.cpp l1bPEStageRace; the hazard pass then inserts the
+# LM-port spacing between steps). `lm_rw_same` pins the split for an L1BMP
+# write, `lm_rw_same_pe` pins the encoding allowance that survives for two
+# non-L1B expressions.
+#
 # Packed peoperand immediates (autostride, width=1, 'v'):
 #   $lr0v=67108880  $ls0v=67108881  $lm0v=67108882  $ln0v=67108883
 #   $lr2v=67110928  $lm4v=67112978  $lr4v=67112976
@@ -22,6 +32,7 @@
   define void @same_read() { ret void }
   define void @lm_rw_diff() { ret void }
   define void @lm_rw_same() { ret void }
+  define void @lm_rw_same_pe() { ret void }
   define void @imm_lm0() { ret void }
 ...
 ---
@@ -112,18 +123,39 @@ body:             |
     RET
 ...
 
-# LM0 read and write of the SAME address -> explicitly allowed, one step.
+# LM0 read and write of the SAME address by an L1B transfer and a PE
+# expression -> split by the stage-race rule, not by the 3.6.4 address rule.
+# The l1bmp write lands in LM0@0; the PE read in the same step would observe
+# the old value (3.6.3.9), so it must be a later step.
 name:            lm_rw_same
 body:             |
   bb.0:
     ; CHECK-LABEL: name: lm_rw_same
-    ; CHECK: BUNDLE
-    ; CHECK-NEXT: MAX_f
-    ; CHECK-NEXT: L1BMP
-    ; CHECK-NEXT: }
+    ; CHECK-NOT: BUNDLE
+    ; CHECK: MAX_f
+    ; CHECK: L1BMP
+    ; CHECK: RET
     MAX_f 67108882, 67108883, 67112976
     ; l1bmp $lb0 $lm0v
     L1BMP 0, 67108882
+    RET
+...
+
+# LM0 read and write of the SAME address by two non-L1B expressions ->
+# explicitly allowed, one step. This is the 3.6.4 encoding rule: fmax writes
+# $lm0v (LM0@0), dmwrite reads $lm0v (LM0@0).
+name:            lm_rw_same_pe
+body:             |
+  bb.0:
+    ; CHECK-LABEL: name: lm_rw_same_pe
+    ; CHECK: BUNDLE
+    ; CHECK-NEXT: MAX_f
+    ; CHECK-NEXT: W_XDMWRITE
+    ; CHECK-NEXT: }
+    ; fmax $ls0v $ln0v $lm0v
+    MAX_f 67108881, 67108883, 67108882
+    ; dmwrite $lm0v $lx0
+    W_XDMWRITE 67108882, 0
     RET
 ...
 

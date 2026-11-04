@@ -183,6 +183,18 @@ def int_mncore_mv
         [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
         [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 
+// MV command with a relocatable memory operand (mncore_kernel_abi_v1.md §13):
+// opcode, params, src, dst, fixup. `fixup` is the packed record from
+// mncore::packReloc() (arg, space, unit, width_bits, operand, opcode,
+// addend_units); the address field of the affected operand is 0. The backend
+// emits a `# @mncore.fixup <site>` comment on the line and records the entry
+// in the sidecar. `llvm.mncore.mv` is unchanged: kernels without buffer
+// arguments keep the frozen 4-argument form.
+def int_mncore_mv_reloc
+    : DefaultAttrsIntrinsic<[],
+        [llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty, llvm_i64_ty],
+        [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
+
 //===----------------------------------------------------------------------===//
 // Control.
 //===----------------------------------------------------------------------===//

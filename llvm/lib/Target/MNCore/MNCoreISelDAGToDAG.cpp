@@ -373,6 +373,35 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       ReplaceNode(N, M);
       return;
     }
+    if (ImmName == "llvm.mncore.mv.reloc") {
+      // (opcode, params, src, dst, fixup) — the reloc form of an MV line
+      // (kernel ABI §13). Selection is identical to `llvm.mncore.mv` except
+      // for the trailing packed relocation record, which no MC operand
+      // consumes: the asm printer strips it off and renders the
+      // `# @mncore.fixup <site>` comment plus the YAML sidecar entry.
+      auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
+      if (!OpcC)
+        report_fatal_error("MN-Core2: mncore.mv.reloc needs a constant opcode");
+      unsigned Opc;
+      switch (OpcC->getZExtValue()) {
+      case (int)mncore::MVOp::MVP: Opc = MNCore::MVP; break;
+      default:
+        report_fatal_error(
+            "MN-Core2: mncore.mv.reloc opcode id not mapped yet");
+      }
+      auto *FixC = dyn_cast<ConstantSDNode>(N->getOperand(6));
+      if (!FixC || !mncore::hasReloc(FixC->getZExtValue()))
+        report_fatal_error(
+            "MN-Core2: mncore.mv.reloc needs a non-empty relocation record");
+      auto TC = [&](unsigned I) -> SDValue {
+        return Fold(N->getOperand(I));
+      };
+      SmallVector<SDValue, 5> MO{TC(3), TC(4), TC(5), TC(6), N->getOperand(0)};
+      MachineSDNode *M = CurDAG->getMachineNode(
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
+      ReplaceNode(N, M);
+      return;
+    }
     if (ImmName == "llvm.mncore.mau") {
       // (opcode, prec, mat, sx, sy, sz, d0, d1, d2, omr, zmask, wmask)
       auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));

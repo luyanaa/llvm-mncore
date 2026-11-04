@@ -293,8 +293,12 @@ def MNCore_MvOp : MNCore_InstOp<"mv"> {
 }
 
 // DRAM/PDM -> L2BM -> L1BM copy (one MV command plus one L2BM->L1B move).
-// Addresses are longword units. This is the landing op for Triton tt.load and
-// TileLang T.copy; buffer bases still need the relocation contract.
+// Addresses are longword units.
+//
+// `src_arg >= 0` makes the source address relocatable (kernel ABI §13): the
+// emitted MV operand is a placeholder 0 and `src_addr` becomes the static
+// offset within the buffer, recorded as `addend_units` in the sidecar.
+// `src_arg = -1` keeps the absolute static address.
 def MNCore_DmaOp : MNCore_Op<"dma", [
     MemoryEffects<[
       MemRead<MNCore_DeviceMem>, MemWrite<MNCore_DeviceMem>,
@@ -304,7 +308,8 @@ def MNCore_DmaOp : MNCore_Op<"dma", [
   let arguments = (ins I32Attr:$src_space, I64Attr:$src_addr,
                        I64Attr:$l2_addr, I64Attr:$l1_addr,
                        I64Attr:$size, I32Attr:$tag,
-                       DefaultValuedAttr<I32Attr, "0">:$mv_flags);
+                       DefaultValuedAttr<I32Attr, "0">:$mv_flags,
+                       DefaultValuedAttr<I32Attr, "-1">:$src_arg);
   let hasVerifier = 1;
 }
 
@@ -317,6 +322,9 @@ def MNCore_DmaOp : MNCore_Op<"dma", [
 // holds the same plane, so `l2bmd` would interleave eight identical
 // 8-longword chunks into L2BM and destroy the plane. `l2bmd` is only correct
 // when the L1Bs hold disjoint data, which this ABI does not produce yet.
+// `dr_arg >= 0` makes the DRAM destination relocatable (kernel ABI §13): the
+// emitted MV operand is a placeholder 0 and `dr_addr` becomes the static
+// offset within the buffer, recorded as `addend_units` in the sidecar.
 def MNCore_DmaStoreOp : MNCore_Op<"dma.store", [
     MemoryEffects<[
       MemRead<MNCore_DeviceMem>, MemWrite<MNCore_DeviceMem>,
@@ -325,7 +333,8 @@ def MNCore_DmaStoreOp : MNCore_Op<"dma.store", [
   let summary = "L1BM -> L2BM -> DRAM copy";
   let arguments = (ins I64Attr:$l1_addr, I64Attr:$l2_addr, I64Attr:$dr_addr,
                        I64Attr:$size, I32Attr:$tag,
-                       DefaultValuedAttr<I32Attr, "0">:$l1b);
+                       DefaultValuedAttr<I32Attr, "0">:$l1b,
+                       DefaultValuedAttr<I32Attr, "-1">:$dr_arg);
   let hasVerifier = 1;
 }
 

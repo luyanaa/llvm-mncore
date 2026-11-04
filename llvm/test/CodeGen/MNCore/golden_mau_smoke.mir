@@ -1,0 +1,45 @@
+# RUN: llc -mtriple=mncore2 %s -o - | FileCheck %s
+#
+# MAU smoke probe: does gpfn3 implement the matrix register at all?
+#
+#   L1B[0] = 111, L1B[1] = 222  ->  l1bmd ($lb0) -> GRF0@0 longword
+#   fmwrite $lr0v $lx0          (4 rows, one longword per PE per cycle)
+#   fmread  $lx0 $lr4v          (4 columns, transposed: row <-> PE)
+#   d get   $lr0 8
+#
+# Both the write and the read use the *longword* (width=1) packing, which is
+# what SDM 3.6.10/3.6.11 calls for on fmwrite/fmread. The point is not the
+# numbers yet -- it is whether the emulator executes the MAU path and whether
+# assemble3 accepts the longword form. Numbers are checked in
+# golden_mau_roundtrip.mir.
+#
+# d set/get spec: [3:0]mem (1=GRF0 6=L1B), [20:4]addr, [28:21]nwords
+#   L1B@<a> n1 = 6 | (a << 4) | (1 << 21)
+#   GRF0@0 n8 = 1 | (8 << 21) = 16777217
+
+--- |
+  target triple = "mncore2"
+  define void @mau_smoke() { ret void }
+...
+---
+name:            mau_smoke
+body:             |
+  bb.0:
+    DSET 2097158, 111
+    DSET 2097174, 222
+    ; CHECK: l1bmd $lb0 $lr0v
+    L1BMD 0, 0, 67108880
+    ; CHECK: nop
+    NOP
+    ; CHECK: fmwrite $lr0v $lx0
+    W_XFMWRITE 67108880, 0
+    ; CHECK: nop
+    NOP
+    ; CHECK: fmread $lx0 $lr4v
+    W_XFMREAD 0, 67112976
+    ; CHECK: nop
+    NOP
+    ; CHECK: d get $lr0 8
+    DGET 16777217
+    RET
+...

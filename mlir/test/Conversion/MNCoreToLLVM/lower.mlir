@@ -106,10 +106,49 @@ func.func @vecstore(%v: vector<4xf32>) {
 // CHECK-LABEL: llvm.func @dmastore
 func.func @dmastore() {
   // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
-  // CHECK: llvm.call_intrinsic "llvm.mncore.l2b"(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (i64, i64, i64, i64) -> ()
+  // The L1BM -> L2BM step is the point transfer (opcode 2, `l2bm@<l1b>`), not
+  // the collect (opcode 1): a replicated plane must not be interleaved.
+  // CHECK: %[[OP:.*]] = llvm.mlir.constant(2 : i64) : i64
+  // CHECK-NEXT: %[[SEL:.*]] = llvm.mlir.constant(0 : i64) : i64
+  // CHECK-NEXT: llvm.call_intrinsic "llvm.mncore.l2b"(%[[OP]], %[[SEL]], %{{.*}}, %{{.*}}) : (i64, i64, i64, i64) -> ()
   // CHECK: llvm.call_intrinsic "llvm.mncore.mvop"
   // CHECK: llvm.call_intrinsic "llvm.mncore.mvparams"
   // CHECK: llvm.call_intrinsic "llvm.mncore.mv"
   "mncore.dma.store"() <{l1_addr = 0 : i64, l2_addr = 0 : i64, dr_addr = 0 : i64, size = 64 : i64, tag = 1 : i32}> : () -> ()
+  return
+}
+
+// CHECK-LABEL: llvm.func @dma_reloc
+func.func @dma_reloc() {
+  // `src_arg = 1` makes the DRAM source relocatable: the mvop address is the
+  // placeholder 0 and the packed record rides on llvm.mncore.mv.reloc
+  // (kernel ABI §13.2). Record: arg 1, DRAM, longword, width 32, operand 1
+  // (src), mvp, addend 64.
+  // CHECK: llvm.mlir.constant(274879086593 : i64) : i64
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mv.reloc"({{.*}}) : (i64, i64, i64, i64, i64) -> ()
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 64 : i64, l2_addr = 0 : i64,
+                    l1_addr = 0 : i64, size = 64 : i64, tag = 1 : i32,
+                    src_arg = 1 : i32}> : () -> ()
+  return
+}
+
+// CHECK-LABEL: llvm.func @dmastore_reloc
+func.func @dmastore_reloc() {
+  // The DRAM destination is relocated: operand 2 (dst), arg 2, addend 0.
+  // CHECK: llvm.mlir.constant(2228226 : i64) : i64
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mv.reloc"({{.*}}) : (i64, i64, i64, i64, i64) -> ()
+  "mncore.dma.store"() <{l1_addr = 0 : i64, l2_addr = 0 : i64, dr_addr = 0 : i64,
+                         size = 64 : i64, tag = 1 : i32, dr_arg = 2 : i32}> : () -> ()
+  return
+}
+
+// CHECK-LABEL: llvm.func @dmastore_l1b5
+func.func @dmastore_l1b5() {
+  // The L1B selector is forwarded from the op attribute.
+  // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
+  // CHECK: %[[OP:.*]] = llvm.mlir.constant(2 : i64) : i64
+  // CHECK-NEXT: %[[SEL:.*]] = llvm.mlir.constant(5 : i64) : i64
+  // CHECK-NEXT: llvm.call_intrinsic "llvm.mncore.l2b"(%[[OP]], %[[SEL]], %{{.*}}, %{{.*}}) : (i64, i64, i64, i64) -> ()
+  "mncore.dma.store"() <{l1_addr = 64 : i64, l2_addr = 64 : i64, dr_addr = 64 : i64, size = 64 : i64, tag = 2 : i32, l1b = 5 : i32}> : () -> ()
   return
 }

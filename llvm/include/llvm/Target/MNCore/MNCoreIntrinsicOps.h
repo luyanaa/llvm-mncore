@@ -89,6 +89,97 @@ enum class MVOp : int64_t {
   MVP = 0,
 };
 
+inline const char *mvOpcodeName(unsigned Op) {
+  switch ((MVOp)Op) {
+  case MVOp::MVP:
+    return "mvp";
+  }
+  return "mv?";
+}
+
+//===----------------------------------------------------------------------===//
+// Relocation records (mncore_kernel_abi_v1.md §13).
+//
+// A memory operand whose base comes from a kernel buffer argument cannot be an
+// immediate: the `.vsm` address field is static. Such an operand is emitted
+// with a placeholder address (0) and a *relocation record* that says which
+// argument supplies the base and what the static offset is. The record rides
+// on the `llvm.mncore.mv.reloc` intrinsic (the frozen `llvm.mncore.mv` ABI is
+// unchanged) and becomes, in the asm printer, a `# @mncore.fixup <site>` line
+// comment plus an entry in the YAML sidecar block.
+//
+// Units follow §13.1: the record's `addend_units` is in device address units
+// (longword = 8 B for DRAM/PDM/L2BM, word = 4 B for GRF/LM); the host side
+// converts bytes to units and must reject a non-integral conversion.
+//===----------------------------------------------------------------------===//
+
+// `space` field of a fixup: where the relocated address lives.
+enum class RelocSpace : int64_t {
+  DRAM = 0,
+  PDM = 1,
+  L2BM = 2,
+};
+
+// Address unit of the relocated field.
+enum class RelocUnit : int64_t {
+  Longword = 0, // 8 bytes
+  Word = 1,     // 4 bytes
+};
+
+// Which MV operand carries the relocated address (`operand` field, §13.2).
+enum class RelocOperand : int64_t {
+  Params = 0,
+  Src = 1,
+  Dst = 2,
+};
+
+constexpr unsigned relocUnitBytes(RelocUnit U) {
+  return U == RelocUnit::Word ? 4u : 8u;
+}
+
+struct RelocRecord {
+  unsigned Arg = 0;      // kernel argument index
+  RelocSpace Space = RelocSpace::DRAM;
+  RelocUnit Unit = RelocUnit::Longword;
+  unsigned WidthBits = 0; // ISA address subfield width, for the bound check
+  unsigned Operand = 0;   // RelocOperand
+  unsigned Opcode = 0;    // MVOp
+  int64_t AddendUnits = 0;
+};
+
+// Packed into one i64 intrinsic argument:
+//   [7:0]   arg
+//   [10:8]  space
+//   [11]    unit
+//   [19:12] width_bits   (0 is not a valid width: it marks "no fixup")
+//   [23:20] operand
+//   [31:24] opcode
+//   [63:32] addend_units (signed, in `unit`)
+constexpr uint64_t packReloc(const RelocRecord &R) {
+  return ((uint64_t)(R.Arg & 0xffu)) | ((uint64_t)((unsigned)R.Space & 0x7u) << 8) |
+         ((uint64_t)((unsigned)R.Unit & 0x1u) << 11) |
+         ((uint64_t)(R.WidthBits & 0xffu) << 12) |
+         ((uint64_t)(R.Operand & 0xfu) << 20) |
+         ((uint64_t)(R.Opcode & 0xffu) << 24) |
+         ((uint64_t)(uint32_t)R.AddendUnits << 32);
+}
+
+constexpr RelocRecord unpackReloc(uint64_t V) {
+  RelocRecord R;
+  R.Arg = (unsigned)(V & 0xffu);
+  R.Space = (RelocSpace)((V >> 8) & 0x7u);
+  R.Unit = (RelocUnit)((V >> 11) & 0x1u);
+  R.WidthBits = (unsigned)((V >> 12) & 0xffu);
+  R.Operand = (unsigned)((V >> 20) & 0xfu);
+  R.Opcode = (unsigned)((V >> 24) & 0xffu);
+  R.AddendUnits = (int64_t)(int32_t)(V >> 32);
+  return R;
+}
+
+// True when the packed record denotes an actual fixup. `width_bits == 0` is
+// the "no fixup" marker: every real address field is at least one bit wide.
+constexpr bool hasReloc(uint64_t V) { return ((V >> 12) & 0xffu) != 0; }
+
 } // namespace mncore
 } // namespace llvm
 

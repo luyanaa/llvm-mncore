@@ -90,6 +90,13 @@ void @llvm.mncore.l1b(i32 opcode, i32 dir, i64 src, i64 dst,
 void @llvm.mncore.l2b(i32 opcode, i64 set, i64 a, i64 b)
 ; MV（§3.5）。opcode: mvp/mvb/mvb2/mvb4/mvd/mvr<op>…
 void @llvm.mncore.mv(i32 opcode, i64 params, i64 src, i64 dst)
+; 可重定位的 MV（kernel ABI §13）。第 5 个参数是打包的 fixup 记录
+; （arg/space/unit/width_bits/operand/opcode/addend_units）；被重定位的
+; 操作数地址字段写 0（占位），asm printer 在该行末尾追加
+; `# @mncore.fixup <site>` 并在文件尾输出 sidecar 注释块。原 `mv` 的
+; 4 参数 ABI 不变，无 buffer 参数的 kernel 不受影响。
+void @llvm.mncore.mv.reloc(i32 opcode, i64 params, i64 src, i64 dst,
+                           i64 fixup)
 ; 控制
 void @llvm.mncore.wait(i32 tag)          ; 必须与其他 PE 表达式共步（§3.6.13）
 void @llvm.mncore.maskdir(i32 spec)      ; 多行写掩码指令（§3.6.2.1）
@@ -169,6 +176,12 @@ void  @llvm.mncore.matwrite.v4f32(i64 %face, i64 %row, <4 x float> %src)
 masked matvec/mread 已以 Layer A `mau` id 4/6 提供；masked mwrite 因唯一
 目的操作数是矩阵寄存器而不可表达。
 
+> **注意（2026-11-04）**：上面这三条 typed 签名只保证“能发指令”，不保证与
+> SDM 的操作数宽度/值宽度一致（y/dst 在 SDM 中是每 PE 8 f32、longword 访问，
+> x 是每 PE 4 f32、word 访问）。矩阵指令至今 **没有数值 golden**，任何据此
+> 构建的 GEMM 会在错误处静默出错。几何、差异表与实测探针见 §22；`tt.dot`
+> 因此在 `tritongpu-to-mncore` 中被门禁拒绝。
+
 ## 6. 内存搬运语义（DRAM/L2BM/L1BM/LM）
 
 * 层级：DRAM/PDM ⇄ L2BM（`mv`）→ L1BM（`l2b`）→ PE 存储（`l1b`）。
@@ -190,7 +203,7 @@ masked matvec/mread 已以 Layer A `mau` id 4/6 提供；masked mwrite 因唯一
 | `tt.load` / `tt.store`（DRAM tensor） | `mncore.dma` → `mv` + `l2b` + `l1b` 序列 |
 | `ttg.local_alloc`（shared） | LM0/LM1 槽位（`peop` 3/4） |
 | `ttg.local_load/store` | `l1b`/`alu passa` 或 `peop` 直接访问 |
-| `tt.dot` | `mau(mwrite)` + `mau(matvec mfma)` + `mau(mread)` |
+| `tt.dot` | `mau(mwrite)` + `mau(matvec mfma)` + `mau(mread)`（**未实现，门禁拒绝**；见 §22） |
 | elementwise（fma/mul/add/max/min） | `mau` 向量形式（Layer B → A） |
 | `ttg.convert_layout` | `l1bmp/l1bmm/l1bmd`（广播/分配/收集） |
 | mask/select | `maskop` + `wmask/zmask` 参数 |
@@ -532,3 +545,120 @@ for cycle = 0:4
 
 **结论**：在无控制流 lowering 之前，Layer B v3 只能以“单块 + 契约限制”
 形态存在；本轮不实现不可验证的跨块生存期代码。
+
+## 22. MAU 矩阵几何与 GEMM 契约 (2026-11-04)
+
+本节记录 SDM §3.6.9–§3.6.11 的矩阵事实（用于 `tt.dot`/GEMM 路径），并
+显式区分 **手册直述**、**由伪码推出的推论** 与 **尚未实测的开放项**。凡标注
+“推论”的条目在 gpfn3 数值 golden 之前不得当作签核依据。
+
+### 22.1 矩阵寄存器（手册直述，SDM pp.65, 111–116, 123–128）
+
+* 每个 MAB 一个 MAU，矩阵寄存器 **按 MAB** 共享，不按 PE 私有；两面
+  `$lx`/`$ly`，各面 **物理 16 行**。
+* 逻辑行数：d=4、f=8、g=8、h=16；物理行映射：double 用 0,4,8,12；single /
+  pseudo-single 用 0,2,…,14；half 用全部 16。
+* 逻辑列数：d 4×4、f/g 8×8、h 16×16。
+* **一行 = 每 PE 一个长语**（d 1×f64 / f 2×f32 / h 4×f16），分布在 MAB 的
+  4 个 PE 上。f32 显式映射：`fmwrite` 的 `refer_matreg[(addr+cycle)%8][j] =
+  src_data[j/2][j%2]`，即逻辑列 j ↔ PE j/2 的 32-bit word j%2。
+* f32 面向量 8 列里 **只有偶数逻辑列 0,2,4,6 被 matvec 使用**
+  （“単精度MAU演算ではMSB側単語を利用する”, p.136），故 matvec 的有效矩阵是
+  8 行 × 4 列。
+
+### 22.2 `fmfma` 语义（手册直述 + 伪码，p.114）
+
+单精度一条指令覆盖 **4 个 cycle**，同一面 A 不变，x/y/dst 按 cycle 取址：
+
+```
+for cycle = 0:4
+  A[8][8]      = refer_matreg(side, SingleWord)      ; 只用列 0,2,4,6
+  x[4]         = refer_pemem(src_x, cycle)           ; 每 PE 1 word
+  y[4][2]      = refer_pemem(src_y, cycle)           ; 每 PE 2 word
+  dst[i] += Σ(j=0..3) A[i][2j]*x[j] + y[i], i=0..7
+  refer_pemem(dst, cycle) = dst[pe*2:(pe+1)*2]
+```
+
+数学形式即 `dst = A·x + y`，行索引是输出索引（不是 `xᵀ·A`）。一条
+`fmfma` 的 4 个 cycle 各取一个 x，因此 **一条指令可以消费 B 的 4 列**，
+构成 8×4（M×K）乘 4×4（K×N）块的累积——这是由伪码推出的组成方式，
+手册并未把它描述成矩阵乘。
+
+其它精度：d `dmfma(u|d)` 4×4、K=4，u|d 选 4 行中的 2 行（另 2 行得
+0+y）；g `gmfma` 8×8、K=8（伪单精度，尾数 18 bit）；h `hmfma` 16×16、
+K=16，单精度累积。
+
+**ISA 没有矩阵×矩阵指令**：§3.6.9.1 只列 `mfma`（3 输入）与 `mmul`
+（y=0），每条只带一个矩阵面。
+
+### 22.3 `mwrite` / `mread`（pp.123–128）
+
+* `(f|g)mwrite <src> $l(x|y)<addr>`：一行/cycle，4 行/指令，行号
+  `(addr+cycle) mod 8`；两指令写满 8×8。src 的 word/longword 访问决定
+  每行取 2 还是 4 f32/PE。
+* `hmwrite` 的 `ll` 形式 2 行/cycle（addr 必须偶），8 行/指令。
+* `mread` 的地址是 **起始列号**，且是 **转置读**：PE 号 ↔ 行号，所以
+  “写入再读出 = 转置”。无“非转置读”指令。`mread` 纯按位复制，不做浮点
+  规范化（也可用于整数矩阵转置）。
+* 列为性能事实：`fmwrite` 一条指令 4 行，`fmread` 一条指令 4 列。
+
+### 22.4 与当前 Layer B 的已知差异（**未实测，阻塞 GEMM**）
+
+`MNCoreLowerTypedIntrinsics` 的 `Tok`/`TokSlot` 对 **所有** PE 操作数统一
+发 `width=2`（2 长语，4-cycle 区域 16 word）。矩阵三指令按 SDM 的每 cycle
+访问量应为：
+
+| 指令 | 操作数 | 每 cycle/PE | 4-cycle 区域 | 期望 width | 每 PE 值数 |
+|---|---|---|---|---|---|
+| `fmfma` | src_x | 1 word | 4 word | 0 (word) | 4 f32 |
+| `fmfma` | src_y / dst | 2 word | 8 word | 1 (longword) | 8 f32 |
+| `fmwrite` | src | 2 word | 8 word | 1 (longword) | 8 f32（4 行） |
+| `fmread` | dst | 2 word | 8 word | 1 (longword) | 8 f32（4 列） |
+
+而 Layer B 的 typed 签名（`matvec.v4f32(face, <4 x f32>, <4 x f32>)`、
+`matwrite`/`matread` 的 `<4 x f32>`）只给 4 f32，且宽度统一为 2。
+即 **值宽度与访问宽度都可能比 SDM 要求宽一档**。
+
+该差异目前只是“由伪码 + `accessRegionWords` 推出的不一致”，不是已测缺陷：
+向量路径（`vec.add` 等，同样是 width=2）已在 gpfn3 上元素级验证过，说明
+width=2 的 16-word 区域模型对 **向量** 指令是对的；矩阵指令是否共享同一
+约定，必须用 golden 实测，不能靠推断定案。**在实测闭合前，任何 GEMM
+lowering 都不得建立在这三条指令之上。**
+
+最小实测探针（待做）：`d set` 一段已知数据 → `l2bmb`/`l1bmp` 取出 →
+`fmwrite` 写入 A → `fmfma`（x/y 从另外的 PE 槽）→ `fmread` → `d get`，
+与 CPU 端 `dst = A·x + y` 逐元素比对；分别用 width=0/1/2 三种打包各跑一次，
+以确定每种操作数的合法宽度与数据落点。该探针同时能定 capacity
+（16 行 × 4 PE × 1 longword = 64 longword/面）与 `(addr+cycle)` 回绕。
+
+### 22.5 `tt.dot` 契约（已实现为 **fail-closed 门禁**）
+
+`third_party/mncore/lib/Conversion/TritonGPUToMNCore.cpp` 的
+`rejectDot` 在进入线性遍历前拒绝任何 `tt.dot`，并按失败子句给出诊断：
+
+1. 精度：只定义 f32（`fmfma`）。h/f64 需 `hmfma`/`dmfma`，未接线；
+   TF32/FP8 输入模式在 MAU 不存在。前端 `MncoreOptions` 已声明
+   `allowed_dot_input_precisions=("ieee",)`。
+2. 分块：矩阵面 8 行（M），一条 `fmfma` 覆盖 4 列（N）与 K=4，故
+   M%8、N%4、K%4 必须为 0。
+3. 布局：真实 `tl.dot` 到达的 `#ttg.dot_op<parent=#blocked>` 由
+   `fmaDotToLinearLayout` 生成，**把整个 K 维复制进每线程寄存器**
+   （32×32×32 时每线程 32 个 K 元素），而 MAU 需要 K 以 **每 MAB 每 PE
+   一个元素** 的形式进入矩阵面。两者不兼容，必须先给 mncore 专属 dot
+   布局，否则降级只会算错而非算慢。
+
+**状态**：`tl.dot` 前端可用（TTIR→TTGIR 通过，`#blocked` 给每线程 4×4
+C tile），mncore 侧为门禁 + 契约，尚无 lowering。回归：
+`third_party/mncore/tests/run_t9.py`（前端 + 三条拒绝子句）。
+
+### 22.6 未决项
+
+1. 22.4 的宽度差异（实测探针未做）。
+2. `v<adri>` 默认步长与 `fmfma` 4-cycle 地址推进的交互（手册未把两者
+   写在一起）。
+3. 矩阵读入 matvec 前必须 **块浮点 (BF) 转换**，且单精度 BF 块为 4 word
+   （每 PE 1 word）共用一个指数；不一致块为非法 BF，行为未定义。写 A 的
+   路径必须先做 BF 量化——这决定 `tt.dot` 的数值契约不是 IEEE f32。
+4. 单精度乘积省略两输入尾数低 5 bit（p.148），求和为精确整数加、最后
+   一次舍入；即 `fmfma` **不是** bit-exact IEEE FMA。任何数值 golden 必须
+   按该规则建模，不能用 `-ffast-math` 或双精度反推。

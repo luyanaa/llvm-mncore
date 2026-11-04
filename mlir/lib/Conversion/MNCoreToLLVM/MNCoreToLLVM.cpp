@@ -32,6 +32,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Target/MNCore/MNCoreIntrinsicOps.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTMNCORETOLLVMPASS
@@ -320,14 +321,34 @@ struct DmaLowering : OpConversionPattern<mncore::DmaOp> {
     };
 
     Value flags = c(op.getMvFlags());
+    // A relocatable source keeps the frozen `llvm.mncore.mv` ABI untouched:
+    // the address operand is the placeholder 0 and the record rides on the
+    // separate `llvm.mncore.mv.reloc` intrinsic (kernel ABI §13.2). The ODS
+    // accessor is uint32_t, so reinterpret the -1 sentinel as signed.
+    const int32_t srcArg = (int32_t)op.getSrcArg();
     Value src = callI64(
         "llvm.mncore.mvop",
-        {c(op.getSrcSpace()), c(op.getSrcAddr()), flags});
+        {c(op.getSrcSpace()),
+         c(srcArg >= 0 ? 0 : (int64_t)op.getSrcAddr()), flags});
     Value dst = callI64("llvm.mncore.mvop",
                         {c(2), c(op.getL2Addr()), flags});
     Value params = callI64("llvm.mncore.mvparams",
                            {c(op.getSize()), c(op.getTag()), c(-1), c(-1)});
-    callVoid("llvm.mncore.mv", {c(0), params, src, dst});
+    if (srcArg >= 0) {
+      llvm::mncore::RelocRecord R;
+      R.Arg = (unsigned)srcArg;
+      R.Space = op.getSrcSpace() == 1 ? llvm::mncore::RelocSpace::DRAM
+                                      : llvm::mncore::RelocSpace::PDM;
+      R.Unit = llvm::mncore::RelocUnit::Longword;
+      R.WidthBits = 32; // packMVOperand addr field: [35:4]
+      R.Operand = (unsigned)llvm::mncore::RelocOperand::Src;
+      R.Opcode = (unsigned)llvm::mncore::MVOp::MVP;
+      R.AddendUnits = (int64_t)op.getSrcAddr();
+      callVoid("llvm.mncore.mv.reloc",
+               {c(0), params, src, dst, c((int64_t)llvm::mncore::packReloc(R))});
+    } else {
+      callVoid("llvm.mncore.mv", {c(0), params, src, dst});
+    }
 
     Value l2 = callI64("llvm.mncore.lbop",
                        {c(1), c(op.getL2Addr()), c(1), c(0)});
@@ -370,11 +391,26 @@ struct DmaStoreLowering : OpConversionPattern<mncore::DmaStoreOp> {
 
     Value src = callI64("llvm.mncore.mvop",
                         {c(2), c(op.getL2Addr()), c(0)});
-    Value dst = callI64("llvm.mncore.mvop",
-                        {c(1), c(op.getDrAddr()), c(0)});
+    const int32_t drArg = (int32_t)op.getDrArg();
+    Value dst = callI64(
+        "llvm.mncore.mvop",
+        {c(1), c(drArg >= 0 ? 0 : (int64_t)op.getDrAddr()), c(0)});
     Value params = callI64("llvm.mncore.mvparams",
                            {c(op.getSize()), c(op.getTag()), c(-1), c(-1)});
-    callVoid("llvm.mncore.mv", {c(0), params, src, dst});
+    if (drArg >= 0) {
+      llvm::mncore::RelocRecord R;
+      R.Arg = (unsigned)drArg;
+      R.Space = llvm::mncore::RelocSpace::DRAM;
+      R.Unit = llvm::mncore::RelocUnit::Longword;
+      R.WidthBits = 32;
+      R.Operand = (unsigned)llvm::mncore::RelocOperand::Dst;
+      R.Opcode = (unsigned)llvm::mncore::MVOp::MVP;
+      R.AddendUnits = (int64_t)op.getDrAddr();
+      callVoid("llvm.mncore.mv.reloc",
+               {c(0), params, src, dst, c((int64_t)llvm::mncore::packReloc(R))});
+    } else {
+      callVoid("llvm.mncore.mv", {c(0), params, src, dst});
+    }
     rewriter.eraseOp(op);
     return success();
   }

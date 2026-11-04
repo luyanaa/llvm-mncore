@@ -24,11 +24,13 @@
 #include "MNCoreTargetMachine.h"
 #include "TargetInfo/MNCoreTargetInfo.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
@@ -36,6 +38,7 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/MNCore/MNCoreIntrinsicOps.h"
 #include "MCTargetDesc/MNCoreInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
@@ -54,6 +57,15 @@ class MNCoreAsmPrinter : public AsmPrinter {
   // emitter calls emitInstruction once per MachineInstr, so the run's
   // remaining NOPs are skipped here.
   SmallPtrSet<const MachineInstr *, 8> SuppressedNops;
+
+  // Relocation records emitted so far, in `.vsm` order (kernel ABI §13).
+  // The site number is the index; the sidecar block at end of file is this
+  // vector verbatim.
+  SmallVector<mncore::RelocRecord, 8> Fixups;
+
+  // Scratch record returned by getFixup(); owned here so the pointer stays
+  // valid for the duration of the emitInstruction call.
+  mncore::RelocRecord ThreadLocalFixup;
 
 public:
   static char ID;
@@ -74,11 +86,18 @@ public:
   // a 2-aligned address (3.6.1.6/.10). SelectionDAG/RA know nothing about
   // the physical encoding, so this is the last place to catch it.
   void validateRegOperands(const MachineInstr *MI);
+  // The packed relocation record carried by an `llvm.mncore.mv.reloc` line,
+  // or nullptr when the MI is not a relocatable MV command.
+  const mncore::RelocRecord *getFixup(const MachineInstr *MI);
+  // Render an MV line followed by its `# @mncore.fixup <site>` comment and
+  // record the site for the sidecar.
+  void emitFixupLine(const MachineInstr *MI, const mncore::RelocRecord &R);
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   void emitFunctionBodyStart() override;
   void emitFunctionBodyEnd() override;
+  void emitEndOfAsmFile(Module &M) override;
 };
 
 void MNCoreAsmPrinter::emitFunctionBodyStart() {
@@ -90,6 +109,73 @@ void MNCoreAsmPrinter::emitFunctionBodyStart() {
 void MNCoreAsmPrinter::emitFunctionBodyEnd() {
   // Kernels end at end-of-file; `quit` is optional and can be inserted
   // by an explicit pass when truncation is desired.
+}
+
+// An MV line selected from `llvm.mncore.mv.reloc` carries one operand more
+// than the instruction def declares: the packed relocation record. The MC
+// operand list is built from all machine operands (MNCoreMCInstLower), and
+// the generated printer only consumes the operands named in the asm string,
+// so the extra record is invisible in the instruction text and is picked up
+// here instead.
+const mncore::RelocRecord *
+MNCoreAsmPrinter::getFixup(const MachineInstr *MI) {
+  // TSFlags[21] marks an MV command line (MNCoreInstrFormats.td); the MV
+  // defs declare (params, src, dst) and nothing else, so four operands means
+  // the selection came from `llvm.mncore.mv.reloc`.
+  if (!((MI->getDesc().TSFlags >> 21) & 1) || MI->getNumOperands() != 4)
+    return nullptr;
+  const MachineOperand &MO = MI->getOperand(3);
+  if (!MO.isImm() || !mncore::hasReloc((uint64_t)MO.getImm()))
+    return nullptr;
+  ThreadLocalFixup = mncore::unpackReloc((uint64_t)MO.getImm());
+  return &ThreadLocalFixup;
+}
+
+void MNCoreAsmPrinter::emitFixupLine(const MachineInstr *MI,
+                                     const mncore::RelocRecord &R) {
+  unsigned Site = Fixups.size();
+  Fixups.push_back(R);
+
+  std::string ExprBuf;
+  raw_string_ostream ExprOS(ExprBuf);
+  emitExpressionText(MI, ExprOS);
+  ExprOS.flush();
+
+  // assemble3 ignores `#` comments; the loader keys on the site number.
+  std::string Line = "\t";
+  Line += StringRef(ExprBuf).trim().str();
+  Line += (" " + MAI.getCommentString() + " @mncore.fixup " + Twine(Site)).str();
+  OutStreamer->emitRawText(Line);
+}
+
+void MNCoreAsmPrinter::emitEndOfAsmFile(Module &M) {
+  // Sidecar (mncore_kernel_abi_v1.md §13.2). It is emitted as a comment
+  // block so a single .vsm stream carries both the instruction text and the
+  // relocation table; a loader strips the comments before assemble3 (§13.3
+  // step 4). `site` is the emission order and is unique per module.
+  if (Fixups.empty())
+    return;
+  // Raw text (not emitRawComment) so the exact bytes are fixed and testable;
+  // the format is `# <indent><key>: <value>`, one field per line.
+  auto emit = [&](const Twine &S) { OutStreamer->emitRawText("# " + S); };
+  emit("@mncore.fixup.begin");
+  emit("fixups:");
+  for (unsigned I = 0, E = Fixups.size(); I != E; ++I) {
+    const mncore::RelocRecord &R = Fixups[I];
+    emit("  - site: " + Twine(I));
+    emit("    arg: " + Twine(R.Arg));
+    emit(Twine("    space: ") +
+         (R.Space == mncore::RelocSpace::DRAM
+              ? "DRAM"
+              : R.Space == mncore::RelocSpace::PDM ? "PDM" : "L2BM"));
+    emit(Twine("    unit: ") +
+         (R.Unit == mncore::RelocUnit::Word ? "word" : "longword"));
+    emit("    addend_units: " + Twine(R.AddendUnits));
+    emit("    width_bits: " + Twine(R.WidthBits));
+    emit(Twine("    opcode: ") + mncore::mvOpcodeName(R.Opcode));
+    emit("    operand: " + Twine(R.Operand));
+  }
+  emit("@mncore.fixup.end");
 }
 
 void MNCoreAsmPrinter::validateRegOperands(const MachineInstr *MI) {
@@ -177,6 +263,18 @@ void MNCoreAsmPrinter::emitInstruction(const MachineInstr *MI) {
   if (!SuppressedNops.empty() && SuppressedNops.erase(MI))
     return;
   validateRegOperands(MI);
+
+  // A relocatable MV line renders through the custom path so the sidecar
+  // comment can ride on the same line. MV commands are never bundled with
+  // PE expressions, so reaching here inside a bundle would mean the
+  // packetizer merged an MV line, which the ISA forbids.
+  if (const mncore::RelocRecord *FR = getFixup(MI)) {
+    if (MI->isInsideBundle())
+      report_fatal_error(
+          "MN-Core2: a relocatable MV line must not be bundled");
+    emitFixupLine(MI, *FR);
+    return;
+  }
 
   // Consecutive bare `nop` steps (each its own MI, never bundled: nop is
   // exclusive with every expression but wait) fold into the manual's

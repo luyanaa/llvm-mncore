@@ -37,3 +37,19 @@ func.func @distributed_store(%v: vector<4xf32>) {
   "mncore.vec.store"(%v, %lb, %hi) <{mode = 3 : i64, set = 0 : i64}> : (vector<4xf32>, !mncore.token, !mncore.token) -> ()
   return
 }
+
+// ERR: a relocatable source must live in DRAM
+func.func @reloc_pdm() {
+  "mncore.dma"() <{src_space = 0 : i32, src_addr = 0 : i64, l2_addr = 0 : i64,
+                    l1_addr = 0 : i64, size = 64 : i64, tag = 1 : i32,
+                    src_arg = 0 : i32}> : () -> ()
+  return
+}
+
+// ERR: src_arg must be -1 (absolute address) or a kernel argument index
+func.func @reloc_arg_range() {
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 0 : i64, l2_addr = 0 : i64,
+                    l1_addr = 0 : i64, size = 64 : i64, tag = 1 : i32,
+                    src_arg = 300 : i32}> : () -> ()
+  return
+}
