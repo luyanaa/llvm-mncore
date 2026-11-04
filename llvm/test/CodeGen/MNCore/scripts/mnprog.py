@@ -101,6 +101,19 @@ def vec_len(t, width=1):
     return n
 
 
+def vec_count(t, width):
+    """Element count of a vector that must fit inside the file, else None.
+
+    parse() uses this for the two vectors it would otherwise allocate for.
+    A non-Program input (a truncated dump, a text file a failed compile left
+    behind) puts garbage in the length word; trusting it means a huge range()
+    and an OOM instead of a clean "not a Program".
+    """
+    if not ok(t, 8):
+        return None
+    return u64(t) if ok(t + 8, u64(t) * width) else None
+
+
 def root_kernel_table():
     """Program root -> kernels vector -> first Kernel table."""
     root = u64(0)
@@ -167,8 +180,12 @@ def parse(path):
     # instblock: field f4 -> Vector<ubyte>; data starts at L, length at L-8.
     ipos = f[4]
     itgt = ipos + u64(ipos)
+    if not ok(itgt, 8):
+        return None
     p["blk"] = u64(itgt)
     p["L"] = itgt + 8
+    if not ok(p["L"], p["blk"]):
+        return None
     p["tail"] = n - p["L"] - p["blk"]
     # arguments_type (f1): 1 byte per argument.
     apos = f[1]
@@ -178,7 +195,9 @@ def parse(path):
     # arguments (f2): union vector, one 8-byte offset per argument.
     ppos = f[2]
     ptgt = ppos + u64(ppos)
-    npay = u64(ptgt) if ok(ptgt, 8) else 0
+    npay = vec_count(ptgt, 8)
+    if npay is None:
+        return None
     for j in range(npay):
         e = ptgt + 8 + 8 * j
         if not ok(e, 8):
@@ -188,7 +207,9 @@ def parse(path):
     # fixups (f3): Vector<Fixup>, 24-byte structs.
     fxpos = f[3]
     fxtgt = fxpos + u64(fxpos)
-    nfx = u64(fxtgt) if ok(fxtgt, 8) else 0
+    nfx = vec_count(fxtgt, 24)
+    if nfx is None:
+        return None
     p["fixups"] = [(u64(fxtgt + 8 + 24 * j), u64(fxtgt + 16 + 24 * j),
                     u64(fxtgt + 24 + 24 * j)) for j in range(nfx)]
     # strings (f5): always an empty vector in practice.

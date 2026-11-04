@@ -109,6 +109,17 @@ if python3 -I $TD/scripts/check_prog.py $PR/gen16.bin nargs=6 >/dev/null 2>&1; t
 else
   echo "PASS prog:negative"
 fi
+# Negative fixture: a file that is not a Program must be rejected cleanly and
+# without a huge allocation.  A failed mnclc leaves text behind, and trusting
+# its vector lengths once drove the decoder into MemoryError.
+tmpp=$(mktemp "${TMPDIR:-/tmp}/progneg.XXXXXX")
+head -c 200 /dev/zero | tr '\0' '0' > $tmpp
+if python3 -I $TD/scripts/mnprog.py --check $tmpp >/dev/null 2>&1; then
+  echo "FAIL prog:not-a-program accepted"; fail=$((fail+1))
+else
+  echo "PASS prog:not-a-program"
+fi
+rm -f $tmpp
 
 # Program rebuild: reconstruct each fixture from its decoded fields with a
 # from-scratch 64-bit FlatBuffers writer and require byte identity.  This is

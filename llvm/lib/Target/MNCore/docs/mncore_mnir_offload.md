@@ -425,6 +425,15 @@ cd ~/hdrprobe && python3 -I mnprog.py --check *.bin
 （覆盖 0/1/3/6/12 个 fixup、0–7 个实参、空镜像 `ke.bin`、以及此前被当成
 "另一种布局"的 `gen16.bin`）。
 
+**全语料广度（2026-11-04，`suzhou`）**：`mncl_samples` 的 106 个 `.bin` 中
+**105 个是合法 Program 且 `--check` 全过**（逐文件加 `timeout` 与内存上限跑的，
+不是一次批量）。第 106 个 `wrapped42.bin`（551 B）**根本不是 Program**：它是
+某次编译失败留下的 ASCII 文本（内容为 `0`/`1` 与换行），不是截断的二进制。
+这次运行顺带暴露了解码器的一个真实缺陷——它曾无条件信任向量长度字段，遇到
+该文件时按垃圾长度申请内存、撑到 2 GB 被 OOM kill（整批 `rc=137`）；现在
+`vec_count()` 要求长度字段描述的对象必须落在文件内，同一文件 0.01 s 内返回
+`not a mncore::Program`。这条已作为回归负例（"非 Program 输入必须被拒"）。
+
 **仍未定死的只有一处：`Target` 的非 0 取值。** `mnclc -t MNCore1/3` 直接崩溃
 （栈回溯在编译器里），MNIR 路径还硬断言 `target == Target::MNCore2`，所以
 除 0 以外的枚举值**没有任何可产出的样本**。这不是没查到，是这套工具链
@@ -454,8 +463,10 @@ llvm/test/CodeGen/MNCore/scripts/mnprog.py                    解码器（parse/
 llvm/test/CodeGen/MNCore/scripts/check_prog.py                逐字段钉住期望值
 llvm/test/CodeGen/MNCore/scripts/mnprog_build.py              从零 64 位 FlatBuffers
                                                               构造器（--write / 比对）
-scripts/run_regression.sh 的 "Program container schema" 阶段  4 正 + 1 负（负例断言
-                                                              错误期望必须被拒绝）
+scripts/run_regression.sh 的 "Program container schema" 阶段  4 正 + 2 负（错误期望
+                                                              必须被拒；非 Program
+                                                              文本也必须被拒且不能
+                                                              大量申请内存）
 scripts/run_regression.sh 的 "Program rebuild" 阶段            4 个 fixture 重建后必须
                                                               逐字节 IDENTICAL + 1 负
                                                               （截断 8 B 必须被拒）
