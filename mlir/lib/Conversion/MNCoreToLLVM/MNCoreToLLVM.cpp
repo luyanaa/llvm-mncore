@@ -361,7 +361,12 @@ struct DmaStoreLowering : OpConversionPattern<mncore::DmaStoreOp> {
 
     Value l1 = callI64("llvm.mncore.lbop", {c(0), c(op.getL1Addr()), c(1), c(0)});
     Value l2 = callI64("llvm.mncore.lbop", {c(1), c(op.getL2Addr()), c(1), c(0)});
-    callVoid("llvm.mncore.l2b", {c(1), c(0), l1, l2});
+    // Point transfer `l2bm@<l1b>`: the L1BM plane is replicated across L1Bs,
+    // so one L1B's stream is the whole plane. `l2bmd` (the collect form)
+    // would interleave eight identical 8-longword chunks instead.
+    callVoid("llvm.mncore.l2b",
+             {c(static_cast<int64_t>(mncore::L2BKind::L2BMPT)), c(op.getL1b()),
+              l1, l2});
 
     Value src = callI64("llvm.mncore.mvop",
                         {c(2), c(op.getL2Addr()), c(0)});

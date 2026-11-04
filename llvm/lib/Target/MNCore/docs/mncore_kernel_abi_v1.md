@@ -708,17 +708,33 @@ MVInstr     { opcode; params; Operand src, dst; }
 * E4 仍需真实设备（本环境仅 emu2）。
 
 
-**E0 覆盖实测（后端语料，2026-11-04 第二次重分类）**
-`encoder/canonical.py` 对 `/tmp/*.vsm` 语料（114 个文件）逐指令分类：
-* 完全可编码（E0-template 或 E0-exact）：**8 个文件**；
-* 存在缺口的文件：106 个。剩余 UNKNOWN 按频次排序（前 20）：
-  fvfma(31) l1bmm@(25) l2bmd(22) fvadd(20) mvp/n64i01-06(合计40)
-  fmin+fmin/0111+fmax(22) lpassa(13) l1bmrffadd+变种(24) l1bmm4/@(13)
-  l2bmdarw/s(12) fvpassa(8) dvpassa(7) dvadd(6) mvp/mvb2/mvd/mvr(12)
-  dmfmau/gmmul/hmmul/gmwrite/hmwrite/hmread(15) wait(5) l2bmb@0/3+@[0,1](8)
-  l2bm@5(4) l2bmrffadd@0/l2bmr2ffadd(8) maskrs(3) quit(3) 尾项若干。
-* **/0111-masked 文本已证实在 value-builtin 面上不可达**（无 mask-flag
-  表层）；只能由 mnclc 在循环/掩码代码路径自身发射，或保持 fail closed。
+**E0 覆盖实测（后端语料，2026-11-04 第五次重分类，post-gen24）**
+`encoder/canonical.py` 对 `/tmp/*.vsm` 语料（122 个文件）逐指令分类：
+* 完全可编码（E0-template 或 E0-exact）：**26 个文件**；
+* 存在缺口的文件：96 个。剩余 UNKNOWN 按频次排序：
+  l2bmd(29) l1bmm@(21) fmin(14)+fmin/0111(3)+fmax(5) lpassa(13)
+  mvp/n64i02-06(35) l2bmdarw(8)+l2bmdars(4) wait(5) maskrs(3) quit(3)
+  l2bmb@0/3(4) l2bm@0(4) mvp/n256nd4(3) mvb2/n64(3) mvr2dfadd/n64(3) mvd/n64(3)
+  l1bmp/0111(2) mvp/n64(2) 尾项若干（各 1）。
+* 新增模板 257 条（post-gen5 → post-gen24：118 → 375），覆盖
+  `l1bmr_ffadd/fmax/fmin`、`l2bmr_ffadd/fmax/fmin`、`mvr_ffadd/fmax/fmin`、
+  `fvadd/fvmul/fvfma`、`dvadd/dvmulu/dvmuld/dvfmau/dvfmad`、
+  `hvmul/hvadd/hvfma/hvpassa`、`dmwrite/dmread/dmmulu/dmfmau`、
+  `mvp/n1024i01`、`mvp/n64i01`、`nop; wait i01`、
+  `l1bmm4@N`、`l2bmb@N/0`、`l2bmb2`、`l2bmr2_*`、`l2bmi@0/5`、
+  `dmax/dmin`、`hbfn/8`、`hbfe/6`、`msl/msr`、`l1bmd`/`l1bmd+N`、
+  及 gen14 附带的大量 `ilsl/ior/uipassa/uilsr` 寄存器初始化序列。
+* **不可达类（fail closed 或需非-builtin 路径）**：
+  `l2bmd`/`l2bmdarw`/`l2bmdars`（LM0 保留/未实现）、
+  `/0111`-masked 文本（无 mask-flag 表层）、
+  `wait`/`maskrs`/`quit`（调度器发射）、
+  `mvp/nNNNi02-i06`（调度器分配的依赖标签）、
+  `lpassa`（无对应 builtin）。
+* **VSM→MNIR 映射**：canonical.py 新增 `vsm_to_mnir_text()`，
+  处理 `l1bmm@N $src $dst` → `l1bmm@N $src -> $dst`、
+  `mvp/nNNNiNN $src $dst` → `mvp/nNNNiNN $src -> $dst`、
+  `l2bmb@[a,b]` → `l2bmb2`、`l2bmb@N/M` → `l2bmb@N/M`、
+  及 `VSM_TO_MNIR` opcode 表（reduce/dv/hv/dm/fv/l1bmm4/l2bmi/dmax/hbfn 家族）。
 早期按 6 测试组的手工清单（alu/mau/l1bml2bm/mv/mask/imm-fixed）已由模板表驱动
 的自动分类取代。同一 oracle 循环继续补齐其余类。**“E0 完全覆盖”验收标准不变**：
 对后端语料（排除 emulator-only `d get/set`）`canonical.py` 报告 100% 可编码。

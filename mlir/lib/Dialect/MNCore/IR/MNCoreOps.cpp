@@ -73,6 +73,7 @@ MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMD);
 
 MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMB);
 MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMDC);
+MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMPT);
 
 MNCORE_ENUM_SYNC(MVOp, MVOp, MVP);
 
@@ -355,6 +356,8 @@ LogicalResult DmaStoreOp::verify() {
     return emitOpError() << "size must fit 32 bits, got " << getSize();
   if (getTag() == 0 || getTag() > 0xff)
     return emitOpError() << "tag must be 1..255";
+  if (getL1b() < 0 || getL1b() > 7)
+    return emitOpError() << "l1b must be an L1B index 0..7, got " << getL1b();
   for (auto [name, addr] : {std::pair{"l1_addr", getL1Addr()},
                             std::pair{"l2_addr", getL2Addr()},
                             std::pair{"dr_addr", getDrAddr()}}) {

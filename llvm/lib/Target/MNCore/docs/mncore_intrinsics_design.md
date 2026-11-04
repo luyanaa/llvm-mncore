@@ -309,25 +309,39 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
   19=h-mwrite 20=d-mread 21=h-mread；`alu` 10=dmax 11=dmin 12=hmax
   13=hmin。f 精度沿用 0..6。
 
-### 14.1a L1B collect 的 MAB 语义 (2026-11-04 数值发现)
+### 14.1a L1B collect 的 MAB 语义 (2026-11-04，已实测更正)
 
-分布式写回（PE→L1BM）的方向**不是** load 的简单逆操作：
+SDM §3.6.8.21 的效果式给出精确语义：
 
-* `l1bmd $pe $lb<addr>`（`L1BMD_C`，无 `mabdiff`）只采集**一个 MAB 的 4 个
-  lane**，并按硬件 L1B subset 布局写入；`d get` 单个 subset 看到的是重复值。
-* gpfn3 实测 `mabdiff` 以 **4 lane** 为步进旋转：
-  `+1 → MAB15/lane61`，`+2 → 57`，`+3 → 53`；
-  `-1 → 5`，`-2 → 9`，`-3 → 13`（lane 0..63，值 = lane+1）。
-* 因此覆盖全部 64 PE 需要 **16 次 collect**（`mabdiff = 0,-1,…, -15` 或其
-  等价旋转），每次落到不同的 L1BM subset；再经 `l2bmd` 汇总到 L2BM。
-* 当前 `mncore.vec.store` 的 Distributed 路径只发 **每平面一次 collect**，
-  所以只把 4/64 个 lane 的值写回并在 DRAM 中重复。**变值输入的 E2E 会失败**
-  （`run_e2e_add.py` 的多重集对拍已捕获）；常量输入会掩盖该错误。
+```
+for cycle = 0:4
+  forall mab, pe:
+    dst_mab = (mab + mabdiff) % 16
+    data[dst_mab*4 + pe] = PE[mab][pe]
+  L1BM[addr_b + cycle*64 : +64] = data[0:64]
+```
 
-**结论**：store 路径要正确，必须实现 16 路 `mabdiff` 旋转调度与对应的
-L1BM subset→L2BM→DRAM 映射；这需要 SDM §3.6.8.21 与 §3.7 的 subset 布局
-定义。load 路径（`l1bmd` 分发 64 个连续 L2BM longword 到 64 PE）是良定义的，
-已数值验证。
+* **一次 `l1bmd` collect 写入全部 64 lane**（每 cycle 64 长语 × 4 cycle）。
+  `mabdiff` 是 **MAB 编号旋转（置换）**，不是掩码：`+k` 时
+  `dest[j] = lane[(j - 4k) mod 64]`，`-k` 时 `dest[j] = lane[(j + 4k) mod 64]`
+  （j 的低 2 位 = PE 号保持不变）。gpfn3 实测 `+1 → lane61`、`-1 → lane5`
+  与上式一致。
+* 之前"每次 collect 只取 4 lane、需 16 次旋转 collect"的结论**错误**，
+  已由 §3.6.8.21 原文和直接 gpfn3 探针推翻；`mabdiff` 只用于把某个 MAB 的
+  数据搬到另一个 MAB 槽位，不承担覆盖率职责。
+* 唯一的硬件约束：collect 的 `$lb` 目标地址必须 **64 长语对齐**（assemble3
+  报 `L1BM address for combining operation must be aligned to the multiple
+  of 64`）。
+* 因此 Distributed 写回只需**每平面一次 collect**。E2E 的真实故障不在
+  collect，而在其后的 L1BM→L2BM：`l2bmd`（§3.6.7.8）按
+  `data[8*l1b : 8*l1b+8] = L1BM[l1b][…]` 从 **8 个 L1B 依次各取 8 长语**
+  拼接。Triton 的 distributed tile 在各 L1B 上是**复制**的，于是 collect
+  把 8 份相同的 8 长语块交织进 L2BM，平面被打散。写回改用
+  `l2bm@<l1badr>`（§3.6.7.5，单 L1B 点对点搬运 16 长语/cycle）取 L1B 0
+  的连续 64 长语即可，DRAM 与 CPU golden 逐元素一致
+  （`tests/run_e2e_add.py` 通过）。`l2bmd` 只在各 L1B 持有互不相同的数据时
+  才是正确原语。
+
 
 ### 14.1 分配器 v2.1 (2026-11-04)
 

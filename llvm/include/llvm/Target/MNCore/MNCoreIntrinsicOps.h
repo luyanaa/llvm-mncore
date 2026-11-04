@@ -75,8 +75,13 @@ enum class L1BOp : int64_t {
 
 // llvm.mncore.l2b(opcode, set, a, b)
 enum class L2BOp : int64_t {
-  L2BMB = 0,  // L2BM -> L1BM broadcast
-  L2BMDC = 1, // L1BM -> L2BM collect
+  L2BMB = 0,  // L2BM -> L1BM broadcast;            set = @<l1bset>
+  L2BMDC = 1, // L1BM -> L2BM collect (all L1Bs);   set = unused
+  // L1BM -> L2BM point transfer from one L1B: `l2bm@<l1badr>` (SDM 3.6.7.5).
+  // Unlike the collect it copies one L1B's 16-longword-per-cycle stream
+  // verbatim, so a replicated (SPMD) L1BM plane lands contiguously in L2BM
+  // instead of being interleaved in 8-longword chunks across the 8 L1Bs.
+  L2BMPT = 2, // set = <l1badr> (0-7)
 };
 
 // llvm.mncore.mv(opcode, params, src, dst)

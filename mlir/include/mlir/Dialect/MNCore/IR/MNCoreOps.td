@@ -96,9 +96,10 @@ def MNCore_L1BEnum : I64EnumAttr<"L1BKind", "MN-Core L1BM opcode", [
 
 def MNCore_L2BOp_L2BMB  : I64EnumAttrCase<"L2BMB", 0>;
 def MNCore_L2BOp_L2BMDC : I64EnumAttrCase<"L2BMDC", 1>;
+def MNCore_L2BOp_L2BMPT : I64EnumAttrCase<"L2BMPT", 2>;
 
 def MNCore_L2BEnum : I64EnumAttr<"L2BKind", "MN-Core L2BM opcode", [
-  MNCore_L2BOp_L2BMB, MNCore_L2BOp_L2BMDC,
+  MNCore_L2BOp_L2BMB, MNCore_L2BOp_L2BMDC, MNCore_L2BOp_L2BMPT,
 ]> {
   let cppNamespace = "::mlir::mncore";
 }
@@ -307,9 +308,15 @@ def MNCore_DmaOp : MNCore_Op<"dma", [
   let hasVerifier = 1;
 }
 
-// L1BM -> L2BM -> DRAM copy: one L2B collect transfer plus one MV command.
-// Addresses are longword units. The caller is responsible for the matching
-// wait on `tag` before reusing the L1BM/L2BM region.
+// L1BM -> L2BM -> DRAM copy. Addresses are longword units. The caller is
+// responsible for the matching wait on `tag` before reusing the L1BM/L2BM
+// region.
+//
+// The transfer is `l2bm@<l1b>`, the single-L1B point form (SDM 3.6.7.5), not
+// `l2bmd` (3.6.7.8). A Triton "distributed" tile is replicated: every L1B
+// holds the same plane, so `l2bmd` would interleave eight identical
+// 8-longword chunks into L2BM and destroy the plane. `l2bmd` is only correct
+// when the L1Bs hold disjoint data, which this ABI does not produce yet.
 def MNCore_DmaStoreOp : MNCore_Op<"dma.store", [
     MemoryEffects<[
       MemRead<MNCore_DeviceMem>, MemWrite<MNCore_DeviceMem>,
@@ -317,7 +324,8 @@ def MNCore_DmaStoreOp : MNCore_Op<"dma.store", [
     ]>]> {
   let summary = "L1BM -> L2BM -> DRAM copy";
   let arguments = (ins I64Attr:$l1_addr, I64Attr:$l2_addr, I64Attr:$dr_addr,
-                       I64Attr:$size, I32Attr:$tag);
+                       I64Attr:$size, I32Attr:$tag,
+                       DefaultValuedAttr<I32Attr, "0">:$l1b);
   let hasVerifier = 1;
 }
 

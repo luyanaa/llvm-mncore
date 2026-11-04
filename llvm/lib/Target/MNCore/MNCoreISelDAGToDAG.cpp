@@ -539,6 +539,12 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
         Opc = MNCore::L2BMD_C;
         MO = {L1BForL2B(N->getOperand(4)), TC(5), N->getOperand(0)};
         break;
+      case (int)mncore::L2BOp::L2BMPT:
+        // (l1badr, src L1B, dst L2BM): `l2bm@<l1badr>` point transfer. The
+        // L1B selector rides in the `set` argument (operand 3).
+        Opc = MNCore::L2BM_PT;
+        MO = {TC(3), L1BForL2B(N->getOperand(4)), TC(5), N->getOperand(0)};
+        break;
       default:
         report_fatal_error("MN-Core2: mncore.l2b opcode id not mapped yet");
       }

@@ -181,11 +181,14 @@ LLVM → .vsm → assemble3 → gpfn3` 已跑通：
   `mncore.dma` + `mncore.vec.load/store` + `mncore.dma.store`；
 * **load 路径数值正确**：DRAM 0..63 写入 1..64，经 MV→L2B→l1bmd 后，PE
   (m,p) 读到 `4m+p+1`，逐 lane 验证通过；
-* **store 路径未闭合**：`l1bmd` collect 只采集一个 MAB（4 lane），`mabdiff`
-  以 4 lane 旋转移位；正确写回需要 **16 次旋转 collect** 与 L1BM subset
-  布局（SDM §3.6.8.21/§3.7）。当前每平面一次 collect，因此变值输入在 DRAM
-  中重复/错位；`run_e2e_add.py` 的多重集对拍会失败，常量输入会掩盖该问题。
-  这是当前 M1 的唯一数值阻塞。
+* **store 路径已数值闭合**（2026-11-04）：`l1bmd` collect 一次写入全部 64
+  lane（SDM §3.6.8.21：`data[(mab+mabdiff)%16*4+pe] = PE[mab][pe]`）；
+  `mabdiff` 是 MAB 旋转置换，不是掩码。E2E 的真实错位来自
+  L1BM→L2BM：`l2bmd` 按 `data[8*l1b:+8]` 从 8 个 L1B **各取 8 长语**
+  拼接，而 Triton distributed tile 在各 L1B 上复制，导致 8 份相同块交织、
+  平面被打散。写回改为 `l2bm@0`（§3.6.7.5 单 L1B 点对点）后，
+  `tests/run_e2e_add.py` 的 4 组 DRAM 与 CPU golden **逐元素一致**，物理
+  顺序即逻辑顺序（permutation = identity）。
 
 **更早的合法化诊断**（已闭合）是 `unsupported kernel argument type
 '!tt.ptr<f32>'`；指针/整 tile 下降现已实现。对 Triton 自带的 62 个 TTGIR 测试做了一次语料扫描：0 个可被
