@@ -9,8 +9,9 @@ MNIR / MN-Core 运行时，最终做到动态 offload。** 所有结论都在 `s
 ## 0. 结论摘要（先看这一段）
 
 1. **MNIR 是编译器 IR，不是运行时格式。** 设备唯一可装载的二进制是
-   `mncore::Program`（FlatBuffers）：**变长头 + N×128 B 指令块**。MNIR
-   （文本或二进制 AST）只是生产 Program 的一种输入。
+   `mncore::Program`（64 位 FlatBuffers：前缀 + 内嵌的指令镜像 + 尾部实参区，
+   schema 已完整反解，见 §6 A.1）。MNIR（文本或二进制 AST）只是生产 Program
+   的一种输入。
 2. **供应商的 MNIR 只提供了两个可用接缝**：
    * `mncl::mnir::Driver::CompileAll()` —— 输入 `.mnir`/`.mnbc`，输出
      `mncore::Program`；**已验证可用**；
@@ -71,7 +72,7 @@ MNIR 文本格式本身是公开文档化的——坏的不是语法，是实现
 
 | 容器 | 生产者 | 消费者 | 特征 |
 |---|---|---|---|
-| **`mncore::Program`** | `mnclc -o`、`Driver::CompileAll` | 设备 runtime（cl API） | 变长 FlatBuffers 头 + N×128 B 块 |
+| **`mncore::Program`** | `mnclc -o`、`Driver::CompileAll` | 设备 runtime（cl API） | 64 位 FlatBuffers：前缀 + 内嵌镜像 + 尾部实参区（§2 下文） |
 | **GPFN app** | `assemble3 --binary` / `--app2` | `gpfn3_package_main`（仿真器） | `--binary` 在偏移 **64** 有 magic `"GPFN3"`；`--app2` 是另一版本，无该 magic |
 | **裸 `.vsm` 文本** | `llc`（本后端） | `assemble3` | 每行一条指令 |
 
@@ -368,7 +369,8 @@ Finish 之后文件从 root 开始，于是得到 §2 的三段式布局。
 64 / 128 / 192 三种值：指针实参 0–2 个 → 64 B，3–5 个 → 128 B，6–8 个 →
 192 B（gen16 的 7 个实参正好 192）；每含一个**标量**实参再加 64 B
 （2 实参含 1 个 `f64` 标量 → 128 B；上表 Ls1 的 3 实参含 1 标量 → 192 B）。
-它们是"对象大小向上取整到 8 字节"的自然结果，解码时直接算，不要当公式用。
+它由这三样的实际大小逐项相加得到（向量 = 8 B 长度字段 + 数据，空 payload
+表 8 B 或 12 B），**不必记档位**——解码时直接读 `L`/`blk` 求 `tail`。
 
 **复现**（`tools/mnir_probe/mnprog.py`，见 §7）：
 
