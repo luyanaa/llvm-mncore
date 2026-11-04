@@ -305,7 +305,7 @@ unsigned long>` 的 `size_type = unsigned long` 也印证了这一点。
 | Kernel.name | 内核名 | `k`→`kk` 差分只改长度字节与第二个字符 |
 | f1 arguments_type | 每实参 1 字节 | `DRAM i32*` → `01`；`i32/i16/i64/f32/f64` 标量 → `02`（见下） |
 | f2 arguments | 每实参一个 union payload 表 | 见"payload 规则" |
-| f3 fixups | 24 B struct 向量 | 4 个 fixup ⇒ 向量占 `8+96`，镜像长度字段正好后移 96 B；12 个 ⇒ 288 B |
+| f3 fixups | 24 B struct 向量 | 同一内核、同样 2 个指针实参：1 个 fixup → `L=192`（gen28），3 个 → 256（gen26），12 个 → 448（gen47）；每项 24 B，1→3 的增量有一部分被对齐吃掉，所以不能按 24 B 逐项外推 |
 | f4 instblock | 镜像本体 | 长度字段的值 = `--dump` 的 `size of instblock`，数据段逐字节 = 镜像 |
 | f5 strings | 未用 | 116 个 `mncl_samples` + 全部实验核里长度恒为 0，且位置固定在 kernel table 之后 |
 
