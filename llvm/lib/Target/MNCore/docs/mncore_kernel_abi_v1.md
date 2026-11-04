@@ -708,19 +708,20 @@ MVInstr     { opcode; params; Operand src, dst; }
 * E4 仍需真实设备（本环境仅 emu2）。
 
 
-**E0 覆盖实测（后端语料，2026-11-04）**
-`encoder/canonical.py` 对 llc 产出的 .vsm 逐指令分类：
-| 测试 | 可编码/总数 | 说明 |
-|---|---|---|
-| alu-emit | 0/23 | 全部 ALU 类待编码 |
-| mau-emit | 4/21 | 仅 nop 模板；fmfma 等待编码 |
-| l1bml2bm-emit | 8/37 | 仅 nop 模板；L1BM/L2BM 全部待编码 |
-| mv-emit | 2/8 | mvnop/nop 模板；MV/wait 待编码 |
-| mask-emit | 1/10 | 掩码 `/0111` 不支持 |
-| imm-fixed-emit | 12/23 | imm/immu/ipassa 已过；其余待编码 |
-这是 E0 完成度的量化缺口。每类按同一 oracle 流程补齐：`--dump` 一变量对
-→ FieldMap → E0 → E1/E2/E3。**“E0 完全覆盖”的验收标准**：对后端语料
-（排除 emulator-only 的 d get/set）`canonical.py` 报告 100% 可编码。
+**E0 覆盖实测（后端语料，2026-11-04 第二次重分类）**
+`encoder/canonical.py` 对 `/tmp/*.vsm` 语料（114 个文件）逐指令分类：
+* 完全可编码（E0-template 或 E0-exact）：**8 个文件**；
+* 存在缺口的文件：106 个。剩余 UNKNOWN 按频次排序（前 20）：
+  fvfma(31) l1bmm@(25) l2bmd(22) fvadd(20) mvp/n64i01-06(合计40)
+  fmin+fmin/0111+fmax(22) lpassa(13) l1bmrffadd+变种(24) l1bmm4/@(13)
+  l2bmdarw/s(12) fvpassa(8) dvpassa(7) dvadd(6) mvp/mvb2/mvd/mvr(12)
+  dmfmau/gmmul/hmmul/gmwrite/hmwrite/hmread(15) wait(5) l2bmb@0/3+@[0,1](8)
+  l2bm@5(4) l2bmrffadd@0/l2bmr2ffadd(8) maskrs(3) quit(3) 尾项若干。
+* **/0111-masked 文本已证实在 value-builtin 面上不可达**（无 mask-flag
+  表层）；只能由 mnclc 在循环/掩码代码路径自身发射，或保持 fail closed。
+早期按 6 测试组的手工清单（alu/mau/l1bml2bm/mv/mask/imm-fixed）已由模板表驱动
+的自动分类取代。同一 oracle 循环继续补齐其余类。**“E0 完全覆盖”验收标准不变**：
+对后端语料（排除 emulator-only `d get/set`）`canonical.py` 报告 100% 可编码。
 
 
 **assemble3 292-bit 解码启动（2026-11-04）**

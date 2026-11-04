@@ -2,7 +2,7 @@
 ;
 ; Distributed load (SDM 3.6.8.20): l1bmd has no double-longword form, so a
 ; 4xf32/PE vector is two transfers, one per longword plane. The PE slot's
-; longwords are addressed W/2 and W/2+2.
+; longwords are addressed W/2 and W/2+4.
 
 target triple = "mncore2"
 

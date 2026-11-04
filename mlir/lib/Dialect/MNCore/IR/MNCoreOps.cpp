@@ -72,6 +72,7 @@ MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMM4);
 MNCORE_ENUM_SYNC(L1BKind, L1BOp, L1BMD);
 
 MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMB);
+MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMDC);
 
 MNCORE_ENUM_SYNC(MVOp, MVOp, MVP);
 
@@ -344,6 +345,22 @@ LogicalResult DmaOp::verify() {
   }
   if (getMvFlags() & ~uint32_t{0xf})
     return emitOpError() << "unknown MV flag bits in " << getMvFlags();
+  return success();
+}
+
+LogicalResult DmaStoreOp::verify() {
+  if (getSize() == 0)
+    return emitOpError() << "size must be nonzero";
+  if (getSize() > 0xffffffffULL)
+    return emitOpError() << "size must fit 32 bits, got " << getSize();
+  if (getTag() == 0 || getTag() > 0xff)
+    return emitOpError() << "tag must be 1..255";
+  for (auto [name, addr] : {std::pair{"l1_addr", getL1Addr()},
+                            std::pair{"l2_addr", getL2Addr()},
+                            std::pair{"dr_addr", getDrAddr()}}) {
+    if (addr > 0xffffffffULL)
+      return emitOpError() << name << " must fit 32 bits, got " << addr;
+  }
   return success();
 }
 

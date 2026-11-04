@@ -501,14 +501,49 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       auto *OpcC = dyn_cast<ConstantSDNode>(N->getOperand(2));
       if (!OpcC)
         report_fatal_error("MN-Core2: mncore.l2b needs a constant opcode");
-      if (OpcC->getZExtValue() != 0)
-        report_fatal_error("MN-Core2: mncore.l2b opcode id not mapped yet");
       auto TC = [&](unsigned I) -> SDValue {
         return Fold(N->getOperand(I));
       };
-      SmallVector<SDValue, 4> MO{TC(3), TC(4), TC(5), N->getOperand(0)};
+      // The L1B side of an L2BM expression uses the [35:4] address field
+      // (addr<<4), unlike an L1BM expression ($lb, addr<<2). Repack it here;
+      // a plain `lbop` token cannot know which consumer it feeds.
+      auto L1BForL2B = [&](SDValue V) -> SDValue {
+        if (auto *C = dyn_cast<ConstantSDNode>(V))
+          return CurDAG->getTargetConstant(C->getZExtValue(), DL, MVT::i64);
+        if (V.getOpcode() != ISD::INTRINSIC_WO_CHAIN)
+          report_fatal_error(
+              "MN-Core2: L2BM L1B operand is not an lbop token");
+        auto *IDC = dyn_cast<ConstantSDNode>(V.getOperand(0));
+        if (!IDC)
+          report_fatal_error("MN-Core2: malformed lbop token");
+        StringRef TN = Intrinsic::getName((Intrinsic::ID)IDC->getZExtValue());
+        if (TN != "llvm.mncore.lbop")
+          report_fatal_error(
+              "MN-Core2: L2BM L1B operand is not an lbop token");
+        if (ConstOf(V, 1) != 0)
+          report_fatal_error(
+              "MN-Core2: L2BM L1B operand must use the L1B space");
+        return CurDAG->getTargetConstant(
+            (uint64_t)(ConstOf(V, 2) & 0x1fff) << 4, DL, MVT::i64);
+      };
+      unsigned Opc;
+      SmallVector<SDValue, 4> MO;
+      switch (OpcC->getZExtValue()) {
+      case (int)mncore::L2BOp::L2BMB:
+        // (set, src L2BM, dst L1B)
+        Opc = MNCore::L2BMB;
+        MO = {TC(3), TC(4), L1BForL2B(N->getOperand(5)), N->getOperand(0)};
+        break;
+      case (int)mncore::L2BOp::L2BMDC:
+        // (src L1B, dst L2BM); no l1bset operand.
+        Opc = MNCore::L2BMD_C;
+        MO = {L1BForL2B(N->getOperand(4)), TC(5), N->getOperand(0)};
+        break;
+      default:
+        report_fatal_error("MN-Core2: mncore.l2b opcode id not mapped yet");
+      }
       MachineSDNode *M = CurDAG->getMachineNode(
-          MNCore::L2BMB, DL, CurDAG->getVTList(MVT::Other), MO);
+          Opc, DL, CurDAG->getVTList(MVT::Other), MO);
       ReplaceNode(N, M);
       return;
     }

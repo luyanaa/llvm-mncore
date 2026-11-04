@@ -94,10 +94,11 @@ def MNCore_L1BEnum : I64EnumAttr<"L1BKind", "MN-Core L1BM opcode", [
   let cppNamespace = "::mlir::mncore";
 }
 
-def MNCore_L2BOp_L2BMB : I64EnumAttrCase<"L2BMB", 0>;
+def MNCore_L2BOp_L2BMB  : I64EnumAttrCase<"L2BMB", 0>;
+def MNCore_L2BOp_L2BMDC : I64EnumAttrCase<"L2BMDC", 1>;
 
 def MNCore_L2BEnum : I64EnumAttr<"L2BKind", "MN-Core L2BM opcode", [
-  MNCore_L2BOp_L2BMB,
+  MNCore_L2BOp_L2BMB, MNCore_L2BOp_L2BMDC,
 ]> {
   let cppNamespace = "::mlir::mncore";
 }
@@ -303,6 +304,20 @@ def MNCore_DmaOp : MNCore_Op<"dma", [
                        I64Attr:$l2_addr, I64Attr:$l1_addr,
                        I64Attr:$size, I32Attr:$tag,
                        DefaultValuedAttr<I32Attr, "0">:$mv_flags);
+  let hasVerifier = 1;
+}
+
+// L1BM -> L2BM -> DRAM copy: one L2B collect transfer plus one MV command.
+// Addresses are longword units. The caller is responsible for the matching
+// wait on `tag` before reusing the L1BM/L2BM region.
+def MNCore_DmaStoreOp : MNCore_Op<"dma.store", [
+    MemoryEffects<[
+      MemRead<MNCore_DeviceMem>, MemWrite<MNCore_DeviceMem>,
+      MemRead<MNCore_MVChannel>, MemWrite<MNCore_MVChannel>
+    ]>]> {
+  let summary = "L1BM -> L2BM -> DRAM copy";
+  let arguments = (ins I64Attr:$l1_addr, I64Attr:$l2_addr, I64Attr:$dr_addr,
+                       I64Attr:$size, I32Attr:$tag);
   let hasVerifier = 1;
 }
 

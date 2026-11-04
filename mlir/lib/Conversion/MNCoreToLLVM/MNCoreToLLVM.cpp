@@ -340,6 +340,41 @@ struct DmaLowering : OpConversionPattern<mncore::DmaOp> {
   }
 };
 
+struct DmaStoreLowering : OpConversionPattern<mncore::DmaStoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mncore::DmaStoreOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto i64 = rewriter.getI64Type();
+    auto intr = [&](StringRef n) { return rewriter.getStringAttr(n); };
+    auto c = [&](int64_t v) { return i64Const(rewriter, loc, v); };
+    auto callI64 = [&](StringRef n, ValueRange args) -> Value {
+      return rewriter
+          .create<LLVM::CallIntrinsicOp>(loc, i64, intr(n), args)
+          .getResult(0);
+    };
+    auto callVoid = [&](StringRef n, ValueRange args) {
+      rewriter.create<LLVM::CallIntrinsicOp>(loc, intr(n), args);
+    };
+
+    Value l1 = callI64("llvm.mncore.lbop", {c(0), c(op.getL1Addr()), c(1), c(0)});
+    Value l2 = callI64("llvm.mncore.lbop", {c(1), c(op.getL2Addr()), c(1), c(0)});
+    callVoid("llvm.mncore.l2b", {c(1), c(0), l1, l2});
+
+    Value src = callI64("llvm.mncore.mvop",
+                        {c(2), c(op.getL2Addr()), c(0)});
+    Value dst = callI64("llvm.mncore.mvop",
+                        {c(1), c(op.getDrAddr()), c(0)});
+    Value params = callI64("llvm.mncore.mvparams",
+                           {c(op.getSize()), c(op.getTag()), c(-1), c(-1)});
+    callVoid("llvm.mncore.mv", {c(0), params, src, dst});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct WaitLowering : OpConversionPattern<mncore::WaitOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -607,6 +642,7 @@ struct MNCoreToLLVMPass
              MaskOpLowering, MvOpLowering, MvParamsLowering,
              AluLowering, MauLowering, L1BLowering, L2BLowering, MvLowering,
              WaitLowering, FenceLowering, MaskDirLowering, DmaLowering,
+             DmaStoreLowering,
              VecFmaLowering, VecMulLowering, VecAddLowering, VecMaxLowering,
              VecMinLowering, MatVecLowering, MatWriteLowering,
              MatReadLowering, VecLoadLowering, VecStoreLowering>(converter,

@@ -188,6 +188,38 @@ layout 计算后选择；方言本身不再默认任何模式。
 * 若将来支持，需要按 longword 平面拆成两条 `l1bmd`，并要求 L1BM/shared
   布局把同一平面连续排放（低 longword 平面、高 longword 平面各自连续）。
 
+### 8.3b MAB-aware 布局推导（Triton `#ttg.linear`）
+
+MN-Core 的 64 个 PE 可编号为 `lane = 4*m + p`（m=0..15 为 MAB，p=0..3 为 MAB
+内 PE）。四种分发模式等价于**哪几位 lane/warp 位被复制**：
+
+| 模式 | 被复制的 lane 位 | 独立 PE 数 | 元素数（f32，4/PE） |
+|---|---|---|---|
+| Broadcast (`l1bmp`) | 全部 6 位 | 1 | 4 |
+| MAB (`l1bmm`) | 位 2..5（全部 MAB 位） | 4（p） | 16 |
+| MAB4 (`l1bmm4`) | 位 2..3（4 个 MAB 内） | 16（p + group） | 64 |
+| Distributed (`l1bmd`) | 无 | 64 | 256 |
+
+设每 PE 有 2 个 longword（= 2 个平面）。采用 **plane-major** 元素顺序
+（低平面优先、每平面 64 个 longword 连续）时，`#ttg.linear` 的基向量为：
+
+| 模式 | register | lane | warp |
+|---|---|---|---|
+| Broadcast | `[[1],[2]]` | `[0]*5` | `[0]` |
+| MAB | `[[1],[8]]` | `[2],[4],[0],[0],[0]` | `[0]` |
+| MAB4 | `[[1],[32]]` | `[2],[4],[0],[0],[8]` | `[16]` |
+| Distributed | `[[1],[128]]` | `[2],[4],[8],[16],[32]` | `[64]` |
+
+元素顺序不是判据：strided（`element = lane + 64*r`）、contiguous
+（`4*lane + r`）与 plane-major 都可以；判据只是**复制位模式**。Triton 的
+`toLinearEncoding` 会把任意 distributed encoding（blocked 或 linear）转成
+基向量，因此后端按上述位模式即可推导模式，无需限制元素顺序。
+
+注意：blocked 布局可以表达 Distributed（64 线程、无复制位）和 MAB（若形状
+退化为 4）；**MAB4 与 Broadcast 必须使用 `#ttg.linear`**，因为它们的复制
+周期不是 warp/线程网格的整数倍。Triton 前端需要增加一个 layout-assignment
+pass 来生成这些线性布局（当前 T5/T6/T7 fixture 手写了它们）。
+
 ### 8.4 与 `ttg.local_load` 的关系
 
 * `ttg.local_alloc` 首版统一映射为 **L1BM allocation**（不同时使用 LM0/LM1，

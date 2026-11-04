@@ -117,7 +117,7 @@ def int_mncore_matread_v8f16 : MNMatRead<llvm_v8f16_ty>;
 //   lbop_lo: low-plane L1BM token (the only source unless distributed)
 //   lbop_hi: high-plane L1BM token for distributed 2-longword vectors,
 //            otherwise the -1 sentinel. A distributed load issues two l1bmd
-//            (one longword per PE each), addressed W/2 and W/2+2 in the slot.
+//            (one longword per PE each), addressed W/2 and W/2+4 in the slot.
 //   zmask/wmask: i64 sentinels (-1 = absent)
 // The PE slot is allocated by mncore-lower-typed-intrinsics.
 class MNVecLoad<LLVMType vt> : DefaultAttrsIntrinsic<[vt],

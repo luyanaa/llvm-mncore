@@ -309,6 +309,26 @@ matvec/mwrite/mread 的 typed 形式）、跨基本块与循环的 slot 复用�
   19=h-mwrite 20=d-mread 21=h-mread；`alu` 10=dmax 11=dmin 12=hmax
   13=hmin。f 精度沿用 0..6。
 
+### 14.1a L1B collect 的 MAB 语义 (2026-11-04 数值发现)
+
+分布式写回（PE→L1BM）的方向**不是** load 的简单逆操作：
+
+* `l1bmd $pe $lb<addr>`（`L1BMD_C`，无 `mabdiff`）只采集**一个 MAB 的 4 个
+  lane**，并按硬件 L1B subset 布局写入；`d get` 单个 subset 看到的是重复值。
+* gpfn3 实测 `mabdiff` 以 **4 lane** 为步进旋转：
+  `+1 → MAB15/lane61`，`+2 → 57`，`+3 → 53`；
+  `-1 → 5`，`-2 → 9`，`-3 → 13`（lane 0..63，值 = lane+1）。
+* 因此覆盖全部 64 PE 需要 **16 次 collect**（`mabdiff = 0,-1,…, -15` 或其
+  等价旋转），每次落到不同的 L1BM subset；再经 `l2bmd` 汇总到 L2BM。
+* 当前 `mncore.vec.store` 的 Distributed 路径只发 **每平面一次 collect**，
+  所以只把 4/64 个 lane 的值写回并在 DRAM 中重复。**变值输入的 E2E 会失败**
+  （`run_e2e_add.py` 的多重集对拍已捕获）；常量输入会掩盖该错误。
+
+**结论**：store 路径要正确，必须实现 16 路 `mabdiff` 旋转调度与对应的
+L1BM subset→L2BM→DRAM 映射；这需要 SDM §3.6.8.21 与 §3.7 的 subset 布局
+定义。load 路径（`l1bmd` 分发 64 个连续 L2BM longword 到 64 PE）是良定义的，
+已数值验证。
+
 ### 14.1 分配器 v2.1 (2026-11-04)
 
 * **目的空间避开存活值**：分配新结果时，先统计当前调用点仍存活的 SSA 值所占

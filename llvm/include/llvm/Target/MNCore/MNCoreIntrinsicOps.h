@@ -75,7 +75,8 @@ enum class L1BOp : int64_t {
 
 // llvm.mncore.l2b(opcode, set, a, b)
 enum class L2BOp : int64_t {
-  L2BMB = 0,
+  L2BMB = 0,  // L2BM -> L1BM broadcast
+  L2BMDC = 1, // L1BM -> L2BM collect
 };
 
 // llvm.mncore.mv(opcode, params, src, dst)

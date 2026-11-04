@@ -161,6 +161,44 @@ third_party/mncore/
 `scf.for`/`scf.if` 必须在 `mnir` stage 之前完全 unroll 或 if-convert 成掩码；
 无法证明等价的副作用（DMA、同步）不得谓词化。
 
+### 2.3b MAB-aware 布局与高层回归状态（2026-11-04）
+
+**布局推导**：模式由 linear layout 的**复制位**决定（见
+`mncore_mlir_dialect.md` §8.3b）：全部 lane 位复制 = Broadcast，位 2..5
+复制 = MAB，位 2..3 复制 = MAB4，无复制 = Distributed。已实现并测试：
+
+* `t7_broadcast.mlir` → `l1bmp`
+* `t5_mab.mlir` → `l1bmm`
+* `t6_mab4.mlir` → `l1bmm4`
+* `t3_distributed.mlir` / `t4_roundtrip.mlir`（blocked，无复制位）→ 两平面
+  `l1bmd`
+
+**真实 Triton 前端（M1 进展）**：`ASTSource → TTIR → TTGIR → mncore →
+LLVM → .vsm → assemble3 → gpfn3` 已跑通：
+
+* 指针参数映射为静态 DRAM 基址（arg i → `128*i` longword，待 relocation）；
+* `tt.load`/`tt.store` 的 **整 tile `base + arange(0,256)`** 已下降为两平面
+  `mncore.dma` + `mncore.vec.load/store` + `mncore.dma.store`；
+* **load 路径数值正确**：DRAM 0..63 写入 1..64，经 MV→L2B→l1bmd 后，PE
+  (m,p) 读到 `4m+p+1`，逐 lane 验证通过；
+* **store 路径未闭合**：`l1bmd` collect 只采集一个 MAB（4 lane），`mabdiff`
+  以 4 lane 旋转移位；正确写回需要 **16 次旋转 collect** 与 L1BM subset
+  布局（SDM §3.6.8.21/§3.7）。当前每平面一次 collect，因此变值输入在 DRAM
+  中重复/错位；`run_e2e_add.py` 的多重集对拍会失败，常量输入会掩盖该问题。
+  这是当前 M1 的唯一数值阻塞。
+
+**更早的合法化诊断**（已闭合）是 `unsupported kernel argument type
+'!tt.ptr<f32>'`；指针/整 tile 下降现已实现。对 Triton 自带的 62 个 TTGIR 测试做了一次语料扫描：0 个可被
+mncore 合法化（它们使用 GPU layout、指针参数与 `tt.load/store`），这符合
+当前严格合法化器的设计，而非回归失败。
+
+**下一步（前端侧）**：
+1. 增加 `mncore-assign-layout`：按张量大小/预期模式生成上述
+   `#ttg.linear`（MAB4/Broadcast 尤其需要）；
+2. 指针参数映射为 buffer descriptor（`mnrt` relocation），`tt.load/store`
+   下降为 `mncore.dma` + 两平面 `vec.load/store`；
+3. DMA 的平面布局必须与所选元素顺序一致（plane-major 可直接连续搬运）。
+
 ### 2.4 指针参数与重定位（关键）
 
 `.vsm` 的地址字段是静态的（`packPEOperand`/`packMVOperand` 只接受立即数），
