@@ -476,25 +476,48 @@ runtime `mnrt` 消费端仍未实现）
 * 转换由 lowering 完成：`addend_units = byte_offset / unit_bytes`；不整除即
   拒绝，不做隐式取整。
 
-### 13.2 产生方式（编译期）——**已实现 (2026-11-04)**
+### 13.2 产生方式（编译期）——**已实现 (2026-11-04)**，命名空间修订 (2026-11-05)
 
 带 buffer 基址的指令在 `.vsm` 中满足：
 
 1. 地址字段填 **0**（占位）；
-2. 该行以注释结尾：`# @mncore.fixup <site>`，`<site>` 在 kernel 内唯一；
-3. sidecar 为每个 site 记录一条：
+2. 该行以注释结尾：`# @mncore.fixup <site>`，`<site>` 在**所属 kernel 内**唯一；
+3. 每个 kernel entry 的指令前有一行 `# @mncore.kernel <entry>`；
+4. sidecar 为每个 site 记录一条，并按 kernel entry 分组：
 
 ```yaml
+kernel: main               # 主键的前半：kernel entry 符号
 fixups:
-  - site: 7
+  - site: 7                # 主键的后半：kernel 内自 0 递增
     arg: 0                 # kernel 参数下标
     space: DRAM            # DRAM | PDM | L2BM
     unit: longword         # longword(8B) | word(4B)
-    addend_units: 8        # 静态偏移 / unit
+    addend_units: 8        # 静态偏移 / unit，**signed 32-bit**
     width_bits: 32         # 地址字段宽度（避免越界写）
     opcode: mvp            # site 自检
     operand: 1             # MV: 0=params 1=src 2=dst; PE: 见下表
 ```
+
+**中间 ABI 主键是 `(kernel entry, site)`，不是模块级发射顺序。** Program
+容器把 fixup 关联到具体 kernel；一个模块可以定义多个入口，site 编号在入口
+处重新从 0 开始，因此裸 site 号会产生归属歧义。`# @mncore.kernel` 标记是
+loader 归属 site 的唯一依据；缺失该标记的旧产物按空 entry `""` 归组。
+
+**`addend_units` 的取值域窄于绝对地址。** 绝对地址字段是 32-bit
+**无符号**（0 .. `0xffffffff`）；可重定位 addend 在打包记录里占一个
+**signed** 32-bit 槽位，打包时按 32 bit 截断、解包时符号扩展，所以
+`0x80000000` 这类值会静默变成负数。两者必须分别校验：
+
+| 形态 | 字段 | 允许范围 |
+|---|---|---|
+| 绝对地址（`*_arg = -1`） | `src_addr` / `dr_addr` | `0 .. 0xffffffff` |
+| 可重定位 addend（`*_arg >= 0`） | 同一字段 | `-2^31 .. 2^31-1` |
+| L2BM/L1BM 内部地址 | `l2_addr` / `l1_addr` | `0 .. 0xffffffff` |
+
+`mncore.dma` / `mncore.dma.store` 的 verifier 在 `*_arg >= 0` 时按 signed
+32-bit 校验，`convert-mncore-to-llvm` 在打包前再查一次
+（`llvm::mncore::relocAddendFits`）并在越界时让转换失败而不是截断；
+`llvm::mncore::relocRoundTrips` 是全字段往返判据。
 
 PE 操作数的 `operand` 位置按 `moncore_intrinsics_design.md` §3 的 intrinsic
 签名计（例如 `alu` 的 `sx` 为 1）。
@@ -506,7 +529,7 @@ PE 操作数的 `operand` 位置按 `moncore_intrinsics_design.md` §3 的 intri
 | `mncore` dialect | `mncore.dma` / `mncore.dma.store` 的 `src_arg` / `dr_arg`（`-1` = 绝对地址）。此时 `src_addr` / `dr_addr` 解释为**相对 buffer 的静态偏移**（longword）。verifier 拒绝 `src_arg >= 0` 且 `src_space != DRAM`，以及超范围的 arg。 |
 | `convert-mncore-to-llvm` | 地址操作数改为 `mvop(..., 0, ...)`，指令 intrinsic 换成 `llvm.mncore.mv.reloc`，第 5 个参数是 `mncore::packReloc()` 打包的记录。冻结的 `llvm.mncore.mv` 4 参数 ABI 未改动。 |
 | isel | `mv.reloc` 与 `mv` 走同一 opcode 选择，多出的记录作为 MI 的第 4 个操作数（MCInst 也会带上，但 asm string 不引用它，故不影响指令文本）。 |
-| asm printer | 识别该操作数 → 行尾追加 ` # @mncore.fixup <site>`，site 按发射顺序从 0 递增；文件尾输出注释形式的 sidecar 块 `# @mncore.fixup.begin` … `# @mncore.fixup.end`。`assemble3` 忽略 `#` 注释，因此**同一条流**既是可汇编的 `.vsm`，也是带 sidecar 的产物。 |
+| asm printer | 每个函数体起点输出 `# @mncore.kernel <entry>`；识别 reloc 操作数 → 行尾追加 ` # @mncore.fixup <site>`，site 在**当前 entry 内**从 0 递增（跨函数重置）；文件尾按 entry 分组输出注释形式的 sidecar 块 `# @mncore.fixup.begin` … `# @mncore.fixup.end`。`assemble3` 忽略 `#` 注释，因此**同一条流**既是可汇编的 `.vsm`，也是带 sidecar 的产物。 |
 
 记录打包（`llvm/include/llvm/Target/MNCore/MNCoreIntrinsicOps.h::
 mncore::packReloc`，MLIR 与 asm printer 共用）：
@@ -517,23 +540,27 @@ mncore::packReloc`，MLIR 与 asm printer 共用）：
 ```
 
 `width_bits == 0` 表示“无 fixup”（真实地址字段至少 1 bit）。
+`[63:32]` 是 signed 槽位：打包前的唯一合法判据是
+`relocAddendFits(addend)`，越界必须由调用方拒绝，`packReloc` 自身不报错。
 
 参考消费端见 `../triton-mncore/third_party/mncore/tests/mncore_fixup.py`
-（`split()` / `relocate()`）：解析 sidecar 注释块、按字节绑定换算、检查
+（`split()` / `relocate()`）：解析 sidecar 注释块并按 `(kernel entry, site)`
+建索引、跟随 `# @mncore.kernel` 标记归属每一行、按字节绑定换算、检查
 unit 整除与 `width_bits` 越界、校验 `opcode`/`operand`/`space` 与行一致、
 剥离注释后交给 assemble3。契约测试
-`third_party/mncore/tests/run_reloc.py`（1 正例 + 7 负例 + 1 word-unit 正例）
+`third_party/mncore/tests/run_reloc.py`（2 正例 + 10 负例 + 1 word-unit，
+含多 kernel 同 site 归属与跨 kernel 歧义负例）
 与 `tests/run_e2e_add.py`（端到端用它做宿主侧重定位）；
 `third_party/mncore/tests/run_all.py --remote` 把 R / E2E 一并纳入单一入口。
 
 
 ### 13.3 消费方式（loader）
 
-1. 解析 sidecar，建立 `site → {arg, space, unit, addend, width, operand}`；
+1. 解析 sidecar，建立 `(kernel entry, site) → {arg, space, unit, addend, width, operand}`；
 2. 对每个 buffer 参数取得设备基址（字节），换算为对应 unit；
-3. 找到带 `# @mncore.fixup <site>` 的 `.vsm` 行，按 `opcode/operand`
-   解码地址子字段，替换为 `base_units + addend_units`，并做 `width_bits`
-   越界检查；
+3. 跟随 `# @mncore.kernel <entry>` 标记确定当前 kernel，找到带
+   `# @mncore.fixup <site>` 的 `.vsm` 行，按 `opcode/operand` 解码地址子字段，
+   替换为 `base_units + addend_units`，并做 `width_bits` 越界检查；
 4. 可选：删除 fixup 注释后交给 assemble3。
 
 **禁止**：在不带 site 的情况下按行号或字节偏移猜测地址位置；禁止把
@@ -552,9 +579,15 @@ unit 整除与 `width_bits` 越界、校验 `opcode`/`operand`/`space` 与行一
 
 * 双 kernel 共享同一 buffer：第二个 kernel 通过 site 读取第一个 kernel 写出
   的数据，数值对拍通过；——**待 `mnrt` 实现后验收**（参考消费端已就绪）。
-* 负例：未绑定 site、`byte_offset % unit != 0`、地址超出 `width_bits`，
-  三者都必须被拒绝。——**已由 `tests/run_reloc.py` 覆盖**，另加
-  space/opcode/operand 不符、sidecar 声明但未被引用的 site 两类 fail-closed 负例。
+* 负例：未绑定 site、`byte_offset % unit != 0`、地址超出 `width_bits`、
+  addend 为负导致下溢，都必须被拒绝。——**已由 `tests/run_reloc.py` 覆盖**，
+  另加 space/opcode/operand 不符、sidecar 声明但未被引用的 site、同一
+  kernel 内重复 site、以及某 kernel 的 site 不得回落到另一 kernel 的记录
+  （`(kernel entry, site)` 主键负例）等 fail-closed 负例。
+* 编译期负例：`src_arg >= 0` 时 `src_addr = 0x80000000` 被
+  `mncore.dma`/`mncore.dma.store` verifier 拒绝（`invalid.mlir`），而同一
+  数值作绝对地址（`src_arg = -1`）合法且不产生 fixup（`lower.mlir`）；
+  `src_addr = 2^31-1` 的 addend 打包后值为 `9223372032560988160`。
 * 端到端：`tests/run_e2e_add.py` 现在编译产出带 fixup 的 `.vsm`，由宿主侧
   `mncore_fixup.relocate()` 绑定 `arg0/1/2 → 0/128/256` longword 后交给
   assemble3；6 个被重定位操作数（2 个 load + 1 个 store，各两个 longword 平面）
