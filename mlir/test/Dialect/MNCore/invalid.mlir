@@ -74,3 +74,22 @@ func.func @reloc_arg_range() {
                     src_arg = 300 : i32}> : () -> ()
   return
 }
+
+// A relocatable addend occupies a *signed* 32-bit slot in the fixup record, so
+// 0x80000000 would come back from pack/unpack as a negative offset. The same
+// value is fine as an absolute address (src_arg = -1); see roundtrip.mlir.
+// ERR: src_addr is a relocatable addend and must fit a signed 32-bit range
+func.func @reloc_src_addend_range() {
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 2147483648 : i64,
+                    l2_addr = 0 : i64, l1_addr = 0 : i64, size = 64 : i64,
+                    tag = 1 : i32, src_arg = 0 : i32}> : () -> ()
+  return
+}
+
+// ERR: dr_addr is a relocatable addend and must fit a signed 32-bit range
+func.func @reloc_store_addend_range() {
+  "mncore.dma.store"() <{l1_addr = 0 : i64, l2_addr = 0 : i64,
+                         dr_addr = 4294967295 : i64, size = 64 : i64,
+                         tag = 1 : i32, dr_arg = 1 : i32}> : () -> ()
+  return
+}

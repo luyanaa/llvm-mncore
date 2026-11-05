@@ -154,6 +154,20 @@ struct RelocRecord {
   int64_t AddendUnits = 0;
 };
 
+// Addend range. The field is 32 bits and is read back as sign-extended, so
+// the pack/unpack round trip is only lossless inside a signed 32-bit range.
+// This is *narrower* than the 32-bit unsigned range an absolute address field
+// allows: `0x80000000` is a legal static DRAM address but not a legal
+// relocatable addend (it would come back as -2147483648). Every producer of a
+// RelocRecord must check this predicate before packing; the MLIR verifiers do
+// it on the `*_arg >= 0` path.
+inline constexpr int64_t MinRelocAddend = -2147483648LL;
+inline constexpr int64_t MaxRelocAddend = 2147483647LL;
+
+constexpr bool relocAddendFits(int64_t V) {
+  return V >= MinRelocAddend && V <= MaxRelocAddend;
+}
+
 // Packed into one i64 intrinsic argument:
 //   [7:0]   arg
 //   [10:8]  space
@@ -162,6 +176,10 @@ struct RelocRecord {
 //   [23:20] operand
 //   [31:24] opcode
 //   [63:32] addend_units (signed, in `unit`)
+//
+// Precondition: `R.AddendUnits` satisfies relocAddendFits(). Packing silently
+// truncates, so an out-of-range addend would survive as a plausible-looking
+// negative offset rather than failing; `relocRoundTrips` is the test for it.
 constexpr uint64_t packReloc(const RelocRecord &R) {
   return ((uint64_t)(R.Arg & 0xffu)) | ((uint64_t)((unsigned)R.Space & 0x7u) << 8) |
          ((uint64_t)((unsigned)R.Unit & 0x1u) << 11) |
@@ -186,6 +204,16 @@ constexpr RelocRecord unpackReloc(uint64_t V) {
 // True when the packed record denotes an actual fixup. `width_bits == 0` is
 // the "no fixup" marker: every real address field is at least one bit wide.
 constexpr bool hasReloc(uint64_t V) { return ((V >> 12) & 0xffu) != 0; }
+
+// Exact round trip check for every field of the record. Used by the lowering
+// (fail closed on a record that would not survive packing) and by the unit
+// test that pins the pack/unpack layout.
+constexpr bool relocRoundTrips(const RelocRecord &R) {
+  RelocRecord U = unpackReloc(packReloc(R));
+  return U.Arg == R.Arg && U.Space == R.Space && U.Unit == R.Unit &&
+         U.WidthBits == R.WidthBits && U.Operand == R.Operand &&
+         U.Opcode == R.Opcode && U.AddendUnits == R.AddendUnits;
+}
 
 } // namespace mncore
 } // namespace llvm

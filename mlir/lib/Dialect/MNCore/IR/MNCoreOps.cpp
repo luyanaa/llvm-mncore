@@ -79,6 +79,36 @@ MNCORE_ENUM_SYNC(L2BKind, L2BOp, L2BMPT);
 MNCORE_ENUM_SYNC(MVOp, MVOp, MVP);
 
 #undef MNCORE_ENUM_SYNC
+
+//===----------------------------------------------------------------------===//
+// Relocation record packing
+//
+// The verifier below relies on the addend slot being signed 32-bit. Pin the
+// two facts that make the distinction meaningful: an in-range addend survives
+// the round trip, and 0x80000000 does not (which is exactly why the
+// `*_arg >= 0` path needs its own range check).
+//===----------------------------------------------------------------------===//
+
+constexpr ::llvm::mncore::RelocRecord mkReloc(int64_t Addend) {
+  ::llvm::mncore::RelocRecord R;
+  R.Arg = 0;
+  R.Space = ::llvm::mncore::RelocSpace::DRAM;
+  R.Unit = ::llvm::mncore::RelocUnit::Longword;
+  R.WidthBits = 32;
+  R.Operand = (unsigned)::llvm::mncore::RelocOperand::Src;
+  R.Opcode = (unsigned)::llvm::mncore::MVOp::MVP;
+  R.AddendUnits = Addend;
+  return R;
+}
+
+static_assert(::llvm::mncore::relocRoundTrips(mkReloc(0)));
+static_assert(::llvm::mncore::relocRoundTrips(mkReloc(2147483647LL)));
+static_assert(::llvm::mncore::relocRoundTrips(mkReloc(-2147483648LL)));
+// 0x80000000 reads back as -2^31: a legal absolute address, not a legal
+// addend. `relocAddendFits` is what rejects it on the relocation path.
+static_assert(!::llvm::mncore::relocRoundTrips(mkReloc(2147483648LL)));
+static_assert(!::llvm::mncore::relocAddendFits(2147483648LL));
+static_assert(!::llvm::mncore::relocAddendFits(-2147483649LL));
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -396,6 +426,18 @@ LogicalResult DmaOp::verify() {
     return emitOpError()
            << "a relocatable source must live in DRAM (src_space = 1); only "
               "kernel buffer arguments are relocatable";
+  // `src_addr` has two different ranges depending on which mode it is in:
+  // an absolute address is an unsigned 32-bit field, but a relocatable
+  // addend travels through a *signed* 32-bit slot in the fixup record, so
+  // 0x80000000 would come back from pack/unpack as a negative offset.
+  if (srcArg >= 0 &&
+      !llvm::mncore::relocAddendFits((int64_t)getSrcAddr()))
+    return emitOpError()
+           << "src_addr is a relocatable addend and must fit a signed 32-bit "
+              "range ("
+           << llvm::mncore::MinRelocAddend << ".."
+           << llvm::mncore::MaxRelocAddend << "), got " << getSrcAddr()
+           << "; use src_arg = -1 for an absolute address";
   return success();
 }
 
@@ -419,6 +461,17 @@ LogicalResult DmaStoreOp::verify() {
     return emitOpError() << "dr_arg must be -1 (absolute address) or a kernel "
                             "argument index 0..255, got "
                          << drArg;
+  // Same split as DmaOp: `dr_addr` is an unsigned 32-bit absolute address
+  // unless it is a relocatable addend, which must fit the signed 32-bit slot
+  // of the fixup record.
+  if (drArg >= 0 &&
+      !llvm::mncore::relocAddendFits((int64_t)getDrAddr()))
+    return emitOpError()
+           << "dr_addr is a relocatable addend and must fit a signed 32-bit "
+              "range ("
+           << llvm::mncore::MinRelocAddend << ".."
+           << llvm::mncore::MaxRelocAddend << "), got " << getDrAddr()
+           << "; use dr_arg = -1 for an absolute address";
   return success();
 }
 

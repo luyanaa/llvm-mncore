@@ -342,6 +342,13 @@ struct DmaLowering : OpConversionPattern<mncore::DmaOp> {
     Value params = callI64("llvm.mncore.mvparams",
                            {c(op.getSize()), c(op.getTag()), c(-1), c(-1)});
     if (srcArg >= 0) {
+      // The drop to a signed 32-bit addend is the one place in this path where
+      // an out-of-range value would survive as a plausible negative offset.
+      // The verifier rejects it, but conversion can run on IR that was never
+      // verified, so fail closed here too instead of truncating.
+      if (!llvm::mncore::relocAddendFits((int64_t)op.getSrcAddr()))
+        return rewriter.notifyMatchFailure(
+            op, "src_addr does not fit a signed 32-bit relocatable addend");
       llvm::mncore::RelocRecord R;
       R.Arg = (unsigned)srcArg;
       R.Space = op.getSrcSpace() == 1 ? llvm::mncore::RelocSpace::DRAM
@@ -405,6 +412,9 @@ struct DmaStoreLowering : OpConversionPattern<mncore::DmaStoreOp> {
     Value params = callI64("llvm.mncore.mvparams",
                            {c(op.getSize()), c(op.getTag()), c(-1), c(-1)});
     if (drArg >= 0) {
+      if (!llvm::mncore::relocAddendFits((int64_t)op.getDrAddr()))
+        return rewriter.notifyMatchFailure(
+            op, "dr_addr does not fit a signed 32-bit relocatable addend");
       llvm::mncore::RelocRecord R;
       R.Arg = (unsigned)drArg;
       R.Space = llvm::mncore::RelocSpace::DRAM;

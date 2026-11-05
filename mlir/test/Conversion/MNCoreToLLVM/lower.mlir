@@ -184,3 +184,29 @@ func.func @dmastore_l1b5() {
   "mncore.dma.store"() <{l1_addr = 64 : i64, l2_addr = 64 : i64, dr_addr = 64 : i64, size = 64 : i64, tag = 2 : i32, l1b = 5 : i32}> : () -> ()
   return
 }
+
+// CHECK-LABEL: llvm.func @dma_abs_high
+func.func @dma_abs_high() {
+  // 0x80000000 is a legal 32-bit *absolute* address, so with the default
+  // src_arg = -1 it stays an immediate and no fixup is produced. It would not
+  // be a legal relocatable addend: that slot is signed (see invalid.mlir).
+  // CHECK: llvm.mlir.constant(2147483648 : i64) : i64
+  // CHECK-NOT: llvm.mncore.mv.reloc
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mv"(
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 2147483648 : i64,
+                    l2_addr = 0 : i64, l1_addr = 0 : i64, size = 64 : i64,
+                    tag = 1 : i32}> : () -> ()
+  return
+}
+
+// CHECK-LABEL: llvm.func @dma_addend_max
+func.func @dma_addend_max() {
+  // The largest signed 32-bit addend survives packing exactly. Record bits:
+  // value 32, operand 1 (src), addend 2147483647.
+  // CHECK: llvm.mlir.constant(9223372032560988160 : i64) : i64
+  // CHECK: llvm.call_intrinsic "llvm.mncore.mv.reloc"({{.*}}) : (i64, i64, i64, i64, i64) -> ()
+  "mncore.dma"() <{src_space = 1 : i32, src_addr = 2147483647 : i64,
+                    l2_addr = 0 : i64, l1_addr = 0 : i64, size = 64 : i64,
+                    tag = 1 : i32, src_arg = 0 : i32}> : () -> ()
+  return
+}
