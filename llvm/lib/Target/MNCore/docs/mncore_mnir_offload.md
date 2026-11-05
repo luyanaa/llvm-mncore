@@ -244,9 +244,10 @@ llc → .vsm ──► canonical.py ──► block_encoder.py ──► N×128 
 ```
 
 * 块编码已有，头部 schema 已反解（§6 A.1），构造器也已写出并**逐字节复现
-  全部 20 个本地样本**（`scripts/mnprog_build.py`）⇒ 剩下的工程问题是把
-  镜像（`block_encoder.py`）与头部（`mnprog_build.py`）接成一条管线，
-  而不是再研究格式。
+  全部 20 个本地样本**（`scripts/mnprog_build.py`）；两者的接缝已落地为
+  `libmnrt/encoder/vsm2prog.py`（§6 A.2），并用供应商 dump 文本 → Program
+  的逐字节比较（70/73）验证了镜像路径。**剩下的是文本覆盖**：精确模板只
+  覆盖语料里出现过的指令文本，`llc` 自己的操作数组合会 fail-closed。
 * 头部内容有三处独立来源可交叉验证：`mnclc --dump` 的头部清单（`target` /
   `# of kernels` / `name` / `# of args` / `# of fixup` /
   `size of instblock` / `debug info`）、§2 的实测切分、以及供应商
@@ -442,6 +443,61 @@ cd ~/hdrprobe && python3 -I mnprog.py --check *.bin
 除 0 以外的枚举值**没有任何可产出的样本**。这不是没查到，是这套工具链
 产不出来——记在 §9，不要臆造。
 
+#### A.2 指令镜像（instblock）编码：已闭合的部分与硬边界（2026-11-05）
+
+**物理块布局（逐字节验证，不是推断）**
+
+```
+block[  0: 64]  MV 段     （22 个 MV 文本 → 64 B，一一对应）
+block[ 64:124]  PE 段     （60 B = 480 bit，装一条 PE 指令的物理位域）
+block[124:128]  4 B pad   （语料里恒为 0）
+镜像 = 这些 128 B 块的拼接（Program.instblock）
+```
+
+供应商 `--dump` 的视图是**旋转过**的：它的 `head` 是 `block+64` 处的 PE 段，
+`tail` 是 `pad(4) + 下一块的 MV(64)`，所以 `head+tail` 拼不出一个块。
+证据：2253/2253 个 oracle 块、2435/2440 个样本块按此布局**逐字节重建**；
+剩 5 块是已钉住的未解码文本（4 个浮点 immu 尾数、1 个组合 PE 表达式）。
+
+**已实现的管线（`libmnrt/encoder/vsm2prog.py`）**
+
+```
+.vsm 文本 ──parse_kernels──► Block(pe,mv,site) ──block_encoder──► 128 B 块
+      └─ @mncore.fixup 侧车 ──► Program Fixup(bin_index, arg, spec_index)
+                                                   └──mnprog_build──► mncore::Program
+```
+
+`--from-dump` 模式用供应商自己的 dump 文本重建供应商自己的 Program：
+76 个 dump+Program 对中 73 个可用（3 个 dump 为空文件），这 73 个里
+**70 个逐字节 IDENTICAL**，其余 3 个正好落在上面钉住的
+5 个块上（不静默跳过，`encoder/regress_roundtrip.py` 已进 `make check`）。
+这证明的是**镜像路径**（文本→块→镜像→Program）与头部合成，不是文本覆盖。
+
+**镜像不能从 assemble3 的封装里"抄"出来**：`--binary` 是 GPFN app
+（`GPFN3` 在偏移 64，其后是描述符表，不是原图）；对 20 块的 `a2add`，
+已知 PE 段在输出中**一处都找不到**，`--loader` 的 `idma.dat` 亦然。
+只有单块样例会"看起来"像镜像，那是封装退化，不是契约。
+
+**块编码的真实边界**：`assemble3 --output-file` 每个块给一行 `i`，
+292 bit = CSV 的 `ll`(2) + 93 个 `pe.*` 字段（283 bit）+ `wd`(8)。
+在一份 2385 对的语料上，**行与 60 B PE 段是双射**（582 个不同行 ↔
+582 个不同段，无一对多）。但它**不是按序嵌入**：逐位相关只能唯一确定
+48/95 个字段的连续窗口，24 个歧义，23 个找不到；单调嵌入的动态规划在第
+10 位就断掉。结论是行必须经过一张**物理位域布局 + 每字段取值律**才能变成
+60 B，而不是一次位置换。
+
+**当前覆盖率（`llc -march=mncore2` 生成的 42 个 .vsm，434 块）**：
+
+| 口径 | 覆盖 |
+|---|---|
+| 精确文本模板（`templates.py`） | 142/434 = 32.7% |
+| 以 assemble3 规范化后的 292 bit 行为键 | 145/333 = 43.5% |
+| 完整可编码的函数 | 0/42 |
+
+所以 A 路线今天的正确形态是：**头部与管线已闭合、文本覆盖 fail-closed**。
+把文本覆盖推到 100% 需要完成位域反解（字段窗口 + 取值律），这是下一项
+研究任务，不是再写一个包装脚本就能绕过的。
+
 ### B. 复用供应商 MNIR（作为 oracle，不作主路径）
 
 `.mnbc` 路线已可用，但它要求我们先有 MNIR AST，而 LLVM 后端没有、也不
@@ -539,11 +595,21 @@ cmp <(tail -c 49408 x.bin) <(tail -c 49408 out.bin) && echo IDENTICAL
    的 105 个合法 `mncl_samples` 上重建同样 105/105 `IDENTICAL`。
    **仍未定的只有一项**：`Target` 枚举除 `MNCore2`(=0) 以外的取值——
    `mnclc -t MNCore1/3` 崩溃、MNIR 路径硬断言只支持 MNCore2，这套工具链
-   产不出样本。下一项工作不再是格式研究，而是把 `block_encoder.py` 的镜像
-   与 `mnprog_build.py` 的头部接成一条从 `.vsm` 到 Program 的管线。
+   产不出样本。头部与 `.vsm → Program` 管线（`encoder/vsm2prog.py`）已于
+   2026-11-05 接合并用供应商 dump 逐字节验证（70/73 对样本 IDENTICAL）。
+   **仍未闭合的是指令文本覆盖**：精确模板对 `llc` 自己的操作数组合只有
+   32.7%（§6 A.2），缺口在 60 B PE 段的物理位域布局与每字段取值律，见第 5 条。
 2. **MNIR 文本解析器的两处 `ud2`**（`immu` + GRF0 目标）是供应商实现
    缺陷；不要围绕它设计任何流程，也不要假定下一版本已修。
 3. **`mnrt` 的 provider 分层尚未落地**：`program` provider、异步事件、
    Program 常驻都还是设计，不是代码。
 4. **`--dump-mnir` 的 `immu` 拼写** 是否在更新版本里改正，未知；本文
    所有结论基于 `mnclc` 2026-10-15 构建。
+5. **60 B PE 段的物理位域布局未解**（§6 A.2）：已知它与 assemble3 的
+   292 bit 规范化行双射，但不是按序嵌入。已定位 48/95 个字段的连续窗口，
+   23 个字段找不到、24 个歧义；9 个非载荷位（`ll`/`wd` 类）不出现在段里。
+   在这些字段窗口与取值律闭合之前，任何未在语料出现过的指令文本都必须
+   fail-closed，**不得**用近似或"最近模板"顶替。
+6. **MV 段的参数化同样未解**：语料 22 条 MV 文本各自对应唯一 64 B，
+   `llc` 会发 `mvp/n64i05 $d0 $lc256` 这类语料没有的等待标签/地址组合，
+   目前同样 fail-closed。

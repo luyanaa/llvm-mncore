@@ -602,11 +602,31 @@ K=16，单精度累积。
   规范化（也可用于整数矩阵转置）。
 * 列为性能事实：`fmwrite` 一条指令 4 行，`fmread` 一条指令 4 列。
 
-### 22.4 与当前 Layer B 的已知差异（**未实测，阻塞 GEMM**）
+### 22.4 与当前 Layer B 的已知差异（**`fmwrite`/`fmread` 已实测闭合，见 §22.7；`fmfma` 仍未测**）
 
-`MNCoreLowerTypedIntrinsics` 的 `Tok`/`TokSlot` 对 **所有** PE 操作数统一
-发 `width=2`（2 长语，4-cycle 区域 16 word）。矩阵三指令按 SDM 的每 cycle
-访问量应为：
+> **2026-11-04 更新**：本节表格中 `fmwrite`/`fmread` 两行的期望 width（=1，
+> longword）已由 gpfn3 数值探针**实测确认**，`width=0`/`width=2` 不复现
+> SDM 的列/行落点；Layer B 对这两条指令统一发 `width=2` 是**确定错误**。
+> `fmfma` 的三行（x / y / dst）**仍未实测**，故 §22.5 的门禁继续有效。
+> 2026-11-04 追加：G2 探针已跑，但 gpfn3 的 `fmfma` 不做乘加（`dst := y`），
+> 详见 §22.9。门禁因此不能停在“待测”，而是“实测到参考模型缺项”。
+> **2026-11-04 再追加**：下表四条已由厂商 SDK 头文件
+> `mncl/device/mncore2.h` 的 intrinsic 签名独立确认（Level 2，见 §22.10）：
+> `fmwrite`/`fmread` 每 PE 4 长语（width=1），`fmfma` 的 x 为 `f32x4`
+> （2 长语）、y/dst 为 `f32x4x2`（4 长语），且 **y 与 dst 是普通 IEEE f32**。
+> 结论、证据与模型见 §22.7。
+> **2026-11-04 已实施**：`MNCoreLowerTypedIntrinsics` 改为按 (opcode, role)
+> 发访问宽度——`fmfma` x = 0、y/dst = 1，`fmwrite`/`fmread` = 1，向量形式保持
+> 2（该路径已在 gpfn3 逐元素验证，不得连带改动）。`layerb2.ll` 现用正则钉住
+> 前缀：矩阵行出现 `$ll`（2 长语）即判回归。
+> **仍未闭合的形状缺口**：typed 签名只有 4 f32（`<4 x float>` = 2 长语），而
+> `fmwrite`/`fmread`/`fmfma.y`/`fmfma.dst` 的活动硬件操作数是 `f32x4x2` = 8 f32
+> （4 长语）。宽度改对之后这四条仍只提供一半的值，因此**不能**据此宣称矩阵
+> 路径可用，`tl.dot` 门禁不变；类型加宽与 ABI 槽位的冲突见 §22.11.3。
+
+`MNCoreLowerTypedIntrinsics` 历史上对 **所有** PE 操作数统一发 `width=2`
+（2 长语，4-cycle 区域 16 word）；2026-11-04 起改为按 (opcode, role) 发宽度
+（见上方更新）。矩阵三指令按 SDM 的每 cycle 访问量应为：
 
 | 指令 | 操作数 | 每 cycle/PE | 4-cycle 区域 | 期望 width | 每 PE 值数 |
 |---|---|---|---|---|---|
@@ -616,8 +636,8 @@ K=16，单精度累积。
 | `fmread` | dst | 2 word | 8 word | 1 (longword) | 8 f32（4 列） |
 
 而 Layer B 的 typed 签名（`matvec.v4f32(face, <4 x f32>, <4 x f32>)`、
-`matwrite`/`matread` 的 `<4 x f32>`）只给 4 f32，且宽度统一为 2。
-即 **值宽度与访问宽度都可能比 SDM 要求宽一档**。
+`matwrite`/`matread` 的 `<4 x f32>`）只给 4 f32。访问宽度已按角色修正，
+但**值宽度仍比 SDM 窄一档**（4 f32 vs 8 f32）。
 
 该差异目前只是“由伪码 + `accessRegionWords` 推出的不一致”，不是已测缺陷：
 向量路径（`vec.add` 等，同样是 width=2）已在 gpfn3 上元素级验证过，说明
@@ -648,17 +668,675 @@ lowering 都不得建立在这三条指令之上。**
    布局，否则降级只会算错而非算慢。
 
 **状态**：`tl.dot` 前端可用（TTIR→TTGIR 通过，`#blocked` 给每线程 4×4
-C tile），mncore 侧为门禁 + 契约，尚无 lowering。回归：
+C tile），mncore 侧为门禁 + 契约，尚无 lowering。2026-11-04：G2 探针实测
+gpfn3 的 `fmfma` 不做乘加（§22.9），故门禁**不放行**，理由由“未测”升级为
+“参考模型缺项”。形状层面的独立证据见 §22.11：ABI v1 的 2-LW 向量槽只够
+x / `fbfn`，y 与 dst 需 4 LW。回归：
 `third_party/mncore/tests/run_t9.py`（前端 + 三条拒绝子句）。
 
 ### 22.6 未决项
 
-1. 22.4 的宽度差异（实测探针未做）。
+1. ~~22.4 的宽度差异（实测探针未做）~~ → **`fmwrite`/`fmread` 已实测闭合
+   (§22.7)**；`fmfma` 的 x / y / dst 三行仍未测，属 G2 —— **G2 已跑但被
+   gpfn3 的模型缺项挡住（`dst := y`，§22.9）**，宽度无法由数值结果反证。
+   宽度的**非模拟器证据**见 §22.11.2（`$l`/`$ll` 增量 1/2/4）与 §22.11.3
+   （ABI v1 向量槽 2 LW 与厂商签名的对齐与冲突）。
 2. `v<adri>` 默认步长与 `fmfma` 4-cycle 地址推进的交互（手册未把两者
-   写在一起）。
+   写在一起）。§22.7 只测了 `v`（单 access unit）形式下的步长 = 1 longword。
 3. 矩阵读入 matvec 前必须 **块浮点 (BF) 转换**，且单精度 BF 块为 4 word
    （每 PE 1 word）共用一个指数；不一致块为非法 BF，行为未定义。写 A 的
    路径必须先做 BF 量化——这决定 `tt.dot` 的数值契约不是 IEEE f32。
+   ~~**`fbfn` 目前在 LLVM 后端与 MLIR dialect 中都不存在**~~ → **已新增并
+   实测闭合 (§22.8)**：`ALUOp::FBFN = 20` / `MNCore_ALUOp_FBFN`，
+   isel 映射到 `BFN_f` / `BFN_f_M`（单输入单目的）。`dbfn` / `gbfn` 仍未接线。
 4. 单精度乘积省略两输入尾数低 5 bit（p.148），求和为精确整数加、最后
    一次舍入；即 `fmfma` **不是** bit-exact IEEE FMA。任何数值 golden 必须
    按该规则建模，不能用 `-ffast-math` 或双精度反推。
+
+### 22.7 **G0 实测：矩阵搬运的物理落点（2026-11-04，gpfn3）**
+
+**证据等级**：模拟器实测（Level 3/4 之间：gpfn3 是模型，不是硅片）。本节
+所有条目都是 dump 直接读出，不是从伪码推断；但**不得**当作对真实芯片的
+断言——凡"硬件为什么这样"的解释都属未知，只有"gpfn3 这样"是可用的契约。
+
+#### 22.7.1 先钉住的读出口径（否则一切 dump 都不可解）
+
+* PE 寄存器文件里 **longword k 占 word (2k, 2k+1)**，dump 的 `<idx>` 是
+  **word 地址**（= 2k），`v:` 是该 longword 的 64 位值；`i:` 是它拆成 4 个
+  16-bit 的视图（不是地址）。
+* `d set <mem> <addr> ...` 的 `addr` 是 **word 地址**，且一次写整个
+  longword、**向偶地址对齐**：对 `$lr1` 的写落在 longword 0。
+  （实测：依次写 `$lr0..$lr7`，只剩 `$lr1,$lr3,$lr5,$lr7` 的图案，
+  分别在 label 0,2,4,6。）
+* 因此"写 4 片、每片 64 PE"的填充手法是：`L1B[64k+p] = pattern`，再
+  `l1bmd $lb<64k> $lr<2k>v` → 第 k 个 longword。
+
+#### 22.7.2 实测映射（f32，两条指令都用 **longword / width=1**）
+
+```
+fmwrite <src> $l(x|y)<row>
+  cycle c (0..3)：取 PE q 的 longword，地址 = src_word_addr + 2c（步长 = 1 长语）
+                  写入矩阵行 (row + c) mod 8
+                  该 longword 的 LOW 半 → 列 2q，HIGH 半 → 列 2q+1
+fmread  $l(x|y)<col> <dst>
+  cycle c (0..3)：读矩阵列 (col + c)
+                  PE q 收到 行 2q → **HIGH 半**，行 2q+1 → LOW 半
+                  写入 longword (dst_word_addr/2 + (c XOR 1))
+```
+
+三条自洽性证据（缺一都不能定案）：
+
+1. **写侧**：源 slot k 的值出现在矩阵行 k（`$lx6` 起写时，slots 0..3 落到
+   行 6,7,0,1，读回时 PE0 拿到 0x22/0x23（slots 2,3），PE3 拿到 0x20/0x21
+   （slots 0,1））。
+2. **列侧**：`$lx0` / `$lx4` 起读分别取列 0..3 / 4..7，列 4..7 的值来自
+   MAB 自己的 PE2/PE3（0x12/0x13 与 0x20+k）。
+3. **`c XOR 1`**：读起始列 0 时目的 longword 的**奇偶列交换**（lw16←列1、
+   lw17←列0、lw18←列3、lw19←列2）；把起始列改成 1 时整体前移一列
+   （lw16←列0、lw17←列1 …）。任何"纯步长"模型都无法同时解释这两组，
+   故 XOR 不是拟合出来的自由度，而是被两组独立数据夹出来的。
+   **其物理原因未知**，作为 gpfn3 契约记录；真机若不同，改这一个函数即可。
+
+另外实测：
+
+* **矩阵按 MAB 私有**：每个 MAB 的矩阵只由它自己那 4 个 PE 喂入。用
+  `pattern(k,p) = 0x10+p` 时，MAB m 的列 0 读回 `0x10+4m`，与 MAB 0 不同。
+* **两个 face 几何相同**：`$ly` 与 `$lx` 逐位同构（同一探针在 Y 面复现 X 面
+  结果），两面互不干扰。
+* **两条 mwrite 可拼满 8 行**：行 0..3 与 4..7 分两次写入互不破坏（
+  `golden_mau_g0.mir` 的 8×8 全检）。
+* **`width=0` / `width=2` 不复现该映射**：
+  - `width=0`（word）：一条指令只覆盖 4 个 word / PE，写侧把同一行的
+    奇偶列拆到不同行，读侧只写回 4 个 word 且不出现在列应有位置；
+  - `width=2`（2 长语）：一个 cycle 吃两个 slot（两行），读侧只落在 PE0、
+    PE2 的四个非连续 longword。
+  二者都不是 SDM 描述的 f32 矩阵语义，**不得**用于 `mwrite`/`mread`。
+
+#### 22.7.3 对 Layer B 的结论
+
+`Tok`/`TokSlot` 的无条件 `width=2` 对 `vec.*` 是对的（已在 gpfn3 上做过
+元素级验证），但对 `fmwrite`/`fmread` **是错的**。这些指令需要按
+(opcode, operand role) 决定宽度：
+
+| 指令 | operand | 实测宽度 | 每 PE 值数 |
+|---|---|---|---|
+| `fmwrite` | src  | 1 (longword) | 4 row × 2 f32 |
+| `fmread`  | dst  | 1 (longword) | 4 col × 2 f32 |
+| `fmfma`   | src_x / src_y / dst | **未测**（SDM 提示 0 / 1 / 1） | — |
+
+#### 22.7.4 回归夹具
+
+* `golden_mau_g0.mir` — 8×8 全矩阵（行 0..3 用图案 A、行 4..7 用图案 B），
+  两次写 + 两次读，逐位比对；
+* `golden_mau_g0_y.mir` — Y 面同构性；
+* `golden_mau_smoke.mir` — MAU 是否可执行 / `assemble3` 是否接受的最小冒烟；
+* `scripts/check_mau_g0.py` — 把 §22.7.2 的模型写成代码，对 64 个 PE 的
+  每个 longword 逐格比对（含"窗口内其余位置必须为 0"与"dump 必须完整"）；
+* `scripts/run_regression.sh` 的 `MAU` 阶段同时跑 FileCheck 与该 checker。
+  `emulate_gpfn3.sh --dump golden_mau_g0.mir` 后：
+
+```sh
+python3 -I scripts/check_mau_g0.py /tmp/mncore_golden_mau_g0.dmp   --case full
+python3 -I scripts/check_mau_g0.py /tmp/mncore_golden_mau_g0_y.dmp --case y
+```
+
+2026-11-04 gpfn3 结果：`OK (case full, 1024 cells over 64 PEs)`、
+`OK (case y, 512 cells over 64 PEs)`。
+
+#### 22.7.5 仍未闭合（G1/G2/G3）
+
+* `fmfma` 的 x / y / dst 宽度与 4-cycle 地址推进（G2）——**形状已由
+  §22.10 的厂商头文件定案，数值被 §22.9 判为当前 gpfn3 不可测**；
+* ~~`fbfn`（块浮点转换）在 LLVM/MLIR 中完全不存在（G1）~~ → **已闭合
+  (§22.8)**；
+* 跨指令累加（G3）：dst 能否作为下一条 `fmfma` 的 y，以及同 slot 复用时
+  的 hazard；
+* `v<adri>` 显式步长与 MAU 4-cycle 的交互（本轮只测了 `v` 默认步长）。
+
+### 22.8 **G1 实测：`fbfn` 块浮点转换（2026-11-04，gpfn3）**
+
+**证据等级**：与 §22.7 相同——gpfn3 模拟器实测，不是硅片。
+
+#### 22.8.1 指令形状
+
+| 项 | 实测 |
+|---|---|
+| cycle 数 | 4 |
+| 每 PE 每 cycle 值数 | 1 longword（`width=1` 原生） |
+| cycle c 读 | longword `src_word/2 + c` |
+| cycle c 写 | longword `dst_word/2 + c` |
+| `width=2` | 合法，但只用每个 2 长语访问的 **MSB longword** |
+| 块的范围 | 一个 32-bit word × 一个 MAB 的 4 个 PE = 4 word 块 |
+
+关键在于**一个 longword 内的两个 32-bit word 是两个互相独立的块**：
+`fbfn` 不是"每 PE 8 个 f32 一起换算"，而是每 PE 每 cycle 各有 2 个独立
+4-word 块，块内的 4 个 word 来自同一 MAB 的 4 个 PE。故 `fbfn` 天然与
+§22.7.2 的矩阵落点同构：转换后的 word 可直接 `fmwrite` 成矩阵列。
+
+#### 22.8.2 SDM 4.4 的编码（与 IEEE 不同，必须显式建模）
+
+BF 采用**显式前导 1**：
+
+```
+value = (-1)^s * 2^(E-127) * sum_{j=1..23} 2^(1-j) * M_j
+```
+
+即尾数域按 1.xxx 解释（首项权重 2^0 = 1），**不是** IEEE 的 1.xxx 隐含 1。
+因此 1.0 在公共指数 0 下的 BF 位型是 `0x3FC00000`——IEEE 会读成 1.5。
+**原始位型永远不是 IEEE 数值**，任何比对必须先按上式解码。
+
+转换算法（`scripts/check_mau_bfn.py` 的 `bf32_block`）：
+1. 公共指数 = 块内各元素指数域的最大值；
+2. 若存在指数等于该最大值的元素且其尾数全 1，公共指数 +1（RNE 的进位）；
+3. 例外：公共指数 ≥ `0xFF` → 全部输出 inf，符号取各自输入；
+   某输入指数为 0（零/次正规）→ 输出指数 = 公共指数、尾数 0；
+   全块指数为 0 → 全零；
+4. 其余元素把 24 bit 有效数（隐含 1 + 尾数）右移 `common - e + 1`，按
+   **就近偶数**舍入；下溢保留公共指数、尾数置 0。
+
+#### 22.8.3 实测覆盖
+
+`golden_mau_bfn.mir` 用 4 个 plane × 4 cycle 覆盖：
+
+* 普通下移（不同指数混在一个块里）；
+* 进位 bump（全 1 尾数把公共指数顶上去，导致 1.999… 的邻居全被舍成 2.0）；
+* `inf` / 零 / 次正规的例外分支；
+* RNE 的三种 tie（`1+2^-23`、`1+2^-22`、`1+3*2^-23`）；
+* 两个 word lane 各自独立成块；
+* 特殊组覆盖全部 4 个 MAB、4 个 cycle、两种访问宽度。
+
+结果：`check_mau_bfn: OK (512 cells x 64 units over 64 PEs)`，逐位一致。
+
+#### 22.8.4 后端接线
+
+* `mncore::ALUOp::FBFN = 20`（`MNCoreIntrinsicOps.h`，新号段）；
+* MLIR `MNCore_ALUOp_FBFN`（`MNCoreOps.td`）+ `MNCORE_ENUM_SYNC`；
+* isel：`case ALUOp::FBFN → BFN_f / BFN_f_M`，`OneInput = true`；
+* 汇编层 `BFN_f` / `BFN_f_M` 原已存在于 `MNCoreInstrALU.td`；
+* `dbfn` / `gbfn` 的 def 存在但**未映射**（`ALUOp` 只加了 FBFN）。
+
+#### 22.8.5 回归夹具
+
+* `golden_mau_bfn.mir` — 上述输入图案；
+* `scripts/check_mau_bfn.py` — SDM 4.4 模型，逐格比对 64 个 unit；
+* `run_regression.sh` 的 `BFN` 阶段（FileCheck + dump 模型检查），
+  并列入 `HAZARD_OK`。
+* `intrinsics.ll::alu_bfn` — 走 `llvm.mncore.alu(opcode=20)` 的 isel 路径
+  （含掩码形）。
+
+#### 22.8.6 仍未闭合
+
+* `dbfn` / `gbfn`（f64 / 伪单精度）未测也未映射；
+* `fbfn` 与 `fmfma` 的**组合**未测：SDM 说 matvec 前必须先 BF 量化，
+  但"`fbfn` 输出直接作矩阵源"这一路径尚无端到端 golden（属 G2/G3 的
+  数值前提）。**2026-11-04 补充（Level 2，§22.10.2）**：厂商
+  `__builtin_matrix_loadf32` 的注释明确该序列是 `fbfn` → `fmwrite`，
+  且 `fmwrite` 本身不做转换。所以组合的**指令顺序**已有权威依据，
+  缺的只是数值 golden——而数值一侧被 §22.9 挡死；
+* 非有限值在后续 `fmfma` 中的传播未测。
+
+### 22.9 **G2 实测（未闭合）：gpfn3 的 `fmfma` 只做操作数搬运，不做乘加（2026-11-04）**
+
+**证据等级**：模拟器实测（Level 4，`gpfn3` 是模型不是硅片）。本节结论
+**只描述 gpfn3 的行为**，不能读成"芯片的 MAU 不算乘加"。
+
+#### 22.9.1 探针与判据
+
+探针（`/tmp/gen_p6.py`、`/tmp/gen_p7.py`、`/tmp/gen_p8.py`，未入库，仅作本轮
+取证）：`d set` 写 L1B → `L1BMD` 进 GRF0 → `PASSA_l` 分出 y 块 →
+`W_XFMWRITE` 写 A 面 → 一条 `XFMFMA`/`YFMFMA` → 40…200 个 `NOP` →
+`DGET` GRF0/GRF1 全量 dump。
+
+写法统一用**位型**表述，避免 BF/IEEE 混淆（见 §22.10.3）：
+
+* A 面 rows 0..3 的每个长语 = `0x000000003FC00000`，即 A[i][2p] 为 BF 1.0；
+* x（`f32x4`，2 长语）= 4 个 `0x3FC00000`，即 [1,1,1,1]（BF）；
+* y（`f32x4x2`，4 长语）= 前两长语 `0x40C0000040C00000`，后两长语 0。
+
+`A·x = 1+1+1+1 = 4.0`，y 的前两长语按 **IEEE f32** 解码为 6.0
+（`0x40C00000` 在 BF 下读作 4.0，两种口径见 §22.10.3）。若乘加成立，
+dst 前两长语应为 **10.0 = `0x41200000`**。
+
+#### 22.9.2 实测结果
+
+| 变化量 | 取值 | dst 实测 |
+|---|---|---|
+| y 前两长语 | `0x00000000` / `0x3FC00000` / `0x40C00000` | **恒等于 y，逐位** |
+| x 空间 | GRF0 / LM0 | 无差别 |
+| dst 空间 | GRF0 / GRF1 | 无差别 |
+| A 面 | 只写 rows 0..3 / 两个面都写 | 无差别 |
+| `fmfma` mat imm | 0 / 4 | 无差别 |
+| 矩阵面 | X 面（`XFMFMA`）/ Y 面（`fmwrite ... $ly0` + `fmfma $ly`） | 无差别 |
+| 延迟窗口 | 40 / 200 NOP | 无差别 |
+
+判决性的一组（A、x 全为 BF 1.0，y 前两长语 `0x40C00000`）：
+
+```
+GREG0 idx=0  v=0x40C0000040C00000     <- dst lw0，逐位等于 y lw0
+GREG0 idx=2  v=0x40C0000040C00000     <- dst lw1，逐位等于 y lw1
+GREG0 idx=4  v=0x0                    <- dst lw2 = y lw2 = 0
+GREG0 idx=6  v=0x0                    <- dst lw3 = y lw3 = 0
+```
+
+预期 `10.0 = 0x41200000`，实测逐位等于 **y**。即
+**`dst := y`（每 cycle 一个长语的原样拷贝），A·x 项恒为 0**。
+
+#### 22.9.3 gpfn3 确实读并校验了操作数
+
+不是"整条指令被忽略"：
+
+* dst 的 4 个长语被**全部重写**（`y = 0` 时被写成 0，而不是保持原值）——
+  写通路是通的；
+* 喂原始 IEEE 位型会触发
+  `Invalid block float format. The exponent of 4th element is not equal to
+  the common exponent ...`，说明 MAU 侧有块浮点解码与校验；
+* `fmwrite`/`fmread` 的搬运（G0，§22.7）在同一程序里正确工作；
+* 逐位复制说明 y 的通路是精确的，缺的只是乘积项。
+
+#### 22.9.4 对 G2 / G3 与 `tt.dot` 的影响
+
+* **G2 无法在本模拟器上闭合**：用户指令里的"数值 golden"这一环缺少可用的
+  参考实现。G3（跨指令 K 累积走 y）同样落在同一条失效通路上。
+* §22.5 的 fail-closed 门禁**继续有效**，且理由从"未测"加强为"实测到模型
+  缺项"。`tl.dot` 不得打开。
+* 数值契约只能从两条路取得，二者都还没做：
+  1. 真实芯片/TEG 上的 MAU 实测；
+  2. 按 SDM p.114 伪码 + p.148 的截断/舍入规则自建参考模型（会与 gpfn3 的
+     行为冲突，必须显式标注为**模型**而非实测）。
+* **可用结论**（结构性，不依赖乘加）：`fmfma` 的 dst 每 cycle 写 1
+  longword / PE，4 cycle 共 4 longword，与 G0 的 longword 访问宽度结论
+  一致；y 与 dst 同宽同位，因此 `dst` 与 `y` 可以取同一寄存器做就地累积。
+
+#### 22.9.5 仍未闭合
+
+* `fmfma` 的 x/y/dst 三行 width 是否与 §22.4 表格一致——本次只验证了
+  width=1 下 dst 可写、可读回，**没能**通过"结果是否正确"来反证 x 的宽度；
+* 向量形（`fvfma` 及 `_M` 掩码形）未测：从 MIR 直接写 `XFVFMA` 时 llc
+  不产出指令，属后端接线缺口，与 MAU 语义无关；
+* mask 寄存器对 `fmfma` 的作用未测。
+
+### 22.10 厂商 SDK 头文件对操作数形状的独立确认（Level 2，2026-11-04）
+
+来源（`suzhou`）：`/opt/pfn/pfcomp/hpc/mncl/include/mncl/device/mncore2.h`
+与 `.../mncore2_builtin_wrappers.h`。这是厂商给 MNCL 用的 C++ intrinsic 声明，
+**不是**我们从伪码推的期望，也不是模拟器行为——属于 §5 的 Level 2 同谱系
+先验，可以单独支撑"形状/宽度"，但**不能**支撑数值。
+
+#### 22.10.1 类型即访问宽度
+
+| 类型 | 定义 | 每 PE 值数 | 长语数 |
+|---|---|---|---|
+| `f32x4` | `typedef DLW f32 f32x4` | 4 | 2 |
+| `f32x4x2` | `typedef FULLCYCLE_LW f32 f32x4x2` | 8 | 4 |
+| `bf32x4` | `struct { f32x4 __inner; }` | 4 | 2 |
+| `bf32x4x2` | `struct { f32x4x2 __inner; }` | 8 | 4 |
+
+#### 22.10.2 三条矩阵指令的权威签名
+
+```
+f32x4x2 __builtin_fmfma_raw(MAB m32x8x8*, f32x4 /*x*/, f32x4x2 /*y*/);
+void    __builtin_fmwrite0..7(f32x4x2 /*src*/, MAB m32x8x8*);
+f32x4x2 __builtin_fmread0..7(MAB m32x8x8*);
+```
+
+由此定案（与 §22.7 的实测一致）：
+
+* `fmwrite` / `fmread` 每指令每 PE 搬 **4 个长语**（`f32x4x2`），即
+  **width = 1**。§22.4 表里这两行是对的。
+* `fmwrite{N}` 的 N 是**起始行**：`__builtin_matrix_loadf32(_with_bf)` 就是
+  `fmwrite0 + fmwrite4` 两条铺满 8 行，所以一条 `fmwriteN` 覆盖 N..N+3 四行
+  （头文件的 "Write row N" 是简写，不能按字面读）。这独立确认了 §22.7 的
+  `mat` 立即数 = 2 × 起始行（MIR 0 和 8 → `$lx0`/`$lx4`，起始行 0 和 4）。
+* `fmread{N}` 的 N 是**起始列**（头文件写明 "starting from column N"），
+  与 §22.7 的"`fmread` cycle c 读第 `start_col + c` 列"一致。
+* `fmfma` 的 x 是 **`f32x4` = 2 长语**（4 个 cycle 合计，每 cycle 1 word），
+  y 与 dst 是 **`f32x4x2` = 4 长语**。§22.4 表中 x 记作 "4 word / width 0"
+  在总量上正确。
+* **`fmfma` 的加数与结果都是普通 IEEE f32，不是块浮点**：
+  `__builtin_fmfma` 的注释写明 "The addend is single precision"，只有 x 经
+  `__builtin_fbfnx4` 转成 `bf32x4`。"The matrix uses columns 0, 2, 4 and 6 of
+  the 8x8 register" 也与 §22.1 一致。
+* 存在 `__builtin_fmmul`（`d = A·x`，无加数）与 `_raw` 变体；`fvfma/fvmul/
+  fvadd/fvpassa` 的 f32 形态是 `f32x4x2` 全宽向量运算。
+* **写矩阵的标准序列是 `fbfn` → `fmwrite`**：`__builtin_matrix_loadf32`
+  的注释是 "by emitting `fbfn` then `fmwrite` matrix-register write
+  instructions"，而 `__builtin_fmwrite0` 明确 "no `fbfn` is emitted, so
+  `from` is written as it stands"。这就把 §22.8.6 里"`fbfn` 与 `fmfma` 的
+  组合未测"从**厂商文档**层面补上了：GEMM 的正确数据通路是
+  f32 → `fbfn` → `fmwrite` → `fmfma`，且 `fbfn` 与 `fmwrite` 是两条独立
+  指令（对应我们已有的 G1 与 G0 夹具，只是尚未在同一程序里串起来）。
+
+#### 22.10.3 对 §22.9 的反向核对（关键）
+
+既然 y 与 dst 都是 **IEEE f32**，§22.9 探针里 `y = 0x40C00000` 的真值是
+**6.0**（同一个位型在 BF 口径下读作 4.0——这正是必须写清口径的原因），
+而 dst 读回逐位等于 `0x40C00000`，即 6.0。
+即：**在正确的 IEEE 口径下 dst 仍然逐位等于 y，A·x 一项贡献为 0**。
+§22.9 的结论不依赖 BF/IEEE 的口径误读，成立。
+
+同时这也修正了本节初稿里的措辞错误：`0x40C00000` 曾被写成 "BF(4.0)"，
+而它作为 IEEE f32 是 **6.0**。结论不变——dst 是 y 的**逐位**复制，与用哪种
+口径解读无关；只有"若乘加成立应得 10.0"这一句需要按 IEEE 口径写。
+
+### 22.11 按 ABI 文档 + MLSDK 文档重建的契约（Level 2/3，2026-11-04）
+
+指定的两份材料是 `llvm/lib/Target/MNCore/docs/mncore_kernel_abi_v1.md` 与
+`https://dev.mn-core.com/sdk/0.9/MLSDK/docs/en/getting_started.html`。
+重建的结论必须先说清楚：**两份材料都不含 MAU 数值语义**。能重建的是
+"MAU 操作数与 ABI 参数槽的接口形状"，以及一条此前只有模拟器侧证据的宽度
+单位；数值仍缺，门禁不动。
+
+#### 22.11.1 各来源实际覆盖的范围（逐条核对，未外推）
+
+| 来源 | 与 MAU 有关的内容 | 能否支撑数值 |
+|---|---|---|
+| `mncore_kernel_abi_v1.md` | ① 参数物理布局 v1（向量 slot = **2 长语**）；② kernel metadata 的资源保留项 `matrix`；③ 示例 entry 名为 `gemm_f32` | 否。全文对 `fmfma`/`fbfn`/块浮点**零提及** |
+| MLSDK `getting_started` | 设备串 `"mncore2:auto"` / `"emu2"` / `"pfvm:cpu|cuda"`；`Context.compile` → `CompiledFunction` → `TensorProxy.cpu()`；`float_dtype`；`model.app` 与 `dump_gpfnapp` | 否。无 MAU / matmul / 操作数尺寸 |
+| MLSDK `hardware_specification` | "Matrix processing units contained within each MAB"；存在 block floating-point 与 pseudo-single 格式，主要用于矩阵-向量点积；访问宽度 `$l`/`$ll` 的增量为 1/2/4 | 否。明确把 ISA 细节留给 dev manual |
+| MLSDK `technical_notes` | 只有图层面的 GEMM dtype/layout 规划 | 否 |
+| MLSDK `api_reference` | `float_dtype=mixed`（默认）把 **GEMM 的输入输出降为 half**；`float` 强制全 f32 | 这是**精度口径**，不是 MAU 语义 |
+
+（`getting_started` 原文只在 setup/编译/取数上；`technical_notes` 原文只在
+MNGraph/Layout/Scheduler 上。两者都没有 `m32x8x8`、`bf32x4`、`fbfn`。）
+
+#### 22.11.2 唯一新获得的独立证据：访问宽度单位
+
+`hardware_specification` 写明 `$l`/`$ll` 是**访问宽度说明符**、与地址单位
+无关；`$m8`、`$lm8`、`$llm8` 从**同一地址**起、增量分别为 **1/2/4**。
+（该页在 `suzhou:/opt/pfn/pfcomp/codegen/MLSDK/docs/en/hardware_specification.html`
+有同版本副本，已核对；同一段落把块浮点细节指给
+`mncore2_dev_manual_{en,ja}.pdf`，即 §22.1 已在用的 SDM，没有新增数值。）
+这正是 packed `peoperand` 的 `width` 字段（0/1/2）的含义，此前只有 gpfn3
+侧的实证（§22.7）。现在它有了一条**不依赖模拟器**的 Level 2 来源，因此
+"按 (opcode, role) 生成访问宽度"的后端改造在**形状层面**已可开工——它不
+需要数值 golden，也不会因此产生任何数值断言。
+
+#### 22.11.3 ABI 参数槽 vs MAU 操作数宽度：一处真实冲突
+
+ABI v1 冻结的向量参数落位是"`space = 1 + i % 4`，地址 `16 * (i / 4)` word，
+**2 长语**"。与 §22.10 的厂商签名对齐后：
+
+| 操作数 | 宽度 | 与 ABI v1 向量 slot 的关系 |
+|---|---|---|
+| `fmfma` 的 x（`f32x4`） | 2 LW | 恰好一个 slot |
+| `fbfn` 的输入 / 输出（`f32x4` / `bf32x4`） | 2 LW | 恰好一个 slot |
+| `fmfma` 的 y / dst（`f32x4x2`） | 4 LW | **两个 slot**，或新参数 kind |
+| `fmwrite` / `fmread` 的 src / dst（`f32x4x2`） | 4 LW | **两个 slot** |
+
+结论：GEMM 内核的 y 与 dst **不能**沿用"一个向量参数 = 一个 MAU 操作数"的
+假设。**禁止**把 v1 的 2-LW slot 就地加宽——参数布局是冻结项，改动会破坏
+已发布的 argument placement。允许的两条路：
+
+1. 连续两个向量 slot 拼成 `f32x4x2`。受 `space = 1 + i % 4` 约束，只有
+   `i % 4 ∈ {0,1}` 或 `{2,3}` 的相邻对落在同一 space、地址相差 16 word；
+   lowering 必须显式校验这一点，否则拒绝。
+2. 在 metadata 里新增 `kind: matrix`，由 lowering 直接生成 4-LW 落位。
+
+选哪条要在 GEMM lowering 落地前一并定案，本文不预先决定。另外
+`resources.matrix` 目前只有"存在这个保留项"，**没有任何占用单位定义**；
+metadata 生成器只能写不透明占用并由 runtime 拒绝未知单位，**不得凭空给
+一个数**。
+
+#### 22.11.4 文档仍然完全没有定义的三项
+
+1. `fmfma` 是否执行乘加（文档只给伪码；gpfn3 实测为 `dst := y`，§22.9）。
+2. `fbfn` 的**公共指数选择规则**：4 个元素中谁定指数、如何舍入、溢出/
+   下溢行为。SDM 只给解码式（§22.8）。
+3. 掩码（`/0111` 等）对 MAU 的语义。
+
+这三项**不能**从文档重建，只能实测或取得 dev manual。
+
+#### 22.11.5 `emu2` 已实测可运行，且确为指令级数值模型（2026-11-04）
+
+此前记录的"不可运行"是**环境缺口**，不是 SDK 限制。补齐后实测通过的
+最小配方（suzhou，2026-11-04）：
+
+1. python3.12：`~/miniforge3/bin/mamba create -y -n mncore312 python=3.12`
+   （本机 `conda create` 因 libmamba 求解器插件损坏不可用）。
+2. torch **2.9.0+cpu**，索引 `https://download.pytorch.org/whl/cpu/`。
+   版本不是猜的：MLSDK 容器构建参数写死 `ARG torch_version=2.9.0` /
+   `ARG torch_index_url=https://download.pytorch.org/whl/cpu/`，
+   `examples/ncf_training/requirements_training.txt` 同样 pin `torch==2.9.0`。
+   实测 2.15 / 2.6 / 2.4.1 / 2.3.1 全部失败：`libpfvm_runtime.so` 需要
+   `c10::SymInt::sym_gt_slow_path` 与
+   `c10::impl::cow::materialize_cow_storage` **同时**存在；2.15 只有前者、
+   2.3–2.6 只有后者，2.9 是唯一两个都导出的版本
+   （`nm -D .../torch/lib/libc10.so` 两个均为 `T`）。
+3. 依赖按 import 缺口逐个补齐：`pfio numpy retrying pytorch-pfn-extras
+   onnx onnxscript accelerate`。
+4. **必须在 `sde64 -hsw` 下运行**：直接执行 python 会在
+   `grape_pfn::codegen::MemoryUnitSet::MemoryUnitSet()` 处 SIGILL
+   （宿主 CPU 缺 AVX-512，与 assemble3 / gpfn3 同一原因，不是 MLSKD 的问题）。
+5. 环境变量：
+   `source /opt/pfn/pfcomp/codegen/build/codegen_pythonpath.sh` 加
+   `LD_LIBRARY_PATH=$P/lib:$P/lib/python3.12/site-packages/torch/lib`。
+
+实测结论（`a(8×4) @ b(4×4)`，`options={"float_dtype": "float"}`）：
+
+* **能算**：整数数据下结果与 CPU `a @ b` **逐位相同**（max abs diff = 0）。
+* **但不是 f32 直算**：把输入换成混合量级的满尾数随机数后
+  max rel diff = **4.38e-6**（不再逐位相等）。emu2 复现的是降低精度的
+  MAU 数据通路，不是宿主 f32 matmul。**推论：`float_dtype=float` 不等于
+  "精确 f32 GEMM"，验收不能用 f32 位精确作判据。**
+* **确实是指令级**：厂商为同一张图生成的 `model.vsm` 里，GEMM 节点由
+  `gmwrite` / `gbfn` / `gmmul` 组成（`gmmul $ly $aluf -> $ln0/1000`），
+  **不是 `fmfma`**。把这串指令交给 gpfn3 时，模拟器会逐指令校验块浮点载荷，
+  非法载荷直接抛
+  `Invalid block float format. The exponent of 2th element is not equal to
+  the common exponent 0. Maybe BFn/BFe is lacking.`
+  —— 同时证明 (a) 模拟器在执行指令而非跑图；(b) `g*` 家族要求操作数先经
+  `gbfn` 转换（把裸 f32 直接喂给 `gmwrite` 会被拒）。
+
+对 G2 的直接影响：
+
+* `emu2` 现在是**可用的指令级参考模型**，这正是 §22.11.4 第 1 项的解锁条件。
+* 但它首先暴露的是**指令选择问题**：厂商的 f32 GEMM 走 `gmmul`（伪单精度
+  家族），我们的后端只发 `fmfma`（f32 家族）。两者都挂在 `m32x8x8` 上，
+  `mncore2.h` 明确把 `g*` 描述为 "pseudo-single-precision counterparts …
+  select the MAU's pseudo-single-word mode"，且
+  `__builtin_fmfma_raw(MAB, f32x4, f32x4x2)` **独立确认了 §22.11.3 的按角色
+  宽度**（x = 4 word = 2 LW，y/dst = 8 word = 4 LW；`__builtin_gmmul`
+  则取 `f32x4x2` 载荷）。
+* 因此 **G2 仍未闭合**，但阻塞点已经从"没有参考模型"变成
+  "`fmfma` 在本模拟器上不产生乘积（§22.9 的 `dst := y`），而厂商 GEMM
+  根本不用它"。下一步最小实验：用合法 `gbfn` 载荷复现 `gmmul`
+  （8×8 矩阵需 8 次 `gmwrite`），再决定 lowering 是改发 `gmmul` 序列，
+  还是先用 `mncl` 的 `__builtin_matmulf32` / `__builtin_gmmul_bpf`
+  生成对照。
+
+**`pfvm:cpu` / `pfvm:cuda` 不是 MAU 的参考模型（2026-11-04 补充）**：厂商文档
+写的是 PFVM "traces PyTorch programs to construct and optimize computation
+graphs"，"both cpu and cuda execute computations by calling PyTorch's C++ API"，
+而 "Unlike emu2, which runs directly on the CPU"。即 `emu2` 走的是编译后的
+MN-Core 程序（指令级），`pfvm:*` 走的是 PyTorch 图执行——没有 `fmfma`、
+没有矩阵面、没有块浮点，只能复现"数学上应得的结果"（本机 numpy 已经能做）。
+因此 `pfvm` **不能**替代 G2 的单指令 golden，也不能证明我们的 lowering 正确；
+它至多用于端到端黑箱对照，且同样受 `float_dtype` 口径与 torch 依赖（本机无）
+限制。`pfvm:cuda` 还要求有 CUDA 设备，本机无。
+
+→ 状态 UNVERIFIED。G2/G3 不放行，`tl.dot` 保持 fail-closed（§22.5）。
+
+### 22.12 mncl→emu2 实测：矩阵面可用，`$mauf` 读回的乘积不可用（2026-11-05）
+
+**证据等级**：模拟器实测（Level 4）+ 厂商二进制字符串（Level 2）。本节把
+§22.11.5 的"下一步最小实验"做完了，结论是**否决了这条取证路线**，
+并给出否决的理由与它对 lowering 的约束。
+
+#### 22.12.1 基线与反例（先说通路没问题）
+
+* **基线**：厂商自带例子
+  `share/mncl/examples/f32_f16_roundtrip`（纯 ALU/传输，**无 MAU**）用
+  `mnclc` 编成 `.bin`、在本机 `libmncl` 的
+  `CL_DEVICE_TYPE_EMU_MNCORE2` 上跑通：`max_rel_err = 9.76e-4`、`[OK]`
+  （边角输入 f16 上下溢全部按预期）。所以 `mnclc` 产物 + emu2 通路本身
+  是好的，下面所有异常都不来自"kernel 根本没跑"。
+* **反例（同一 emu2、同一 host 程序）**：MLSDK 编译的 `a(8×4) @ b(4×4)`
+  与 torch 结果**逐位相同**。所以 emu2 的 MAU **是实现了的**。
+
+#### 22.12.2 矩阵面本身可用
+
+`probe5`（`/tmp/mncl_t/mau_probe5.c`）：
+`fbfn → fmwrite0/fmwrite4 → fmread0/fmread4`，上四行写 1.0、下四行写 2.0。
+读回（PE0）为 `1.5 1.5 1.5 1.5 3 3 3 3`。
+
+这不是错误：`fmread` 返回的是**块浮点原始字型**，`1.0` 的 BF 字是
+`0x3FC00000`，按 IEEE f32 读正是 1.5；`2.0` 的 BF 字 `0x40400000` 读作 3.0。
+与 §22.8.2 的"显式前导 1"编码自洽，也与 §22.10 的"`b*` 载荷是不透明的"
+一致。**结论：写矩阵、读矩阵、BF 编码在 emu2 上都是对的。**
+
+#### 22.12.3 `$mauf` 读回的乘积不可用
+
+四个探针（`mau_probe2/3/4/6.c`）覆盖 f/g 两族 × `mmul`/`mfma`，
+全部走 mnclc 生成的 `… -> $nowrite` + `lpassa $mauf -> $lm…`：
+
+| 探针 | 意图 | 实测 |
+|---|---|---|
+| probe2 | f 族；行常矩阵 vs 列幂矩阵；`x={1,2,4,8}` | 两组矩阵**同一结果**，三组输出**同一结果** |
+| probe3 | g 族，同上，`x={1,…,128}` | 同上（数值恰为 probe2 的 3 倍） |
+| probe4 | 规范填充（`gmwrite0/4`）；全 1 矩阵 vs 全 0 矩阵；`gfma` 加数 `{100,…,800}` | **四个输出全为 12**：零矩阵非 0、加数完全不出现 |
+| probe6 | 同 probe4，但 BF 向量改成**单次使用临时量**，迫使分配器靠近使用点 | 仍为 **12**，且 `-O0/-O1/-Osize` 下产物一致 |
+
+判决性的一条：`gmmul` 对**全零矩阵**与**全 1 矩阵**给出**逐位相同**的结果。
+任何线性模型都不可能同时成立，所以这不是"列映射猜错"，而是**乘积没有
+进到被读的那个寄存器**。
+
+#### 22.12.4 差异在哪里：操作数空间
+
+对比同一 emu2 能跑对的厂商 GEMM（§22.7.5 的 `model.vsm`）与 mnclc 产物：
+
+| | 厂商 MLSDK 生成的 GEMM | mnclc 生成的 MAU |
+|---|---|---|
+| 矩阵写入源 | `gmwrite $lbf -> $lx0` / `$aluf` | `gmwrite $lm0v -> $lx0` |
+| 乘法向量源 | `gmmul $ly $aluf` | `gmmul $lx $lm156v` |
+| 结果去处 | `-> $ln0/1000`（真实目的寄存器） | `-> $nowrite`，靠 `lpassa $mauf` 读回 |
+
+`libmncl.so` 内含字符串
+`convert_instruction_to_uop: MAU input supports only GRF / dram / forward /
+treg yet (temporary)`——emu2 的 MAU **计算输入**只实现 GRF / DRAM /
+转发锁存器 / T 寄存器，**本地内存 LM 不在其中**；而 mnclc 恰恰一律把
+MAU 输入放在 `$lm…`，并从 `$mauf` 取结果。
+
+这是**解释**而不是**证明**：字符串只表明该检查存在，没有日志证明它在本
+次运行里触发（`EMU_LIME_UOP_CHECK=1`、`GLOG_v=2` 都没有新输出；
+`EMU_IEEE754_MAU` / `EMU_LIME_MAU_SOA` /
+`EMU_MAU_FLUSH_UPPER_SINGLEWORD` 三个开关也不改变结果）。但四组合完全
+一致地指向同一处，且反例（厂商形式）在同一模拟器上正确，这是目前唯一
+能同时解释全部数据的假设。
+
+#### 22.12.5 对 G2 / lowering 的影响
+
+* **G2 仍在原位，但取证路线被否决**：`emu2` 能算的只有**厂商那种操作数
+  形式**（转发锁存器 + 真实目的寄存器），`gpfn3` 能接受的是 vsm 但乘积项
+  缺失（§22.9）。两条模拟器路线在"用我们自己后端发出的指令去验证乘积"
+  这件事上**同时不通**，且原因是同一个：**指令形式**，不是数值语义。
+* **对 lowering 的硬约束**：若希望产物可在 emu2 上数值验证，必须发出
+  `$aluf`/`$lbf` 一类转发锁存器作 MAU 输入、并把结果写进**真实目的
+  寄存器**，不得用 `-> $nowrite` + `$mauf`。这条约束先于"选 f 族还是 g 族"
+  ——两族在 emu2 上都受同一限制。
+* **数值验收口径**（来自 §22.11.5，仍是唯一可用的实测口径）：整数数据
+  逐位一致；满尾数相对误差 ~4.4e-6 属 MAU 正常的降低精度行为，不能用
+  f32 位精确当判据。
+* 产物与探针留在 `suzhou:/tmp/mncl_t/`（`mau_host.cc` 为 host 驱动，
+  `mau_probe{2,3,4,5,6}.c/.bin`，`probe*_dump.txt`），未入库：它们是
+  一次性取证工具，不是回归夹具。
+
+#### 22.12.6 仍未闭合
+
+* 尚无任何一次"我们后端发出的 GEMM 指令流"的数值 golden；上面所有数值
+  都属于**厂商编译器的产物**。
+* `$mauf` 在真机上是否等价于 `-> $ln` 的目的寄存器语义，未知；本轮只能
+  确认 emu2 不给出等价行为。
+* `dmfma`/`hmfma` 与 f16/f64 矩阵面在 emu2 上的行为未测。
+
+### 22.13 f32 矩阵角色宽度落地与 `mncore.gemm.tile` 结构金标（2026-11-05）
+
+**证据等级**：文档+代码形状（本机）+ `assemble3` 实机接受（suzhou）。
+
+本轮把 §22.4 / §22.10 / §22.11.2 推出的**按角色访问宽度**从纸面落到
+intrinsic ABI 和 MLIR 类型上，并把一个 8×4×4 的 GEMM tile 接到后端。
+**本轮没有产生任何数值 golden**——§22.12 已经把"用我们自己发出的指令流
+验证乘积"这条路否决了。所以这次交付的判定词是**形状合法性**，
+不是**数值闭合**，两者不得混谈（§22.12.5、§22.11.4）。
+
+#### 22.13.1 类型契约（唯一真源：`IntrinsicsMNCore.td`）
+
+| 角色 | 改前 | 改后 | 依据 |
+|---|---|---|---|
+| `fmfma` x | `<4 x float>`（2 LW） | 不变 | 1 word/cycle × 4 |
+| `fmfma` y / dst | `<4 x float>` | **`<8 x float>`（4 LW）** | 1 LW/cycle × 4 |
+| `fmwrite` src | `<4 x float>` | **`<8 x float>`** | 1 LW/cycle × 4 |
+| `fmread` dst | `<4 x float>` | **`<8 x float>`** | 1 LW/cycle × 4 |
+
+* `llvm.mncore.matvec.v4f32` 的名字后缀描述的是 **x**——唯一与向量族不同
+  的窄角色；返回类型与 y 都是 `v8f32`。名字不再能推出全签名，
+  `MNCoreLowerTypedIntrinsics` 的 `checkShapes` 逐角色重校整条调用，
+  名字只用于选 opcode。
+* `matwrite_v4f32` / `matread_v4f32` **删除**。留着它们等于允许前端发出
+  一条只搬一半数据的 `fmwrite`/`fmread`；宁可编译期报错。
+
+#### 22.13.2 槽位：16 word 本来就够
+
+分配器按 **16 word / slot** 布（因为 width=2 的操作数是 4 cycle × 4 word）。
+一个 4 LW 矩阵操作数按自己的自然宽度（1 LW/cycle）只访问该 slot 的
+**8 word**，所以**不需要更宽的 slot，槽模型未改**。
+
+这**不是**说 §22.11.3 的冲突已经解决：那里问的是"一个函数参数怎么喂进
+4 LW"（选项 1 相邻两 slot 拼接，选项 2 新增 `kind: matrix`），本轮两条都
+没有选，ABI v1 的参数布局未动。当前只做到"给定 4 LW 值，后端能正确地
+发指令"。
+
+#### 22.13.3 MLIR：`mncore.gemm.tile`
+
+```
+mncore.gemm.tile <face = 0> (a_lo, a_hi, b, c0) : (v8f32, v8f32, v4f32, v8f32) -> v8f32
+```
+
+语义 `C = A(8×4) · B(4×4) + C0`，一个矩阵面。`a_lo`/`a_hi` 是 A 的行
+0–3 / 4–7，`b` 是 matvec 的 4 word 输入（对应 §22.7 的偶列 0/2/4/6
+契约），`c0`/结果都是 4 LW slab。
+
+verifier：`face ∈ {0,1}`；`a_lo`/`a_hi`/`c0`/结果必须是 `<8 x f32>`；
+`b` 必须是 `<4 x f32>`。三个负向 fixture 分别只出第一条诊断：
+`matwrite_2lw`、`matvec_narrow_y`、`gemmtile_wide_b`。
+
+#### 22.13.4 lowering 产物与 assemble3 实测
+
+`mlir/test/Integration/MNCore/gemm.mlir` 端到端（mlir-opt → mlir-translate
+→ llc -mtriple=mncore2）：
+
+```
+	fmwrite $lr0v $lx0
+	fmwrite $ls0v $lx4
+	fmfma $lx $m0v $ln0v $lr0v; fmwrite $lr0v $ly0
+```
+
+* 两次 `fmwrite` 落在行 0 / 4（§22.7.2 的 `(row+c) mod 8` 规则），一次
+  `fmfma`；结果用 `fmwrite` 落到**另一个面**，满足 packetizer 的
+  "同一面每 packet 至多一次"。
+* `assemble3 --instruction-mode flat`（**hazard 检查开启**）：rc=0，
+  无诊断，产出 3 条二进制指令。
+* `run_regression.sh`（本地 FileCheck + 远端 assemble3/gpfn3 + MAU
+  G0/G1/G2 金标 + 远端 hazard 阶段）：**本地 0 失败 / 远端 0 失败**，
+  `layerb`、`layerb2` 在 hazard 阶段也 PASS——即按角色宽度改过之后的
+  指令流是 hazard 合法的。
+* `mlir/test/Integration/MNCore/e2e.sh` 改为默认遍历目录下全部 `*.mlir`
+  （并拒绝"零指令"产物），当前 6/6 通过。
+
+#### 22.13.5 本轮**不**证明什么
+
+* **不证明乘积**：gpfn3 上 `fmfma` 仍然 `dst := y`（§22.9），emu2 上
+  mnclc 形式的 `$mauf` 回读不可用（§22.12）。
+* **不证明偶列约定就是硬件的有效 8×4**：它来自 §22.7 的 matvec 契约，
+  本轮没有新的实测。
+* **不证明指令族选对**：厂商 GEMM 发 `g*`（§22.11.5），我们发 `f*`；
+  两者在模拟器上的行为差异原样保留。
+* `gemm.mlir` 文件头已显式写明它是 **STRUCTURAL golden**（钉指令选择，
+  不钉数值）。
+* 因此 §22.13 不改变任何门禁：G0/G1 已闭，**G2/G3 原位**，`tl.dot`
+  保持 fail-closed。
+
+#### 22.13.6 下一轮要动数值时的前置条件
+
+不是继续加形状，而是先满足 §22.12.5 的硬约束：MAU 输入必须发转发锁存器
+/GRF 形式，结果必须写进**真实目的寄存器**（不得 `-> $nowrite` + `$mauf`）。
+在此之前，形状与 lowering 再完善也不会产生可验证的数。
