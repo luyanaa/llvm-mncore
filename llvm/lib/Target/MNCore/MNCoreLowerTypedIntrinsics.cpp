@@ -14,15 +14,21 @@
 // Coverage:
 //   vector: fma / mul / add / max / min for <2 x double>, <4 x float>,
 //           <8 x half>;
-//   matrix: matvec / matwrite / matread for the same three element types.
+//   matrix: matvec / matwrite / matread. The f32 matrix roles are wider than
+//           the vector forms: x is <4 x float> (2 longwords) but y, dst and
+//           the fmwrite/fmread operand are <8 x float> (4 longwords), because
+//           one expression spans four cycles at one longword per cycle and
+//           the wire form is f32x4x2 (SDM 4.4; design doc 22.4/22.10/22.13).
+//           The f64/f16 matrix forms keep their single 2-longword type.
 //
 // Slot allocation (v2, still deliberately simple but constraint-aware):
-//   * 2-longword slots. The accessed region of a 2-longword operand is 16
-//     words (4 cycles x 4 words), so slots are 16 words apart — a smaller
-//     step makes neighbouring slots overlap and assemble3 reports a data
-//     race. Slots rotate over GRF0/GRF1/LM0/LM1 because one address field
-//     per space exists: two distinct same-space inputs in one expression
-//     would be a field conflict;
+//   * 16-word slots. The accessed region of a 2-longword operand is 16 words
+//     (4 cycles x 4 words), so slots are 16 words apart — a smaller step
+//     makes neighbouring slots overlap and assemble3 reports a data race.
+//     A 4-longword matrix operand is read at longword width, i.e. 8 words of
+//     its slot, so it needs no wider slot. Slots rotate over GRF0/GRF1/LM0/LM1
+//     because one address field per space exists: two distinct same-space
+//     inputs in one expression would be a field conflict;
 //   * a value's slot is released after its last use and reused (linear-scan
 //     liveness, no cross-block analysis);
 //   * a destination takes a space not read by the same expression;
@@ -51,6 +57,11 @@ enum class Op { FMA, MUL, ADD, MAX, MIN, MATVEC, MATWRITE, MATREAD,
                 L1LOAD, L1STORE };
 enum class Prec { D, F, H };
 
+// A typed operand's size in 32-bit words per PE. 2 longwords is the vector
+// form; 4 longwords is the wide f32 matrix form (f32x4x2).
+constexpr unsigned Words2LW = 4;
+constexpr unsigned Words4LW = 8;
+
 class MNCoreLowerTypedIntrinsics : public FunctionPass {
 public:
   static char ID;
@@ -58,25 +69,28 @@ public:
   bool runOnFunction(Function &F) override;
 
 private:
-  static bool parseName(StringRef Name, Op &O, Prec &P);
-  static bool classify(Type *VT, Prec &P);
+  static bool parseName(StringRef Name, Op &O, Prec &P, unsigned &Words);
+  static bool classify(Type *VT, Prec &P, unsigned &Words);
+  static void checkShapes(CallInst *CI, Op O, Prec P, StringRef Name);
 };
 
 } // end anonymous namespace
 
-bool MNCoreLowerTypedIntrinsics::classify(Type *VT, Prec &P) {
+bool MNCoreLowerTypedIntrinsics::classify(Type *VT, Prec &P, unsigned &Words) {
   auto *Vec = dyn_cast<FixedVectorType>(VT);
   if (!Vec)
     return false;
   unsigned N = Vec->getNumElements();
   Type *E = Vec->getElementType();
-  if (E->isDoubleTy() && N == 2) { P = Prec::D; return true; }
-  if (E->isFloatTy() && N == 4) { P = Prec::F; return true; }
-  if (E->isHalfTy() && N == 8) { P = Prec::H; return true; }
+  if (E->isDoubleTy() && N == 2) { P = Prec::D; Words = Words2LW; return true; }
+  if (E->isFloatTy() && N == 4) { P = Prec::F; Words = Words2LW; return true; }
+  if (E->isFloatTy() && N == 8) { P = Prec::F; Words = Words4LW; return true; }
+  if (E->isHalfTy() && N == 8) { P = Prec::H; Words = Words2LW; return true; }
   return false;
 }
 
-bool MNCoreLowerTypedIntrinsics::parseName(StringRef Name, Op &O, Prec &P) {
+bool MNCoreLowerTypedIntrinsics::parseName(StringRef Name, Op &O, Prec &P,
+                                           unsigned &Words) {
   // llvm.mncore.<op>.<type>
   if (!Name.starts_with("llvm.mncore."))
     return false;
@@ -94,10 +108,60 @@ bool MNCoreLowerTypedIntrinsics::parseName(StringRef Name, Op &O, Prec &P) {
   else if (OpName == "l1load") O = Op::L1LOAD;
   else if (OpName == "l1store") O = Op::L1STORE;
   else return false;
-  if (Ty == "v2f64") { P = Prec::D; return true; }
-  if (Ty == "v4f32") { P = Prec::F; return true; }
-  if (Ty == "v8f16") { P = Prec::H; return true; }
+  // The 4-longword f32 form exists only for the matrix instructions; a
+  // `fma.v8f32` is not a hardware operation and must stay unlowered.
+  bool Matrix = (O == Op::MATVEC || O == Op::MATWRITE || O == Op::MATREAD);
+  if (Ty == "v2f64") { P = Prec::D; Words = Words2LW; return true; }
+  if (Ty == "v4f32") { P = Prec::F; Words = Words2LW; return true; }
+  if (Ty == "v8f32") { P = Prec::F; Words = Words4LW; return Matrix; }
+  if (Ty == "v8f16") { P = Prec::H; Words = Words2LW; return true; }
   return false;
+}
+
+// The declared signature must agree with the role widths the access-width
+// table emits (see runOnFunction). A 2-longword value fed to a 4-longword
+// matrix role would silently leave half of the hardware operand stale, and a
+// 4-longword value in a 2-longword vector expression would give the region
+// model a slot it never verified. Both are contract errors, not warnings.
+void MNCoreLowerTypedIntrinsics::checkShapes(CallInst *CI, Op O, Prec P,
+                                             StringRef Name) {
+  auto Expect = [&](Type *T, unsigned Want, const char *Role) {
+    Prec TP;
+    unsigned TW = 0;
+    if (!classify(T, TP, TW))
+      report_fatal_error(Twine("MN-Core2 Layer B: ") + Name + ": " + Role +
+                         " is not a typed vector operand");
+    if (TP != P || TW != Want)
+      report_fatal_error(Twine("MN-Core2 Layer B: ") + Name + ": " + Role +
+                         " must be a " + (Want == Words4LW ? "4" : "2") +
+                         "-longword operand of this precision");
+  };
+  auto ExpectAll = [&](unsigned Want) {
+    for (Value *V : CI->args())
+      if (V->getType()->isVectorTy())
+        Expect(V->getType(), Want, "operand");
+    if (CI->getType()->isVectorTy())
+      Expect(CI->getType(), Want, "result");
+  };
+  switch (O) {
+  case Op::MATVEC: {
+    unsigned Wide = (P == Prec::F) ? Words4LW : Words2LW;
+    Expect(CI->getArgOperand(1)->getType(), Words2LW, "x");
+    Expect(CI->getArgOperand(2)->getType(), Wide, "y");
+    Expect(CI->getType(), Wide, "result");
+    break;
+  }
+  case Op::MATWRITE:
+    Expect(CI->getArgOperand(2)->getType(),
+           (P == Prec::F) ? Words4LW : Words2LW, "src");
+    break;
+  case Op::MATREAD:
+    Expect(CI->getType(), (P == Prec::F) ? Words4LW : Words2LW, "result");
+    break;
+  default:
+    ExpectAll(Words2LW);
+    break;
+  }
 }
 
 bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
@@ -121,8 +185,11 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
         continue;
       Op O;
       Prec P;
-      if (parseName(Callee->getName(), O, P))
+      unsigned W;
+      if (parseName(Callee->getName(), O, P, W)) {
+        checkShapes(CI, O, P, Callee->getName());
         Calls.push_back({CI, O, P});
+      }
     }
   if (Calls.empty())
     return false;
@@ -199,8 +266,9 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       auto *UC = dyn_cast<CallInst>(U);
       Op O;
       Prec P;
+      unsigned W;
       if (!UC || !UC->getCalledFunction() ||
-          !parseName(UC->getCalledFunction()->getName(), O, P))
+          !parseName(UC->getCalledFunction()->getName(), O, P, W))
         report_fatal_error(
             "MN-Core2 Layer B: a typed value has a non-typed use "
             "(unsupported ABI contract)");
@@ -329,17 +397,29 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       Slots[CI] = DS;
 
     IRBuilder<> B(CI);
-    auto Tok = [&](Value *V) -> Value * {
+    // Access width is a property of (opcode, operand role), not of the pass:
+    //   * vector forms (fvfma/fvmul/fvadd) and Layer A tokens keep width 2
+    //     (2 longwords); that region model is element-wise verified on gpfn3.
+    //   * matrix forms follow the vendor operand contract
+    //     (docs/mncore_intrinsics_design.md 22.4, 22.7, 22.10):
+    //       fmfma   x   = 1 word/cycle   -> width 0
+    //       fmfma   y/d = 1 longword/cyc -> width 1
+    //       fmwrite src = 1 longword/cyc -> width 1
+    //       fmread  dst = 1 longword/cyc -> width 1
+    //     Emitting width 2 for these does not reproduce the SDM placement.
+    auto TokW = [&](Value *V, uint64_t W) -> Value * {
       const Slot &S = Slots[V];
       Value *Args[5] = {B.getInt64(S.Space), B.getInt64(S.Addr),
-                        B.getInt64(2), B.getInt64(8), B.getInt64(0)};
+                        B.getInt64(W), B.getInt64(8), B.getInt64(0)};
       return B.CreateCall(Peop, Args);
     };
-    auto TokSlot = [&](const Slot &S) -> Value * {
+    auto TokSlotW = [&](const Slot &S, uint64_t W) -> Value * {
       Value *Args[5] = {B.getInt64(S.Space), B.getInt64(S.Addr),
-                        B.getInt64(2), B.getInt64(8), B.getInt64(0)};
+                        B.getInt64(W), B.getInt64(8), B.getInt64(0)};
       return B.CreateCall(Peop, Args);
     };
+    auto Tok = [&](Value *V) -> Value * { return TokW(V, 2); };
+    auto TokSlot = [&](const Slot &S) -> Value * { return TokSlotW(S, 2); };
     auto ConstArg = [&](unsigned I) -> uint64_t {
       auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(I));
       if (!C)
@@ -412,17 +492,17 @@ bool MNCoreLowerTypedIntrinsics::runOnFunction(Function &F) {
       Value *Mat = B.getInt64((ConstArg(0) & 1) |
                               ((ConstArg(1) & 0xff) << 1));
       Value *Args[12] = {B.getInt64(MauId), B.getInt64(0), Mat,
-                         O == Op::MATWRITE ? Tok(Src[0]) : B.getInt64(-1),
+                         O == Op::MATWRITE ? TokW(Src[0], 1) : B.getInt64(-1),
                          B.getInt64(-1), B.getInt64(-1),
-                         O == Op::MATREAD ? TokSlot(DS) : B.getInt64(-1),
+                         O == Op::MATREAD ? TokSlotW(DS, 1) : B.getInt64(-1),
                          B.getInt64(-1), B.getInt64(-1), B.getInt64(-1),
                          B.getInt64(-1), B.getInt64(-1)};
       B.CreateCall(Mau, Args);
     } else if (O == Op::MATVEC) {
       Value *Mat = B.getInt64(ConstArg(0) & 1);
       Value *Args[12] = {B.getInt64(MauId), B.getInt64(0), Mat,
-                         Tok(Src[0]), Tok(Src[1]), B.getInt64(-1),
-                         TokSlot(DS), B.getInt64(-1), B.getInt64(-1),
+                         TokW(Src[0], 0), TokW(Src[1], 1), B.getInt64(-1),
+                         TokSlotW(DS, 1), B.getInt64(-1), B.getInt64(-1),
                          B.getInt64(-1), B.getInt64(-1), B.getInt64(-1)};
       B.CreateCall(Mau, Args);
     } else if (O == Op::L1LOAD) {

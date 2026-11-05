@@ -42,21 +42,31 @@ func.func @inst() {
 }
 
 // CHECK-LABEL: func.func @typed
-func.func @typed(%a: vector<4xf32>, %b: vector<4xf32>, %c: vector<4xf32>) {
+func.func @typed(%a: vector<4xf32>, %b: vector<4xf32>, %c: vector<4xf32>,
+                 %slab: vector<8xf32>) {
   // CHECK: "mncore.vec.fma"({{.*}}) <{wmask = -1 : i64, zmask = -1 : i64}>
   %r = "mncore.vec.fma"(%a, %b, %c) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>, vector<4xf32>) -> vector<4xf32>
   // CHECK: "mncore.vec.max"
   %m = "mncore.vec.max"(%r, %a) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+  // The f32 matrix roles are 4 longwords; the 2-longword x of a matvec is
+  // the only narrow one.
+  // CHECK: "mncore.mat.vec"({{.*}}) <{face = 0 : i64}> : (vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  %n = "mncore.mat.vec"(%m, %slab) <{face = 0 : i64}> : (vector<4xf32>, vector<8xf32>) -> vector<8xf32>
   // CHECK: "mncore.mat.write"
-  "mncore.mat.write"(%m) <{face = 0 : i64, row = 2 : i64}> : (vector<4xf32>) -> ()
+  "mncore.mat.write"(%n) <{face = 0 : i64, row = 2 : i64}> : (vector<8xf32>) -> ()
   // CHECK: "mncore.mat.read"() <{face = 1 : i64, row = 2 : i64}>
-  %v = "mncore.mat.read"() <{face = 1 : i64, row = 2 : i64}> : () -> vector<4xf32>
+  %v = "mncore.mat.read"() <{face = 1 : i64, row = 2 : i64}> : () -> vector<8xf32>
   // Typed values may not escape (the Layer B pass rejects it), so consume it.
-  "mncore.mat.write"(%v) <{face = 1 : i64, row = 3 : i64}> : (vector<4xf32>) -> ()
+  "mncore.mat.write"(%v) <{face = 1 : i64, row = 3 : i64}> : (vector<8xf32>) -> ()
+  // CHECK: "mncore.gemm.tile"
+  %g = "mncore.gemm.tile"(%v, %slab, %a, %n) <{face = 1 : i64}> : (vector<8xf32>, vector<8xf32>, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  "mncore.mat.write"(%g) <{face = 1 : i64, row = 4 : i64}> : (vector<8xf32>) -> ()
   // CHECK: "mncore.vec.load"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
   %hn = "mncore.none"() : () -> !mncore.token
   %w = "mncore.vec.load"(%lb, %hn) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
-  "mncore.mat.write"(%w) <{face = 0 : i64, row = 4 : i64}> : (vector<4xf32>) -> ()
+  // CHECK: "mncore.vec.add"
+  %z = "mncore.vec.add"(%w, %a) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+  "mncore.vec.add"(%z, %b) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
   return
 }

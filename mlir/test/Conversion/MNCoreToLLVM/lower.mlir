@@ -44,8 +44,11 @@ func.func @vecfma(%a: vector<4xf32>, %b: vector<4xf32>, %c: vector<4xf32>) {
   // CHECK: llvm.call_intrinsic "llvm.mncore.fma.v4f32"({{.*}}) : (vector<4xf32>, vector<4xf32>, vector<4xf32>, i64, i64) -> vector<4xf32>
   %r = "mncore.vec.fma"(%a, %b, %c) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>, vector<4xf32>) -> vector<4xf32>
   // Typed values cannot escape the kernel; consume it with a typed op.
-  // CHECK: llvm.call_intrinsic "llvm.mncore.matwrite.v4f32"
-  "mncore.mat.write"(%r) <{face = 0 : i64, row = 0 : i64}> : (vector<4xf32>) -> ()
+  // A 2-longword f32 value is no longer a legal matrix operand, so the
+  // vector path terminates in another vector op.
+  // CHECK: llvm.call_intrinsic "llvm.mncore.add.v4f32"
+  %s = "mncore.vec.add"(%r, %a) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+  "mncore.vec.add"(%s, %b) <{zmask = -1 : i64, wmask = -1 : i64}> : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
   return
 }
 
@@ -70,14 +73,43 @@ func.func @matops(%x: vector<2xf64>, %y: vector<2xf64>) {
 }
 
 // CHECK-LABEL: llvm.func @vecload
-func.func @vecload() {
+func.func @vecload(%slab: vector<8xf32>) {
   // CHECK: llvm.call_intrinsic "llvm.mncore.lbop"
   %lb = "mncore.lbop"() <{mem = 0 : i32, addr = 0 : i64, width = 2 : i32, flags = 0 : i32}> : () -> !mncore.token
   %hn = "mncore.none"() : () -> !mncore.token
   // CHECK: llvm.call_intrinsic "llvm.mncore.l1load.v4f32"
   %v = "mncore.vec.load"(%lb, %hn) <{mode = 0 : i64, zmask = -1 : i64, wmask = -1 : i64}> : (!mncore.token, !mncore.token) -> vector<4xf32>
-  "mncore.mat.write"(%v) <{face = 0 : i64, row = 0 : i64}> : (vector<4xf32>) -> ()
+  // A load is 2 longwords, which is exactly the matvec x width.
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matvec.v4f32"
+  %m = "mncore.mat.vec"(%v, %slab) <{face = 0 : i64}> : (vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matwrite.v8f32"
+  "mncore.mat.write"(%m) <{face = 0 : i64, row = 0 : i64}> : (vector<8xf32>) -> ()
   return
+}
+
+// f32 matrix shapes: x is 2 longwords, y / dst / the fmwrite operand are 4.
+// CHECK-LABEL: llvm.func @matf32
+func.func @matf32(%x: vector<4xf32>, %slab: vector<8xf32>) {
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matvec.v4f32"(%{{.*}}, %{{.*}}, %{{.*}}) : (i64, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  %v = "mncore.mat.vec"(%x, %slab) <{face = 0 : i64}> : (vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matwrite.v8f32"
+  "mncore.mat.write"(%v) <{face = 0 : i64, row = 4 : i64}> : (vector<8xf32>) -> ()
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matread.v8f32"(%{{.*}}, %{{.*}}) : (i64, i64) -> vector<8xf32>
+  %r = "mncore.mat.read"() <{face = 1 : i64, row = 0 : i64}> : () -> vector<8xf32>
+  "mncore.mat.write"(%r) <{face = 1 : i64, row = 0 : i64}> : (vector<8xf32>) -> ()
+  return
+}
+
+// One GEMM tile is two slab writes (rows 0-3, 4-7) plus the matvec that reads
+// the accumulated face. Numeric closure is still open (design doc 22.13).
+// CHECK-LABEL: llvm.func @gemmtile
+func.func @gemmtile(%alo: vector<8xf32>, %ahi: vector<8xf32>,
+                    %b: vector<4xf32>, %c0: vector<8xf32>) -> vector<8xf32> {
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matwrite.v8f32"(%{{.*}}, %{{.*}}, %{{.*}}) : (i64, i64, vector<8xf32>) -> ()
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matwrite.v8f32"
+  // CHECK: llvm.call_intrinsic "llvm.mncore.matvec.v4f32"(%{{.*}}, %{{.*}}, %{{.*}}) : (i64, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  %c = "mncore.gemm.tile"(%alo, %ahi, %b, %c0) <{face = 0 : i64}> : (vector<8xf32>, vector<8xf32>, vector<4xf32>, vector<8xf32>) -> vector<8xf32>
+  return %c : vector<8xf32>
 }
 
 // CHECK-LABEL: llvm.func @dma

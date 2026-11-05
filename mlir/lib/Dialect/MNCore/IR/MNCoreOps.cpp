@@ -45,6 +45,7 @@ MNCORE_ENUM_SYNC(ALUOp, ALUOp, DMax);
 MNCORE_ENUM_SYNC(ALUOp, ALUOp, DMin);
 MNCORE_ENUM_SYNC(ALUOp, ALUOp, HMax);
 MNCORE_ENUM_SYNC(ALUOp, ALUOp, HMin);
+MNCORE_ENUM_SYNC(ALUOp, ALUOp, FBFN);
 
 MNCORE_ENUM_SYNC(MAUOp, MAUOp, FVFMA);
 MNCORE_ENUM_SYNC(MAUOp, MAUOp, FVMUL);
@@ -136,6 +137,44 @@ static LogicalResult verifyVectorType(Operation *op, Type type) {
     return success();
   return op->emitOpError()
          << "expects <2 x f64>, <4 x f32>, or <8 x f16>, got " << type;
+}
+
+// Matrix operands have per-role hardware widths (design doc 22.4, 22.10):
+// one `fmwrite`/`fmread`/`fmfma` expression spans four cycles, moving one
+// longword per PE per cycle for the wide roles and one 32-bit word per cycle
+// for the matvec x. So for f32 the wide roles are `f32x4x2` = 8 f32 = 4
+// longwords, while x stays `f32x4` = 2 longwords. The f64/f16 matrix forms
+// keep their old 2-longword type: their real widths have not been measured,
+// and this dialect does not guess them (design doc 22.13).
+static bool isF32MatrixSlab(Type type) {
+  auto vec = dyn_cast<VectorType>(type);
+  return vec && vec.getRank() == 1 && vec.getNumElements() == 8 &&
+         vec.getElementType().isF32();
+}
+
+static bool isF32Vector(Type type) {
+  auto vec = dyn_cast<VectorType>(type);
+  return vec && vec.getRank() == 1 && vec.getElementType().isF32();
+}
+
+static LogicalResult verifyF32MatrixSlab(Operation *op, Type type,
+                                         StringRef role) {
+  if (isF32MatrixSlab(type))
+    return success();
+  return op->emitOpError()
+         << "expects a 4-longword f32 matrix operand (<8 x f32>) for " << role
+         << ", got " << type;
+}
+
+// The wide matrix roles doubled in width for f32; the three element types
+// therefore no longer share one signature rule.
+static LogicalResult verifyMatrixOperand(Operation *op, Type type,
+                                         StringRef role) {
+  if (isF32Vector(type))
+    return verifyF32MatrixSlab(op, type, role);
+  if (failed(verifyVectorType(op, type)))
+    return failure();
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -410,7 +449,24 @@ LogicalResult VecMinOp::verify() {
   return verifyVectorType(getOperation(), getResult().getType());
 }
 LogicalResult MatVecOp::verify() {
-  return verifyVectorType(getOperation(), getResult().getType());
+  Type x = getX().getType();
+  Type y = getY().getType();
+  Type r = getResult().getType();
+  if (failed(verifyVectorType(getOperation(), x)))
+    return failure();
+  if (isF32Vector(x)) {
+    // x is the narrow role (2 longwords); y and the result are 4 longwords.
+    if (failed(verifyF32MatrixSlab(getOperation(), y, "y")))
+      return failure();
+    return verifyF32MatrixSlab(getOperation(), r, "result");
+  }
+  if (y != x)
+    return emitOpError() << "y must have the same type as x (" << x << "), got "
+                         << y;
+  if (r != x)
+    return emitOpError() << "result must have the same type as x (" << x
+                         << "), got " << r;
+  return success();
 }
 LogicalResult VecStoreOp::verify() {
   if (failed(verifyVectorType(getOperation(), getValue().getType())))
@@ -457,10 +513,26 @@ LogicalResult VecStoreOp::verify() {
 }
 
 LogicalResult MatWriteOp::verify() {
-  return verifyVectorType(getOperation(), getSrc().getType());
+  return verifyMatrixOperand(getOperation(), getSrc().getType(), "src");
 }
 LogicalResult MatReadOp::verify() {
-  return verifyVectorType(getOperation(), getResult().getType());
+  return verifyMatrixOperand(getOperation(), getResult().getType(), "result");
+}
+LogicalResult GemmTileOp::verify() {
+  if (getFace() != 0 && getFace() != 1)
+    return emitOpError() << "face must be 0 (X) or 1 (Y), got " << getFace();
+  if (failed(verifyF32MatrixSlab(getOperation(), getALo().getType(), "a_lo")))
+    return failure();
+  if (failed(verifyF32MatrixSlab(getOperation(), getAHi().getType(), "a_hi")))
+    return failure();
+  Type b = getB().getType();
+  if (!isF32Vector(b) || cast<VectorType>(b).getNumElements() != 4)
+    return emitOpError() << "expects a 2-longword f32 vector (<4 x f32>) for b,"
+                            " got "
+                         << b;
+  if (failed(verifyF32MatrixSlab(getOperation(), getC0().getType(), "c0")))
+    return failure();
+  return verifyF32MatrixSlab(getOperation(), getResult().getType(), "result");
 }
 LogicalResult VecLoadOp::verify() {
   if (failed(verifyVectorType(getOperation(), getResult().getType())))

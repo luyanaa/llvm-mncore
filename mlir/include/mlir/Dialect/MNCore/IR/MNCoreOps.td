@@ -39,12 +39,15 @@ def MNCore_ALUOp_DMax   : I64EnumAttrCase<"DMax", 10>;
 def MNCore_ALUOp_DMin   : I64EnumAttrCase<"DMin", 11>;
 def MNCore_ALUOp_HMax   : I64EnumAttrCase<"HMax", 12>;
 def MNCore_ALUOp_HMin   : I64EnumAttrCase<"HMin", 13>;
+// Block float (SDM 3.6.12.12), new range.
+def MNCore_ALUOp_FBFN   : I64EnumAttrCase<"FBFN", 20>;
 
 def MNCore_ALUOp : I64EnumAttr<"ALUOp", "MN-Core ALU opcode", [
   MNCore_ALUOp_FMin, MNCore_ALUOp_FMax, MNCore_ALUOp_IAdd,
   MNCore_ALUOp_ISub, MNCore_ALUOp_LPassa,
   MNCore_ALUOp_DMax, MNCore_ALUOp_DMin,
   MNCore_ALUOp_HMax, MNCore_ALUOp_HMin,
+  MNCore_ALUOp_FBFN,
 ]> {
   let cppNamespace = "::mlir::mncore";
 }
@@ -413,15 +416,30 @@ def MNCore_VecMinOp : MNCore_VecOp<"vec.min"> {
                        DefaultValuedAttr<I64Attr, "-1">:$wmask);
 }
 
-def MNCore_MatVecOp : MNCore_VecOp<"mat.vec"> {
+// `mat.vec` is deliberately NOT a `MNCore_VecOp`: the three operand roles have
+// different hardware widths (SDM 4.4, vendor header). For f32, x is one 32-bit
+// word per PE per cycle (4 f32 = 2 longwords over the 4-cycle expression),
+// while y and the result are one longword per PE per cycle (8 f32 = 4
+// longwords). `fma`/`mul`/... keep the uniform `<4 x f32>` form.
+def MNCore_MatVecOp : MNCore_Op<"mat.vec", [
+    MemoryEffects<[MemRead<MNCore_PEState>, MemWrite<MNCore_PEState>]>]> {
   let summary = "dst = A*x + y";
   let arguments = (ins I64Attr:$face, AnyFixedVectorOfNonZeroRank:$x,
                        AnyFixedVectorOfNonZeroRank:$y);
+  let results = (outs AnyFixedVectorOfNonZeroRank:$result);
+  let hasVerifier = 1;
 }
 
 def MNCore_MatWriteOp : MNCore_Op<"mat.write", [
     MemoryEffects<[MemRead<MNCore_PEState>, MemWrite<MNCore_PEState>]>]> {
-  let summary = "write a vector into the matrix register";
+  let summary = "write four rows of the matrix register";
+  let description = [{
+    One `fmwrite` covers four rows: cycle c writes row `(row + c) mod 8`, with
+    PE q's longword LOW half landing on column 2q and the HIGH half on 2q+1.
+    For f32 the operand is therefore 4 longwords per PE (`<8 x float>`, four
+    rows x two columns), not a single row. `src` must already be in the
+    block-float format the matrix face stores: this op does not convert.
+  }];
   let arguments = (ins I64Attr:$face, I64Attr:$row,
                        AnyFixedVectorOfNonZeroRank:$src);
   let hasVerifier = 1;
@@ -429,8 +447,40 @@ def MNCore_MatWriteOp : MNCore_Op<"mat.write", [
 
 def MNCore_MatReadOp : MNCore_Op<"mat.read", [
     MemoryEffects<[MemRead<MNCore_PEState>, MemWrite<MNCore_PEState>]>]> {
-  let summary = "transposed read from the matrix register";
+  let summary = "transposed read of four columns of the matrix register";
+  let description = [{
+    Cycle c reads column `(col + c)`, transposed: PE q receives row 2q in the
+    HIGH half and row 2q+1 in the LOW half. For f32 the result is 4 longwords
+    per PE (`<8 x float>`, four columns x two rows). The read is a bit copy;
+    no floating-point normalisation happens (block-float payloads come back
+    raw).
+  }];
   let arguments = (ins I64Attr:$face, I64Attr:$row);
+  let results = (outs AnyFixedVectorOfNonZeroRank:$result);
+  let hasVerifier = 1;
+}
+
+// One 8x4x4 GEMM tile: C = A(8x4) * B(4x4) + C0, as a single MAU matrix
+// expression plus the two writes that fill the face.
+//
+//   a_lo, a_hi  block-float slabs for matrix rows 0-3 and 4-7. Each PE holds
+//               two columns of four rows; A's four K values sit in even
+//               columns 0,2,4,6 (the only columns a single-precision MAU
+//               matvec reads). 4 longwords per PE each.
+//   b           the K values for the output column owned by this PE
+//               (4 f32 = 2 longwords per PE).
+//   c0, result  the IEEE f32 accumulator, 8 f32 = 4 longwords per PE, one
+//               output row per element, result[m] = sum_k A[m][k]*b[k].
+//
+// The block-float conversion and the L1BM -> PE distribution are NOT part of
+// this op. Numeric validation is open: see design doc 22.5 and 22.13.
+def MNCore_GemmTileOp : MNCore_Op<"gemm.tile", [
+    MemoryEffects<[MemRead<MNCore_PEState>, MemWrite<MNCore_PEState>]>]> {
+  let summary = "C = A(8x4) * B(4x4) + C0 on one matrix face";
+  let arguments = (ins I64Attr:$face, AnyFixedVectorOfNonZeroRank:$a_lo,
+                       AnyFixedVectorOfNonZeroRank:$a_hi,
+                       AnyFixedVectorOfNonZeroRank:$b,
+                       AnyFixedVectorOfNonZeroRank:$c0);
   let results = (outs AnyFixedVectorOfNonZeroRank:$result);
   let hasVerifier = 1;
 }

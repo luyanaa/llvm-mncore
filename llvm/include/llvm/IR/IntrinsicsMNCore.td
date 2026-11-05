@@ -103,13 +103,21 @@ def int_mncore_max_v8f16 : MNCVec2<llvm_v8f16_ty>;
 def int_mncore_min_v8f16 : MNCVec2<llvm_v8f16_ty>;
 
 def int_mncore_matvec_v2f64 : MNMatVec<llvm_v2f64_ty>;
-def int_mncore_matvec_v4f32 : MNMatVec<llvm_v4f32_ty>;
+// f32 matvec: x is 2 longwords (<4 x float>), y and the result are 4
+// (<8 x float>), matching the 4-cycle one-word / one-longword per cycle
+// accesses of `fmfma` (design doc 22.4, 22.10, 22.13). The name's type suffix
+// describes x, which is the narrow role and the only one that differs from
+// the vector forms; the backend re-checks the whole signature.
+def int_mncore_matvec_v4f32
+    : DefaultAttrsIntrinsic<[llvm_v8f32_ty],
+        [llvm_i64_ty, llvm_v4f32_ty, llvm_v8f32_ty],
+        [IntrHasSideEffects, IntrInaccessibleMemOnly]>;
 def int_mncore_matvec_v8f16 : MNMatVec<llvm_v8f16_ty>;
 def int_mncore_matwrite_v2f64 : MNMatWrite<llvm_v2f64_ty>;
-def int_mncore_matwrite_v4f32 : MNMatWrite<llvm_v4f32_ty>;
+def int_mncore_matwrite_v8f32 : MNMatWrite<llvm_v8f32_ty>;
 def int_mncore_matwrite_v8f16 : MNMatWrite<llvm_v8f16_ty>;
 def int_mncore_matread_v2f64 : MNMatRead<llvm_v2f64_ty>;
-def int_mncore_matread_v4f32 : MNMatRead<llvm_v4f32_ty>;
+def int_mncore_matread_v8f32 : MNMatRead<llvm_v8f32_ty>;
 def int_mncore_matread_v8f16 : MNMatRead<llvm_v8f16_ty>;
 
 // Layer B memory access: L1BM -> PE slot. Arguments:

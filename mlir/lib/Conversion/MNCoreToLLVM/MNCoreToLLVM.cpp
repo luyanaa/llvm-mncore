@@ -53,14 +53,21 @@ static Value i64Const(ConversionPatternRewriter &rewriter, Location loc,
                                            rewriter.getI64IntegerAttr(value));
 }
 
+// The type suffix carries the element count as well as the element type: the
+// f32 matrix roles are 2 longwords (`v4f32`, matvec x) and 4 longwords
+// (`v8f32`, matrix slabs), and the backend rejects a name whose width does
+// not match the lowered operand (design doc 22.13).
 static std::string vectorSuffix(Type type) {
   auto vec = cast<VectorType>(type);
   Type element = vec.getElementType();
+  std::string n = std::to_string(vec.getNumElements());
   if (element.isF64())
-    return "v2f64";
+    return "v" + n + "f64";
   if (element.isF32())
-    return "v4f32";
-  return "v8f16";
+    return "v" + n + "f32";
+  if (element.isF16())
+    return "v" + n + "f16";
+  return "v" + n + "<?>";
 }
 
 //===----------------------------------------------------------------------===//
@@ -479,7 +486,7 @@ struct TypedOpLowering : OpConversionPattern<OpT> {
     if (failed(getOperands(op, adaptor, rewriter, args)))
       return failure();
 
-    std::string name = getBaseName().str() + vectorSuffix(op.getType());
+    std::string name = getBaseName().str() + getSuffix(op);
     auto call = rewriter.create<LLVM::CallIntrinsicOp>(
         loc, resultType, rewriter.getStringAttr(name), args);
     rewriter.replaceOp(op, call.getResult(0));
@@ -487,7 +494,14 @@ struct TypedOpLowering : OpConversionPattern<OpT> {
   }
 
 protected:
+  // The intrinsic name's type suffix describes the operand that determines
+  // the op's shape. For every vector op that is the (uniform) result type;
+  // `mat.vec` is the exception, because its x is 2 longwords while y and the
+  // result are 4 (design doc 22.13), and the suffix names x.
   virtual StringRef getBaseName() const = 0;
+  virtual std::string getSuffix(OpT op) const {
+    return vectorSuffix(op.getType());
+  }
   virtual LogicalResult getOperands(OpT op, typename OpT::Adaptor adaptor,
                                     ConversionPatternRewriter &rewriter,
                                     SmallVectorImpl<Value> &args) const = 0;
@@ -557,6 +571,9 @@ struct MatVecLowering : TypedOpLowering<mncore::MatVecOp> {
 
 protected:
   StringRef getBaseName() const override { return "llvm.mncore.matvec."; }
+  std::string getSuffix(mncore::MatVecOp op) const override {
+    return vectorSuffix(op.getX().getType());
+  }
   LogicalResult getOperands(mncore::MatVecOp op, OpAdaptor adaptor,
                             ConversionPatternRewriter &rewriter,
                             SmallVectorImpl<Value> &args) const override {
@@ -564,6 +581,47 @@ protected:
     args.push_back(i64Const(rewriter, op.getLoc(), op.getFace()));
     args.push_back(adaptor.getX());
     args.push_back(adaptor.getY());
+    return success();
+  }
+};
+
+// One GEMM tile is the whole MAU expression for an 8x4x4 block: two matrix
+// writes (rows 0-3 and 4-7) followed by the matvec, which reads both as the
+// accumulated face. Emitting the writes from here -- rather than leaving the
+// caller to compose three separate ops -- is what makes "the face holds this
+// A tile" a single contract instead of an unchecked convention. The matrix
+// face is a per-MAB resource that no value names, so the packetizer's
+// one-face-per-expression rule (MNCorePacketizer.cpp) is what keeps the
+// three expressions from co-issuing.
+struct GemmTileLowering : OpConversionPattern<mncore::GemmTileOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mncore::GemmTileOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Type slabType = getTypeConverter()->convertType(op.getALo().getType());
+    Type bType = getTypeConverter()->convertType(op.getB().getType());
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    if (!slabType || !bType || !resultType)
+      return rewriter.notifyMatchFailure(op, "operand type is not convertible");
+
+    std::string slabSuffix = vectorSuffix(op.getALo().getType());
+    std::string vectorSuffixStr = vectorSuffix(op.getB().getType());
+    Value face = i64Const(rewriter, loc, op.getFace());
+    for (auto [slab, row] :
+         {std::pair{adaptor.getALo(), int64_t{0}},
+          std::pair{adaptor.getAHi(), int64_t{4}}}) {
+      SmallVector<Value> args = {face, i64Const(rewriter, loc, row), slab};
+      rewriter.create<LLVM::CallIntrinsicOp>(
+          loc, rewriter.getStringAttr("llvm.mncore.matwrite." + slabSuffix),
+          args);
+    }
+    SmallVector<Value> args = {face, adaptor.getB(), adaptor.getC0()};
+    auto call = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, resultType,
+        rewriter.getStringAttr("llvm.mncore.matvec." + vectorSuffixStr), args);
+    rewriter.replaceOp(op, call.getResult(0));
     return success();
   }
 };
@@ -686,8 +744,8 @@ struct MNCoreToLLVMPass
              DmaStoreLowering,
              VecFmaLowering, VecMulLowering, VecAddLowering, VecMaxLowering,
              VecMinLowering, MatVecLowering, MatWriteLowering,
-             MatReadLowering, VecLoadLowering, VecStoreLowering>(converter,
-                                                                 ctx);
+             MatReadLowering, GemmTileLowering, VecLoadLowering,
+             VecStoreLowering>(converter, ctx);
     populateFuncToLLVMConversionPatterns(converter, patterns);
     arith::populateArithToLLVMConversionPatterns(converter, patterns);
 
