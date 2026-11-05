@@ -305,7 +305,12 @@ Triton 3.9 的上游 LLVM 版本与 LLVM 24 的 API 兼容性尚未验证。若�
 需要 LLVM IR，因此走 **TVM 的 LLVM codegen** 路径，而不是复制 Ascend 的 C
 codegen。
 
-### 3.1 推荐路径：TVM `CodeGenLLVM` 子类
+### 3.1 推荐路径：TVM `CodeGenLLVM` 子类 —— **实测否决 (2026-11-05)**
+
+> **结论：TVM `4211874e9` 的 LLVM codegen 无法针对 LLVM 24 编译。** 实测
+> 证据见 §3.4。本节保留原始设计以记录决策过程；当前推荐路径改为 §3.3 的
+> MLIR 文本桥，即 TileLang 直接产出与本仓库 Triton 相同的 `mncore` dialect
+> MLIR 文本，再交给 `mlir-opt` + `llc`。
 
 1. 用本仓库的 LLVM 安装构建 TVM：
    `USE_LLVM=/opt/llvm-mncore/bin/llvm-config`（必须包含 MNCore target）。
@@ -348,6 +353,70 @@ codegen。
   `llc` 前做一次受控文本重写为 `llvm.mncore.*`。该桥已在设计上可行，
   但必须由 golden 测试锁定，不能作为长期形态。
 * 不建议在 TileLang 侧重写一套 LLVM IR emitter。
+
+### 3.4 构建可行性实测（2026-11-05）
+
+**LLVM 侧前提：组件集必须完整。** TVM 的 CMake 用
+`llvm-config --libfiles` 判断可用性，该命令只有在本仓库 LLVM 的静态库集合
+完整时才返回 0。实测逐轮补齐的组件：
+`LLVMOrcJIT`、`LLVMExecutionEngine`、`LLVMJITLink`、`LLVMDWARFLinker` /
+`LLVMDWARFLinkerClassic` / `LLVMDWARFLinkerParallel`、`LLVMFuzzMutate`、
+`LLVMSupportLSP`、`LLVMDWARFCFIChecker`。
+
+**配置命令（Z3 必须关闭：本机无 Z3，`-DUSE_Z3=OFF`）：**
+
+```sh
+cmake -S ../tilelang-mncore -B /tmp/tl-build \
+  -DUSE_LLVM=/Users/yanlu/Documents/llvm-mncore/build-mlir/bin/llvm-config \
+  -DUSE_CUDA=OFF -DUSE_Z3=OFF -DCMAKE_BUILD_TYPE=Release
+```
+
+配置**成功**（TVM `TVM_LLVM_VERSION=240`，即 LLVM 24 被正确识别）。
+
+**编译否决（NO-GO）。** `cmake --build /tmp/tl-build -j 8` 在
+`tvm_objs` 失败，原因是 TVM 的 LLVM codegen 仍使用 LLVM 15 之前的有类型
+指针 API，而 LLVM 19+ 已把类型参数从 `PointerType::get` 移除：
+
+```
+src/target/llvm/codegen_cpu.cc:156: error: non-const lvalue reference to type
+  'LLVMContext' cannot bind to a value of unrelated type 'llvm::Type *'
+```
+
+TVM 自己的兼容宏 `src/target/llvm/llvm_instance.h:45` 写的是
+`PointerType::get(arg, offset)`（有类型指针形式），只对
+`TVM_LLVM_VERSION >= 200` 生效；LLVM 24 的签名是
+`PointerType::get(LLVMContext&, unsigned)`。逐文件实测错误数：
+
+| 文件 | `-fsyntax-only -ferror-limit=0` 错误数 |
+|---|---|
+| `src/target/llvm/codegen_cpu.cc` | 45 |
+| `src/target/llvm/codegen_llvm.cc` | 20 |
+| `src/target/hexagon/llvm/codegen_hexagon.cc` | 3 |
+| `src/target/llvm/codegen_nvptx.cc` | 2 |
+| `src/target/llvm/codegen_aarch64.cc` | 0 |
+
+这是**跨文件的 API 移植**（约 70 处，且不排除其它未编译到的 TU），不是可以
+夹带在功能 PR 里的一行 shim。因此：
+
+* **不**把 TVM 的 LLVM codegen 作为 MN-Core 2 的发射路径；
+* 不以“升级 TVM 子模块”作为本轮动作（会牵动整个 fork 的其余后端）；
+* 走 §3.3 的 MLIR 文本桥：TileLang 产出 `mncore` dialect MLIR 文本，
+  与本仓库 Triton 的产物同构，共享 fixup、buffer descriptor 与数值 golden。
+
+**落地状态。** `../tilelang-mncore/src/mncore/` 已加入：
+
+* `target_utils.{h,cc}`：`tvm::tl::TargetIsMNCore(Target)`，kind 字符串的
+  唯一判定点；
+* `target.cc`：`TVM_REGISTER_TARGET_KIND("mncore2", kDLExtDev)`（属性
+  `mcpu`、`arch`、`supports_kernel_status_return=false`、
+  `max_vector_bits=64`）与 **fail-closed** 的 `target.build.mncore2`
+  ——在 `CodeGenMNCore` 落地前，为 `mncore2` 构建会直接报错，而不是产出一个
+  空的设备镜像；
+* `CMakeLists.txt`：只编译上面三个文件，**不依赖 `USE_LLVM`**。
+
+因此 TVM 用 `-DUSE_LLVM=OFF` 即可配置成功，这是 MN-Core 2 引导阶段的可构建
+基线；`USE_LLVM=ON` 只在需要其它后端的 LLVM codegen 时才需要，而它当前
+在 LLVM 24 下不可用。
 
 ---
 
