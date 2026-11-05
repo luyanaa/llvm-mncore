@@ -245,6 +245,10 @@ void MNCoreDAGToDAGISel::Select(SDNode *N) {
       case (int)mncore::ALUOp::DMin: Opc = Masked ? MNCore::MIN_d_M : MNCore::MIN_d; break;
       case (int)mncore::ALUOp::HMax: Opc = Masked ? MNCore::MAX_h_M : MNCore::MAX_h; break;
       case (int)mncore::ALUOp::HMin: Opc = Masked ? MNCore::MIN_h_M : MNCore::MIN_h; break;
+      case (int)mncore::ALUOp::FBFN: // block float, one input, one destination
+        Opc = Masked ? MNCore::BFN_f_M : MNCore::BFN_f;
+        OneInput = true;
+        break;
       default:
         report_fatal_error("MN-Core2: mncore.alu opcode id not mapped yet");
       }

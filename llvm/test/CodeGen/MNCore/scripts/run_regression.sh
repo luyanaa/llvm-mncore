@@ -26,7 +26,7 @@ for a in "$@"; do
 done
 
 # Tests that emit straight .vsm text (full llc run).
-EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip"
+EMIT="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip golden_mau_smoke"
 # Tests checked via -run-pass=mncore-packetizer (MIR output).
 PKT="mau-rules packetize-groups peoperand-conflict vfma-mwrite-shape mask-rules"
 # Tests checked via -run-pass=mncore-hazard (MIR output).
@@ -40,12 +40,21 @@ IRL="wide-imm plain-ir intrinsics layerb layerb2"
 NEG="operand-placement|illegal PE operand placement
 pe-alignment|misaligned PE operand
 lone-wait|`wait` must co-issue"
+# Matrix-transport goldens: FileCheck + the MAU placement model checker
+# (scripts/check_mau_g0.py), run as their own numeric stage.
+MAU="golden_mau_g0 golden_mau_g0_y"
+# Block-float goldens: FileCheck + the SDM 4.4 conversion model
+# (scripts/check_mau_bfn.py), run as their own numeric stage.
+BFN="golden_mau_bfn"
+# G2 tripwire: pins the measured absence of the MAU product on gpfn3
+# (design doc 22.9). It is a negative result, so it runs its own stage.
+G2TRAP="golden_mau_g2"
 # Tests whose vsm needs --instruction-mode flat on assemble3.
 FLAT="peoperand-modes"
 # Hazard/race checking is a separate stage: only streams authored to be
 # race-free (single-kernel, spaced) belong here. Syntax-only verification
 # (checkers disabled) is the stage above.
-HAZARD_OK="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip l1load-dist l1store-dist layerb layerb2"
+HAZARD_OK="peoperand-modes l1bml2bm-emit mv-emit mau-emit alu-emit mask-emit imm-fixed-emit lmbar golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip golden_mau_smoke golden_mau_g0 golden_mau_g0_y golden_mau_bfn golden_mau_g2 l1load-dist l1store-dist layerb layerb2"
 
 fail=0
 echo "===== FileCheck ====="
@@ -66,6 +75,10 @@ done
 for t in $HAZR; do
   $LLC -mtriple=mncore2 -run-pass=mncore-hazard -mncore-hazard-report $TD/$t.mir -o - 2>&1 \
     | $FC $TD/$t.mir >/dev/null 2>&1 \
+    && echo "PASS $t" || { echo "FAIL $t"; fail=$((fail+1)); }
+done
+for t in $MAU $BFN $G2TRAP; do
+  $LLC -mtriple=mncore2 $TD/$t.mir -o - 2>/dev/null | $FC $TD/$t.mir >/dev/null 2>&1 \
     && echo "PASS $t" || { echo "FAIL $t"; fail=$((fail+1)); }
 done
 for t in $IRL; do
@@ -149,6 +162,16 @@ rm -f $tmpp
 
 remfail=0
 if [ $LOCAL_ONLY = 0 ]; then
+  # One ssh connection for the whole run. Each test opens ~5 connections on
+  # suzhou; a burst of ~200 in a couple of minutes gets the host to close new
+  # connections ("Connection closed by ... port 57953"), which used to be
+  # reported as test failures. A shared master keeps the connection count at
+  # one and makes those failures impossible by construction.
+  export MN_SSH_CONTROL="/tmp/mncore_ssh_$$.sock"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -o ControlMaster=yes \
+      -o ControlPath="$MN_SSH_CONTROL" -o ControlPersist=300 -N -f suzhou \
+      2>/dev/null || true
+  trap 'ssh -o ControlPath="$MN_SSH_CONTROL" -O exit suzhou >/dev/null 2>&1 || true' EXIT
   echo "===== assemble3 + gpfn3_package_main ====="
   for t in $EMIT; do
     extra=""
@@ -181,6 +204,56 @@ if [ $LOCAL_ONLY = 0 ]; then
       fi
     fi
   done
+  echo "===== golden MAU G0 (matrix placement model) ====="
+  for t in $MAU; do
+    case $t in
+      golden_mau_g0) c=full ;;
+      golden_mau_g0_y) c=y ;;
+    esac
+    out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^emulate:'
+    if [ $rc -ne 0 ]; then
+      if printf '%s' "$out" | grep -q '^SKIP' && [ $ALLOW_OFFLINE = 1 ]; then
+        :
+      else
+        echo "FAIL  $t  (remote)"; remfail=$((remfail+1))
+      fi
+    elif ! python3 -I $TD/scripts/check_mau_g0.py /tmp/mncore_$t.dmp --case $c; then
+      echo "FAIL  $t  (MAU G0 model)"; remfail=$((remfail+1))
+    fi
+  done
+  echo "===== golden block float G1 (SDM 4.4 conversion model) ====="
+  for t in $BFN; do
+    out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^emulate:'
+    if [ $rc -ne 0 ]; then
+      if printf '%s' "$out" | grep -q '^SKIP' && [ $ALLOW_OFFLINE = 1 ]; then
+        :
+      else
+        echo "FAIL  $t  (remote)"; remfail=$((remfail+1))
+      fi
+    elif ! python3 -I $TD/scripts/check_mau_bfn.py /tmp/mncore_$t.dmp; then
+      echo "FAIL  $t  (block float model)"; remfail=$((remfail+1))
+    fi
+  done
+  echo "===== G2 tripwire (gpfn3 fmfma does not compute A*x) ====="
+  for t in $G2TRAP; do
+    out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^emulate:'
+    if [ $rc -ne 0 ]; then
+      if printf '%s' "$out" | grep -q '^SKIP' && [ $ALLOW_OFFLINE = 1 ]; then
+        :
+      else
+        echo "FAIL  $t  (remote)"; remfail=$((remfail+1))
+      fi
+    elif ! python3 -I $TD/scripts/check_mau_g2.py /tmp/mncore_$t.dmp; then
+      echo "FAIL  $t  (G2 tripwire: emulator changed, re-open G2)"
+      remfail=$((remfail+1))
+    fi
+  done
   echo "===== golden numeric (dump + check_dump) ====="
   for t in golden golden_mem golden_store golden_l1bmm golden_l1bmd golden_l1bmd_store golden_roundtrip; do
     out=$($TD/scripts/emulate_gpfn3.sh --dump $TD/$t.mir 2>&1)
@@ -200,10 +273,20 @@ if [ $LOCAL_ONLY = 0 ]; then
       exp=('GREG0:*:0=0xaa' 'GREG0:*:4=0xbb')
     elif [ "$t" = golden_l1bmd_store ]; then
       exp=('L1BM:*:0=0x3900000039')
+    elif [ "$t" = golden_roundtrip ]; then
+      # Planes 0 and 64 of the roundtrip fixture hold different constants;
+      # the entries are keyed by L1BM block id, so both are checked by index.
+      exp=('L1BM:*:0=0x4000000040000000' 'L1BM:*:64=0x4080000040800000')
     else
       exp=('L1BM:*:0=0x4080000040800000')
     fi
-    if [ $rc -ne 0 ] || ! python3 -I $TD/scripts/check_dump.py /tmp/mncore_$t.dmp "${exp[@]}" >/dev/null 2>&1; then
+    # Distinguish "the emulation did not run" (transport/e.g. a dropped ssh)
+    # from "it ran and the values are wrong": both fail, but a numeric
+    # FAIL should never be reported for an infrastructure hiccup.
+    if [ $rc -ne 0 ]; then
+      echo "FAIL  $t  (remote)"; remfail=$((remfail+1)); continue
+    fi
+    if ! python3 -I $TD/scripts/check_dump.py /tmp/mncore_$t.dmp "${exp[@]}" >/dev/null 2>&1; then
       echo "FAIL  $t  (golden value)"; remfail=$((remfail+1))
     fi
     if [ "$t" = golden_l1bmd_store ]; then

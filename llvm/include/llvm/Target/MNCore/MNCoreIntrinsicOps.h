@@ -39,6 +39,13 @@ enum class ALUOp : int64_t {
   DMin = 11,
   HMax = 12,
   HMin = 13,
+  // Block float (SDM 3.6.12.12), appended in a new range. `fbfn` converts
+  // one 4-word block (SDM 4.4) at a time: the two 32-bit words of a PE
+  // longword are two independent blocks, each spanning the four PEs of a
+  // MAB. One input, one destination, longword access width (1 longword per
+  // PE per cycle, 4 cycles per instruction). The double/pseudo-single forms
+  // (dbfn/gbfn) use the same PE operand shape but are not mapped yet.
+  FBFN = 20,
 };
 
 // llvm.mncore.mau(opcode, prec, mat, sx, sy, sz, d0, d1, d2, omr,

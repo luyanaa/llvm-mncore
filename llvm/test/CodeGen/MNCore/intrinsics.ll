@@ -173,6 +173,22 @@ define void @lmbar() {
   ret void
 }
 
+; ALU: opcode 20 = fbfn (block float, SDM 3.6.12.12). One input, one
+; destination, longword access width; the masked form is a separate def.
+; Numeric behaviour is pinned by golden_mau_bfn.mir (G1).
+define void @alu_bfn() {
+; CHECK-LABEL: alu_bfn:
+; CHECK: fbfn $lr0v $lr8v
+; CHECK: fbfn $lr0v $lr8v/0111
+  %s = call i64 @llvm.mncore.peop(i64 1, i64 0, i64 1, i64 8, i64 0)
+  %d = call i64 @llvm.mncore.peop(i64 1, i64 8, i64 1, i64 8, i64 0)
+  call void @llvm.mncore.alu(i64 20, i64 2, i64 0, i64 %s, i64 -1, i64 %d,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 -1)
+  call void @llvm.mncore.alu(i64 20, i64 2, i64 0, i64 %s, i64 -1, i64 %d,
+                             i64 -1, i64 -1, i64 -1, i64 -1, i64 57)
+  ret void
+}
+
 ; Masked matvec / mread outputs (Layer A mau ids 4 and 6).
 define void @masked_matrix() {
 ; CHECK-LABEL: masked_matrix:

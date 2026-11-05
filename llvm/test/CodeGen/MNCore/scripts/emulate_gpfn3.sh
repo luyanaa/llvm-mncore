@@ -13,10 +13,16 @@
 #
 # Requires build-mncore/bin/llc next to the repo root and ssh access to 'suzhou'.
 set -u
+# Reuse run_regression.sh's shared connection when it provides one
+# (MN_SSH_CONTROL); otherwise behave like a plain ssh call.
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+if [ -n "${MN_SSH_CONTROL:-}" ]; then
+  SSH="$SSH -o ControlMaster=auto -o ControlPath=$MN_SSH_CONTROL -o ControlPersist=120"
+fi
 # A missing ssh connection must never look like success: fail fast, and let
 # the caller decide whether that is acceptable (run_regression.sh exits
 # non-zero unless --local/--allow-offline was given).
-if ! ssh -o BatchMode=yes -o ConnectTimeout=8 suzhou true 2>/dev/null; then
+if ! $SSH suzhou true 2>/dev/null; then
   echo "SKIP  (ssh suzhou unavailable)"
   exit 2
 fi
@@ -51,13 +57,13 @@ for mir in "${ARGS[@]}"; do
   fi
   rv=/tmp/mncore_$name.vsm
   ra=/tmp/mncore_$name.asm
-  printf '%s\n' "$vsm" | ssh suzhou "cat > $rv" 2>/dev/null || true
-  if ! ssh suzhou "test -s $rv" 2>/dev/null; then
+  printf '%s\n' "$vsm" | $SSH suzhou "cat > $rv" 2>/dev/null || true
+  if ! $SSH suzhou "test -s $rv" 2>/dev/null; then
     echo "FAIL  $name  (could not stage $rv on suzhou)"
     fail=$((fail+1)); continue
   fi
   # Stage 2: assemble. Capture stderr; a non-empty diagnostic means failure.
-  aout=$(ssh suzhou "$SDE -hsw -- $ASM $A3FLAGS --output-file $ra $rv 2>&1" | grep -v '^[ijm] [01]')
+  aout=$($SSH suzhou "$SDE -hsw -- $ASM $A3FLAGS --output-file $ra $rv 2>&1" | grep -v '^[ijm] [01]')
   if [ -n "$aout" ]; then
     echo "FAIL  $name  (assemble3)"
     echo "$aout" | sed 's/^/      /' | grep -iv '^\s*$' | head -8
@@ -67,7 +73,7 @@ for mir in "${ARGS[@]}"; do
   rd=/tmp/mncore_$name.dmp
   dflag=""
   [ $DUMP = 1 ] && dflag="-d $rd"
-  eout=$(ssh suzhou "$SDE -hsw -- $EMU -i $ra -x /tmp/mncore_$name.log $dflag 2>&1")
+  eout=$($SSH suzhou "$SDE -hsw -- $EMU -i $ra -x /tmp/mncore_$name.log $dflag 2>&1")
   erc=$?
   if [ $erc -ne 0 ]; then
     echo "FAIL  $name  (gpfn3_package_main rc=$erc)"
@@ -75,7 +81,7 @@ for mir in "${ARGS[@]}"; do
     fail=$((fail+1)); continue
   fi
   if [ $DUMP = 1 ]; then
-    ssh suzhou "cat $rd" > /tmp/mncore_$name.dmp 2>/dev/null
+    $SSH suzhou "cat $rd" > /tmp/mncore_$name.dmp 2>/dev/null
     echo "      dump: /tmp/mncore_$name.dmp"
   fi
   nsteps=$(printf '%s\n' "$vsm" | grep -c '\S')

@@ -14,6 +14,12 @@
 # checked independently; the remote file is unique per run so a stale
 # /tmp artifact can never turn into a false PASS.
 set -u -o pipefail
+# Reuse run_regression.sh's shared connection when it provides one
+# (MN_SSH_CONTROL); otherwise behave like a plain ssh call.
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+if [ -n "${MN_SSH_CONTROL:-}" ]; then
+  SSH="$SSH -o ControlMaster=auto -o ControlPath=$MN_SSH_CONTROL -o ControlPersist=120"
+fi
 LLC=${LLC:-/Users/yanlu/Documents/llvm-mncore/build-mncore/bin/llc}
 SDE=/opt/sde-external-10.13.1-2026-07-28-lin/sde64
 ASM=/opt/pfn/pfcomp/codegen/build/tools/assemble3
@@ -32,7 +38,7 @@ A3FLAGS=""
 [ "$FLAT" = 1 ] && A3FLAGS="$A3FLAGS --instruction-mode flat"
 [ "$HAZARD" = 0 ] && A3FLAGS="$A3FLAGS --disable-hazard-checker --disable-deadlock-checker"
 
-if ! ssh -o BatchMode=yes -o ConnectTimeout=8 suzhou true 2>/dev/null; then
+if ! $SSH suzhou true 2>/dev/null; then
   echo "SKIP  (ssh suzhou unavailable)"
   exit 2
 fi
@@ -61,29 +67,29 @@ for src in "${ARGS[@]}"; do
   bfail=0
   for f in "${files[@]}"; do
     fn=$(basename "$f" .vsm)
-    remote=$(ssh suzhou "mktemp /tmp/mncore_verify_XXXXXX.vsm" 2>/dev/null) || {
+    remote=$($SSH suzhou "mktemp /tmp/mncore_verify_XXXXXX.vsm" 2>/dev/null) || {
       echo "FAIL  $name/$fn  (ssh mktemp failed)"
       bfail=1; break; }
     remote_asm=${remote%.vsm}.asm
-    if ! ssh suzhou "cat > '$remote'" < "$f"; then
+    if ! $SSH suzhou "cat > '$remote'" < "$f"; then
       echo "FAIL  $name/$fn  (ssh staging failed)"
       bfail=1; break
     fi
-    if ! ssh suzhou "test -s '$remote'"; then
+    if ! $SSH suzhou "test -s '$remote'"; then
       echo "FAIL  $name/$fn  (staged file empty)"
       bfail=1; break
     fi
-    aout=$(ssh suzhou "$SDE -hsw -- $ASM $A3FLAGS --output-file '$remote_asm' '$remote' 2>&1")
+    aout=$($SSH suzhou "$SDE -hsw -- $ASM $A3FLAGS --output-file '$remote_asm' '$remote' 2>&1")
     arc=$?
     diag=$(printf '%s\n' "$aout" | grep -v '^[ijm] [01]' | grep -v '^\s*$')
     if [ $arc -ne 0 ] || [ -n "$diag" ]; then
       echo "FAIL  $name/$fn  (assemble3 rc=$arc)"
       printf '%s\n' "$diag" | sed 's/^/      /' | head -8
       bfail=1
-      ssh suzhou "rm -f '$remote' '$remote_asm'" 2>/dev/null || true
+      $SSH suzhou "rm -f '$remote' '$remote_asm'" 2>/dev/null || true
       break
     fi
-    ssh suzhou "rm -f '$remote' '$remote_asm'" 2>/dev/null || true
+    $SSH suzhou "rm -f '$remote' '$remote_asm'" 2>/dev/null || true
   done
   rm -rf "$tmp"
   if [ $bfail -eq 0 ]; then
